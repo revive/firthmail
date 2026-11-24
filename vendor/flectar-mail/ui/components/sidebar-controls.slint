@@ -1,0 +1,576 @@
+import { SavedSearchUi } from "../saved-searches.slint";
+import { SidebarRowSurface, SidebarStyle } from "sidebar-row.slint";
+import { AccountProblem, AccountStatus, MailDragApi } from "../models.slint";
+import { AccountStatusPanel, AccountStatusText } from "account-status.slint";
+import { ActivitySpinner } from "activity-spinner.slint";
+import { Avatar } from "avatar.slint";
+import { IconButton } from "controls.slint";
+import { AppTheme, LayoutMetrics } from "../design-system.slint";
+import { TypeScale } from "../typography.slint";
+
+component SidebarIcon {
+    in property <image> icon;
+    in property <color> color;
+    in property <length> icon-size: SidebarStyle.icon-size;
+
+    width: SidebarStyle.icon-size;
+    height: 28px;
+
+    Image {
+        x: (parent.width - root.icon-size) / 2;
+        y: (parent.height - root.icon-size) / 2;
+        width: root.icon-size;
+        height: root.icon-size;
+        source: root.icon;
+        colorize: root.color;
+        image-fit: contain;
+        accessible-role: none;
+    }
+}
+
+// Counts are compact status badges rather than loose right-aligned text. This
+// keeps large unread values visually grouped and gives selected rows a clear
+// accent treatment without changing the row's geometry.
+component SidebarCountBadge inherits Rectangle {
+    in property <string> count;
+    in property <bool> selected: false;
+    in property <color> accent-color;
+    in property <color> muted-color;
+
+    visible: root.count != "";
+    width: min(52px, max(24px, count-label.preferred-width + 12px));
+    height: 20px;
+    border-radius: 7px;
+    background: root.selected
+        ? root.accent-color.transparentize(0.78)
+        : root.muted-color.transparentize(0.86);
+
+    count-label := Text {
+        text: root.count;
+        color: root.selected ? root.accent-color : root.muted-color;
+        font-size: TypeScale.caption;
+        font-weight: 600;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+}
+
+// A row's pointer area, which sits inside the row's ContextMenuArea so taps
+// reach it first: on Android, Slint holds every press on a menu's own area to
+// wait for a long press, which swallowed taps on the rows above it. A
+// right-click opens the menu, and so does holding a finger still for half a
+// second, as on Android and iOS.
+component SidebarRowHit inherits TouchArea {
+    in property <bool> menu-enabled;
+    callback activated();
+    callback open-menu(Point);
+    private property <bool> holding: false;
+    private property <bool> held: false;
+    private property <length> hold-x;
+    private property <length> hold-y;
+
+    pointer-event(event) => {
+        if event.kind == PointerEventKind.down {
+            self.held = false;
+            if event.button == PointerEventButton.right && root.menu-enabled {
+                root.open-menu({ x: self.mouse-x, y: self.mouse-y });
+            } else if event.button == PointerEventButton.left && event.touch-finger-id != 0 && root.menu-enabled {
+                self.hold-x = self.mouse-x;
+                self.hold-y = self.mouse-y;
+                self.holding = true;
+            }
+        } else if event.kind == PointerEventKind.move {
+            if self.holding && (abs(self.mouse-x - self.hold-x) > 8px || abs(self.mouse-y - self.hold-y) > 8px) {
+                self.holding = false;
+            }
+        } else {
+            self.holding = false;
+        }
+    }
+    clicked => {
+        // The finger that opened the menu lifts here; it was not a tap.
+        if !self.held {
+            root.activated();
+        }
+        self.held = false;
+    }
+
+    Timer {
+        interval: 500ms;
+        running: root.holding;
+        triggered => {
+            root.holding = false;
+            root.held = true;
+            root.open-menu({ x: root.hold-x, y: root.hold-y });
+        }
+    }
+}
+
+// A folder row is shared by unified and account sections so indentation,
+// selection, hover, and counts remain consistent throughout the tree.
+export component SidebarItem inherits SidebarRowSurface {
+    in property <bool> interactive: true;
+    in property <string> label;
+    in property <string> accessible-name: root.label;
+    in property <string> count;
+    in property <string> scope;
+    in property <image> icon;
+    in property <bool> selected: false;
+    in property <bool> label-has-emoji: false;
+    in property <string> label-path: root.label;
+    in property <length> row-height: 28px;
+    in property <length> left-padding: SidebarStyle.icon-left;
+    in property <int> account-id: -1;
+    in property <int> folder-id: -1;
+    in property <int> label-id: -1;
+    in property <bool> has-children: false;
+    in property <bool> expanded: true;
+    in property <bool> label-tree-node: false;
+    in property <bool> folder-menu-enabled: false;
+    in property <bool> can-create-child: false;
+    in property <bool> can-rename: false;
+    in property <bool> can-delete: false;
+    in property <bool> can-empty-trash: false;
+    // The row lists unread mail that "Mark all as read…" can mark (#234).
+    in property <bool> can-mark-all-read: false;
+    in property <bool> label-manageable: false;
+    in property <bool> label-can-create-child: false;
+    in property <bool> label-is-global: false;
+    in property <string> label-account-name: "";
+    in property <bool> mail-drop-enabled: false;
+    in property <bool> mail-drop-copies: false;
+    // A saved search, whose menu edits, moves and deletes it (#243). Its id
+    // is `label-id`.
+    in property <bool> saved-search: false;
+    in property <color> sidebar-background;
+    in property <color> selection-background;
+    in property <color> accent-color;
+    in property <color> body-color;
+    in property <color> muted-color;
+    in property <color> icon-color: muted-color;
+    in property <color> editable-color: icon-color;
+    callback clicked(string);
+    callback toggled(int, bool);
+    callback new-subfolder(int, int, string);
+    callback rename-folder(int, string);
+    callback delete-folder(int, string);
+    callback empty-trash(int);
+    // The row's scope and the name it shows.
+    callback mark-all-read(string, string);
+    callback new-child-label(int, int, string, string);
+    callback rename-label(int, string, color, string, bool);
+    callback delete-label(int, string, string, bool, bool);
+
+    height: root.visible ? root.row-height : 0px;
+    idle-background: root.sidebar-background;
+    hover-background: root.selection-background;
+    hovered: row-hit.has-hover;
+    active: root.selected || mail-drop-target.has-drag;
+    border-width: mail-drop-target.has-drag ? 2px : 0px;
+    border-color: root.accent-color;
+
+    SidebarIcon {
+        x: root.left-padding;
+        y: 0px;
+        height: root.row-height;
+        icon: root.icon;
+        color: root.icon-color;
+    }
+
+    if root.has-children: Image {
+        x: root.left-padding - 18px;
+        y: (root.row-height - self.height) / 2;
+        width: 12px;
+        height: 12px;
+        source: root.expanded
+            ? @image-url("../icons/lucide/outline/chevron-down.svg")
+            : @image-url("../icons/lucide/outline/chevron-right.svg");
+        colorize: root.muted-color;
+        image-fit: contain;
+        accessible-role: none;
+    }
+
+    Text {
+        x: root.left-padding + SidebarStyle.label-offset;
+        y: 0px;
+        width: max(0px, parent.width - self.x - (root.count == "" ? 6px : count-badge.width + 12px));
+        height: root.row-height;
+        text: root.label;
+        color: root.body-color;
+        font-size: SidebarStyle.label-size;
+        font-weight: root.selected ? SidebarStyle.selected-weight : SidebarStyle.normal-weight;
+        font-family: root.label-has-emoji ? "Noto Emoji" : "";
+        vertical-alignment: center;
+        overflow: elide;
+    }
+
+    count-badge := SidebarCountBadge {
+        x: parent.width - self.width - 6px;
+        y: (root.row-height - self.height) / 2;
+        count: root.count;
+        selected: root.selected;
+        accent-color: root.accent-color;
+        muted-color: root.muted-color;
+    }
+
+    // Folder and label actions. Rows without any keep the area disabled.
+    row-menu := ContextMenuArea {
+        enabled: root.interactive && (root.can-mark-all-read || root.folder-menu-enabled || root.can-empty-trash || root.label-manageable || root.saved-search);
+        width: parent.width;
+        height: parent.height;
+        Menu {
+            if root.can-mark-all-read: MenuItem {
+                title: @tr("Mark all as read…");
+                activated => { root.mark-all-read(root.scope, root.label); }
+            }
+            if root.can-mark-all-read && (root.folder-menu-enabled || root.can-empty-trash || root.label-manageable): MenuSeparator {}
+            if root.folder-menu-enabled: MenuItem {
+                title: @tr("New subfolder");
+                enabled: root.can-create-child;
+                activated => { root.new-subfolder(root.account-id, root.folder-id, root.label); }
+            }
+            if root.folder-menu-enabled: MenuItem {
+                title: @tr("Rename folder");
+                enabled: root.can-rename;
+                activated => { root.rename-folder(root.folder-id, root.label); }
+            }
+            if root.folder-menu-enabled: MenuItem {
+                title: @tr("Delete folder");
+                enabled: root.can-delete;
+                activated => { root.delete-folder(root.folder-id, root.label); }
+            }
+            if root.can-empty-trash: MenuItem {
+                title: @tr("Empty Trash…");
+                activated => { root.empty-trash(root.account-id); }
+            }
+            if root.label-manageable && root.label-can-create-child: MenuItem {
+                title: @tr("New nested label");
+                activated => { root.new-child-label(root.account-id, root.label-id, root.label-path, root.label-account-name); }
+            }
+            if root.label-manageable: MenuItem {
+                title: root.label-is-global ? @tr("Rename global label") : @tr("Rename label in {}", root.label-account-name);
+                activated => { root.rename-label(root.label-id, root.label-path, root.editable-color, root.label-account-name, root.label-is-global); }
+            }
+            if root.label-manageable: MenuItem {
+                title: root.label-is-global ? @tr("Delete global label") : @tr("Delete label from {}", root.label-account-name);
+                activated => { root.delete-label(root.label-id, root.label-path, root.label-account-name, root.label-is-global, root.has-children); }
+            }
+            if root.saved-search: MenuItem {
+                title: @tr("Edit saved search…");
+                activated => { SavedSearchUi.start-edit(root.label-id); }
+            }
+            if root.saved-search: MenuItem {
+                title: @tr("Move up");
+                activated => { SavedSearchUi.move(root.label-id, -1); }
+            }
+            if root.saved-search: MenuItem {
+                title: @tr("Move down");
+                activated => { SavedSearchUi.move(root.label-id, 1); }
+            }
+            if root.saved-search: MenuItem {
+                title: @tr("Delete saved search…");
+                activated => { SavedSearchUi.start-delete(root.label-id); }
+            }
+        }
+
+        row-hit := SidebarRowHit {
+            enabled: root.interactive;
+            menu-enabled: row-menu.enabled;
+            accessible-role: button;
+            accessible-label: root.accessible-name;
+            accessible-checked: root.selected;
+            accessible-action-default => { root.clicked(root.scope); }
+            activated => { root.clicked(root.scope); }
+            open-menu(position) => { row-menu.show(position); }
+            mouse-cursor: pointer;
+        }
+    }
+
+    if root.has-children: TouchArea {
+        enabled: root.interactive;
+        x: max(0px, root.left-padding - 22px);
+        y: 0px;
+        width: 22px;
+        height: root.row-height;
+        accessible-role: button;
+        accessible-label: root.label-tree-node
+            ? (root.expanded ? @tr("Collapse label") : @tr("Expand label"))
+            : (root.expanded ? @tr("Collapse folder") : @tr("Expand folder"));
+        accessible-expanded: root.expanded;
+        accessible-action-default => {
+            root.toggled(root.folder-id, !root.expanded);
+        }
+        clicked => { root.toggled(root.folder-id, !root.expanded); }
+        mouse-cursor: pointer;
+    }
+
+    mail-drop-target := DropArea {
+        width: parent.width;
+        height: parent.height;
+        enabled: root.interactive && root.mail-drop-enabled;
+        can-drop(event) => {
+            MailDragApi.can-drop-on-mailbox(
+                event.data,
+                root.scope,
+                root.account-id,
+                root.folder-id,
+            ) ? (root.mail-drop-copies ? DragAction.copy : DragAction.move) : DragAction.none
+        }
+        dropped(event) => {
+            if MailDragApi.drop-on-mailbox(
+                event.data,
+                root.scope,
+                root.account-id,
+                root.folder-id,
+            ) {
+                return root.mail-drop-copies ? DragAction.copy : DragAction.move;
+            }
+            return DragAction.none;
+        }
+    }
+}
+
+// Expansion belongs to the host model so recycled headers retain their state.
+export component SidebarSectionHeader inherits SidebarRowSurface {
+    in property <bool> interactive: true;
+    in property <string> label;
+    in property <string> detail;
+    // A collapsed account shows the unread mail of the folders it hides.
+    in property <string> count;
+    in property <string> avatar;
+    in property <image> avatar-image;
+    in property <bool> has-avatar-image: false;
+    in property <image> icon;
+    in property <bool> has-avatar: false;
+    in property <bool> open: true;
+    in property <color> sidebar-background;
+    in property <color> body-color;
+    in property <color> muted-color;
+    in property <color> icon-color;
+    in property <int> label-font-weight: SidebarStyle.selected-weight;
+    in property <length> left-padding: 4px;
+    in property <bool> folder-row-style: false;
+    // An account's heading offers that account's actions on right-click.
+    in property <bool> account-menu: false;
+    in property <bool> can-check-mail: true;
+    // An account's checks: a spinner while one runs, and a button that
+    // explains a problem that stops them.
+    in property <AccountStatus> status;
+    in property <bool> touch-mode: false;
+    // Headers and children share the same icon and text columns. The leading
+    // gutter belongs to disclosure controls, not to an extra icon indent.
+    private property <length> icon-left: root.left-padding + SidebarStyle.icon-left - 4px;
+    private property <length> label-left: root.icon-left + SidebarStyle.label-offset;
+    private property <bool> marked: root.status.marked && root.status.problem != AccountProblem.none;
+    private property <length> status-width: !(root.status.checking || root.marked) ? 0px
+        : root.touch-mode ? LayoutMetrics.touch-target : 24px;
+    private property <length> status-x: (root.count == "" ? root.width - 4px : count-badge.x - 2px) - root.status-width;
+    private property <length> trailing: (root.count == "" ? 8px : count-badge.width + 12px) + root.status-width;
+    private property <string> problem-title: AccountStatusText.problem(root.status.problem);
+    private property <bool> status-from-keyboard: false;
+    private property <string> last-checked: AccountStatusText.last-checked(root.status.checked_day, root.status.checked_at);
+    private property <bool> waiting: root.status.problem == AccountProblem.waiting;
+    // The menu's first line.
+    private property <string> status-line: root.status.checking ? @tr("Checking for new mail…")
+        : root.problem-title != "" ? root.problem-title : root.last-checked;
+    callback toggled(bool);
+    callback check-mail();
+    callback account-settings();
+    callback sign-in();
+
+    height: root.folder-row-style ? 28px : root.detail == "" ? 32px : 7px + max(20px, header-label.preferred-height) + header-detail.height;
+    idle-background: root.sidebar-background;
+    hovered: header-hit.has-hover;
+
+    Image {
+        x: root.left-padding;
+        y: (parent.height - self.height) / 2;
+        width: 12px;
+        height: 12px;
+        source: root.open
+            ? @image-url("../icons/lucide/outline/chevron-down.svg")
+            : @image-url("../icons/lucide/outline/chevron-right.svg");
+        colorize: root.muted-color;
+        image-fit: contain;
+        accessible-role: none;
+    }
+
+    if root.has-avatar: Avatar {
+        x: root.icon-left + (SidebarStyle.icon-size - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        size: 22px;
+        source: root.avatar-image;
+        has-source: root.has-avatar-image;
+        fallback: root.avatar;
+        background-color: root.has-avatar-image ? #ffffff : root.hover-background;
+        foreground-color: root.body-color;
+    }
+
+    if !root.has-avatar: SidebarIcon {
+        x: root.icon-left;
+        y: (parent.height - self.height) / 2;
+        height: 22px;
+        icon: root.icon;
+        color: root.icon-color;
+    }
+
+    header-label := Text {
+        x: root.label-left;
+        y: root.detail == "" ? 0px : 4px;
+        width: parent.width - self.x - root.trailing;
+        height: root.detail == "" ? parent.height : max(20px, self.preferred-height);
+        text: root.label;
+        color: root.body-color;
+        font-size: SidebarStyle.label-size;
+        font-weight: root.label-font-weight;
+        vertical-alignment: center;
+        overflow: elide;
+    }
+
+    header-detail := Text {
+        visible: root.detail != "";
+        x: root.label-left;
+        y: header-label.y + header-label.height - 2px;
+        width: parent.width - self.x - root.trailing;
+        height: max(15px, self.preferred-height);
+        text: root.detail;
+        color: root.muted-color;
+        font-size: TypeScale.caption;
+        vertical-alignment: center;
+        overflow: elide;
+    }
+
+
+    count-badge := SidebarCountBadge {
+        x: parent.width - self.width - 6px;
+        y: (parent.height - self.height) / 2;
+        count: root.count;
+        accent-color: root.muted-color;
+        muted-color: root.muted-color;
+    }
+
+    heading-menu := ContextMenuArea {
+        enabled: root.interactive && root.account-menu;
+        width: parent.width;
+        height: parent.height;
+        Menu {
+            // How the account's checks are going, then when it checks again
+            // while it waits for the server, or its last complete check when
+            // another problem stops them.
+            if root.status-line != "" : MenuItem {
+                title: root.status-line;
+                enabled: false;
+            }
+
+            if root.waiting && !root.status.checking && root.status.resume_at != "" : MenuItem {
+                title: AccountStatusText.checks-again(root.status.resume_day, root.status.resume_at);
+                enabled: false;
+            }
+
+            if root.problem-title != "" && !root.waiting && !root.status.checking && root.last-checked != "" : MenuItem {
+                title: root.last-checked;
+                enabled: false;
+            }
+
+            if root.status-line != "" : MenuSeparator {}
+
+            MenuItem {
+                title: @tr("Check for new mail");
+                enabled: root.can-check-mail;
+                activated => { root.check-mail(); }
+            }
+
+            MenuItem {
+                title: @tr("Account settings");
+                activated => { root.account-settings(); }
+            }
+        }
+
+        header-hit := SidebarRowHit {
+            enabled: root.interactive;
+            menu-enabled: heading-menu.enabled;
+            accessible-role: button;
+            accessible-label: root.label;
+            accessible-description: root.status-line;
+            accessible-expanded: root.open;
+            accessible-action-default => {
+                root.toggled(!root.open);
+            }
+            activated => {
+                root.toggled(!root.open);
+            }
+            open-menu(position) => { heading-menu.show(position); }
+            mouse-cursor: pointer;
+        }
+    }
+
+    if root.status.checking : ActivitySpinner {
+        x: root.status-x + (root.status-width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        color: root.muted-color;
+    }
+
+    // Above the row's own pointer area, so it takes its clicks.
+    if root.marked && !root.status.checking : IconButton {
+        x: root.status-x;
+        y: (parent.height - self.height) / 2;
+        width: root.status-width;
+        height: min(root.status-width, parent.height);
+        icon: root.waiting
+            ? @image-url("../icons/lucide/outline/history.svg")
+            : @image-url("../icons/lucide/outline/alert-circle.svg");
+        icon-size: 16px;
+        icon-color: root.waiting ? root.muted-color : AppTheme.destructive;
+        hover-background: AppTheme.muted-control-bg;
+        tooltip-text: root.problem-title;
+        clicked => {
+            root.status-from-keyboard = self.focus-visible;
+            status-popup.show();
+        }
+    }
+
+    status-popup := PopupWindow {
+        x: 4px;
+        y: root.height + 2px;
+        // On a desktop it may reach over the message list; in a phone drawer
+        // it stays inside the drawer.
+        width: root.touch-mode ? root.width - 8px : max(300px, root.width - 8px);
+        height: status-panel.preferred-height;
+        close-policy: close-on-click-outside;
+        forward-focus: popup-keys;
+        // Opened from the keyboard, focus goes on to the fixing action.
+        init => {
+            if root.status-from-keyboard {
+                status-panel.focus-action();
+            }
+        }
+
+        popup-keys := FocusScope {
+            key-pressed(event) => {
+                if event.text == Key.Escape {
+                    status-popup.close();
+                    return accept;
+                }
+                reject
+            }
+
+            status-panel := AccountStatusPanel {
+                status: root.status;
+                can-check-mail: root.can-check-mail;
+                touch: root.touch-mode;
+                check-mail => {
+                    status-popup.close();
+                    root.check-mail();
+                }
+                sign-in => {
+                    status-popup.close();
+                    root.sign-in();
+                }
+                account-settings => {
+                    status-popup.close();
+                    root.account-settings();
+                }
+            }
+        }
+    }
+}

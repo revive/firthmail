@@ -1,0 +1,3362 @@
+//! Thin wrapper around async-imap. Everything the sync engine needs goes
+//! through `ImapSession`, so async-imap API churn stays contained here.
+//!
+//! v1 keeps the protocol surface small: no CONDSTORE/QRESYNC - incremental
+//! sync is done with new-UID fetches, windowed flag polls, and UID-set
+//! reconciliation, which is correct on every server.
+
+use crate::error::{CoreError, LimitKind, Result};
+use crate::mime::{self, MimePlan};
+use crate::net::{self, MailStream};
+use base64::{Engine as _, engine::general_purpose::STANDARD_NO_PAD};
+use futures::StreamExt;
+use std::collections::{HashMap, HashSet};
+use std::future::Future;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, LazyLock, Mutex, PoisonError};
+use std::time::Duration;
+use tokio::net::TcpStream;
+use tokio_rustls::TlsConnector;
+
+// async-imap with runtime-tokio speaks tokio's AsyncRead/AsyncWrite natively.
+pub type Session = async_imap::Session<MailStream>;
+
+/// Metadata and mutation commands must never be able to wedge a sync actor.
+pub const METADATA_TIMEOUT: Duration = Duration::from_secs(30);
+/// Background message-content reads are allowed a little longer, but remain
+/// bounded so a throttled server cannot pin a worker forever.
+pub const CONTENT_TIMEOUT: Duration = Duration::from_secs(60);
+/// User-requested attachment reads may be large and get a larger deadline.
+pub const ATTACHMENT_TIMEOUT: Duration = Duration::from_secs(120);
+
+async fn with_deadline<T, F>(label: &'static str, timeout: Duration, future: F) -> Result<T>
+where
+    F: Future<Output = Result<T>>,
+{
+    // As long as the account's server timeout stretches it (#252).
+    let timeout = net::timeouts::scaled(timeout);
+    tokio::time::timeout(timeout, future).await.map_err(|_| {
+        tracing::warn!(
+            operation = label,
+            seconds = timeout.as_secs(),
+            "imap operation timed out"
+        );
+        CoreError::Imap(format!("{label} timed out after {}s", timeout.as_secs()))
+    })?
+}
+
+#[derive(Clone)]
+pub enum ImapCredentials {
+    Password { user: String, password: String },
+    XOAuth2 { user: String, access_token: String },
+}
+
+struct XOAuth2Authenticator {
+    response: String,
+    /// The initial client response is sent exactly once. Any further challenge
+    /// is the server's SASL *error* response, which must be answered per RFC.
+    sent_initial: bool,
+}
+
+/// The server a sign-in goes to, as error messages name it.
+#[derive(Clone, Copy)]
+struct SignInTarget<'a> {
+    host: &'a str,
+    port: u16,
+    /// Text a server sends over an unencrypted connection could come from
+    /// anyone on the path.
+    encrypted: bool,
+}
+
+/// A server's tagged NO or BAD reply to a command.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ServerReply {
+    /// BAD (the command wasn't understood) rather than NO.
+    bad: bool,
+    /// The response code in upper case: AUTHENTICATIONFAILED, NONEXISTENT
+    /// and the other RFC 5530 codes, or one imap-proto parses, such as ALERT
+    /// or TRYCREATE (RFC 9051 7.1).
+    code: Option<String>,
+    /// The server's text.
+    text: String,
+}
+
+impl ServerReply {
+    /// async-imap hands a tagged NO or BAD on only as text (async-imap
+    /// 0.12): `code: {code:?}, info: {information:?}` from
+    /// `Connection::check_status_ok`, and `outcome: {outcome:?}` from
+    /// SELECT, EXAMINE and STATUS (`parse_mailbox`, `parse_status`).
+    /// imap-proto parses ALERT itself and leaves the RFC 5530 codes at the
+    /// start of the text. Read the fields directly once async-imap exposes
+    /// them (chatmail/async-imap#157).
+    fn from_async_imap(formatted: &str, bad: bool) -> Self {
+        let fields = formatted
+            .strip_prefix("outcome: Outcome { code: ")
+            .and_then(|outcome| outcome.strip_suffix(" }"))
+            .and_then(|outcome| outcome.split_once(", information: "))
+            .or_else(|| formatted.strip_prefix("code: ")?.split_once(", info: "));
+        let parsed = fields.and_then(|(code, info)| {
+            let text = match info {
+                "None" => String::new(),
+                quoted => read_debug_str(quoted.strip_prefix("Some(")?.strip_suffix(')')?)?,
+            };
+            Some((code, text))
+        });
+        let Some((code, text)) = parsed else {
+            return Self {
+                bad,
+                code: None,
+                text: formatted.to_owned(),
+            };
+        };
+        let code = match code.strip_prefix("Some(") {
+            Some(name) => Some(response_code_name(name)),
+            None => leading_response_code(&text),
+        };
+        Self { bad, code, text }
+    }
+
+    /// The reply in a tagged response read without async-imap's help.
+    fn from_outcome(bad: bool, outcome: &async_imap::imap_proto::Outcome<'_>) -> Self {
+        let text = outcome
+            .information
+            .as_deref()
+            .unwrap_or_default()
+            .to_owned();
+        let code = match &outcome.code {
+            Some(code) => Some(response_code_name(&format!("{code:?}"))),
+            None => leading_response_code(&text),
+        };
+        Self { bad, code, text }
+    }
+
+    /// The server's text for an error message. Over an unencrypted
+    /// connection it is marked as unverified, as RFC 9051 7.1 asks for
+    /// alerts.
+    fn quoted(&self, encrypted: bool) -> String {
+        match self.text.trim() {
+            "" => String::new(),
+            text if encrypted => format!(" ({text})"),
+            text => format!(" (unverified reply over an unencrypted connection: {text})"),
+        }
+    }
+}
+
+/// The reply as the server wrote it, such as
+/// `NO [NONEXISTENT] Unknown Mailbox: Old (Failure)`.
+impl std::fmt::Display for ServerReply {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(if self.bad { "BAD" } else { "NO" })?;
+        let text = self.text.trim();
+        // imap-proto takes the codes it knows out of the text.
+        if let Some(code) = &self.code
+            && leading_response_code(text).is_none()
+        {
+            write!(f, " [{code}]")?;
+        }
+        if !text.is_empty() {
+            write!(f, " {text}")?;
+        }
+        Ok(())
+    }
+}
+
+/// The name of a response code imap-proto parsed, from its `{:?}` form:
+/// TRYCREATE from `TryCreate`, UIDNEXT from `UidNext(5)`.
+fn response_code_name(debug: &str) -> String {
+    debug
+        .chars()
+        .take_while(char::is_ascii_alphanumeric)
+        .collect::<String>()
+        .to_ascii_uppercase()
+}
+
+/// The error for a command async-imap reports as failed. A tagged NO or BAD
+/// turns down only that command and leaves the connection in step for the
+/// next one; anything else may have left it mid-response.
+pub(crate) fn command_error(error: async_imap::error::Error) -> CoreError {
+    use async_imap::error::Error;
+    match error {
+        Error::No(formatted) => refusal(ServerReply::from_async_imap(&formatted, false)),
+        Error::Bad(formatted) => refusal(ServerReply::from_async_imap(&formatted, true)),
+        error => CoreError::Imap(error.to_string()),
+    }
+}
+
+fn refusal(reply: ServerReply) -> CoreError {
+    match LimitKind::in_text(&reply.text) {
+        // Only words that clearly ask to slow down count here: a code alone
+        // can be about the command, as LIMIT is about too many flags in RFC
+        // 5530's own example.
+        Some(kind) => CoreError::RateLimited {
+            service: "the server".to_owned(),
+            kind,
+            retry_after: suggested_backoff(&reply.text),
+            detail: reply.to_string(),
+        },
+        None => CoreError::ImapRefused(reply.to_string()),
+    }
+}
+
+/// The wait Exchange Online names when it throttles a connection, as in
+/// "Request is throttled. Suggested Backoff Time: 165839 milliseconds".
+fn suggested_backoff(text: &str) -> Option<std::time::Duration> {
+    let text = text.to_ascii_lowercase();
+    let rest = text.split_once("suggested backoff time:")?.1.trim_start();
+    let digits = rest
+        .find(|c: char| !c.is_ascii_digit())
+        .map_or(rest, |end| &rest[..end]);
+    let amount: u64 = digits.parse().ok()?;
+    let unit = rest[digits.len()..].trim_start();
+    Some(if unit.starts_with("ms") || unit.starts_with("milli") {
+        std::time::Duration::from_millis(amount)
+    } else {
+        std::time::Duration::from_secs(amount)
+    })
+}
+
+/// The response code at the start of a reply's text, such as UNAVAILABLE in
+/// "[UNAVAILABLE] Try again later" (RFC 5530).
+fn leading_response_code(text: &str) -> Option<String> {
+    let rest = text.strip_prefix('[')?;
+    let atom = &rest[..rest.find([']', ' '])?];
+    (!atom.is_empty()
+        && atom
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-'))
+    .then(|| atom.to_ascii_uppercase())
+}
+
+/// Read back a string written with `{:?}`.
+fn read_debug_str(quoted: &str) -> Option<String> {
+    let mut chars = quoted.strip_prefix('"')?.strip_suffix('"')?.chars();
+    let mut text = String::new();
+    while let Some(c) = chars.next() {
+        text.push(match c {
+            '\\' => match chars.next()? {
+                'n' => '\n',
+                'r' => '\r',
+                't' => '\t',
+                '0' => '\0',
+                escaped @ ('\\' | '"' | '\'') => escaped,
+                'u' => {
+                    if chars.next()? != '{' {
+                        return None;
+                    }
+                    let hex: String = chars.by_ref().take_while(|&c| c != '}').collect();
+                    char::from_u32(u32::from_str_radix(&hex, 16).ok()?)?
+                }
+                _ => return None,
+            },
+            c => c,
+        });
+    }
+    Some(text)
+}
+
+/// Why a server did not sign in, sorted by RFC 5530 the way Thunderbird,
+/// K-9 Mail, Evolution and Geary sort it: only a refusal without a code, or
+/// with one about the credentials, says they are wrong.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SignInFailure {
+    /// The credentials weren't accepted, and trying again won't help: a NO
+    /// without a code or with AUTHENTICATIONFAILED, AUTHORIZATIONFAILED or
+    /// EXPIRED, a BAD, or an ALERT the user has to read (RFC 3501 7.1).
+    Rejected(ServerReply),
+    /// UNAVAILABLE: the server can't check credentials right now, and they
+    /// may well be right.
+    Unavailable(ServerReply),
+    /// Another response code: a server problem new credentials won't fix.
+    Refused(ServerReply),
+    /// The server asked to wait: too many connections or requests for now,
+    /// or the mailbox in use (LIMIT, INUSE, or words that say so, even in
+    /// an ALERT). Signing in again at once would only count against it.
+    Limited(ServerReply, LimitKind),
+    /// The username or password has a line break, so nothing was sent.
+    Unsendable,
+    /// The connection failed before the server answered. Not a refusal.
+    Transport(String),
+}
+
+impl SignInFailure {
+    fn from_imap(error: async_imap::error::Error) -> Self {
+        use async_imap::error::Error;
+        let reply = match error {
+            Error::No(formatted) => ServerReply::from_async_imap(&formatted, false),
+            Error::Bad(formatted) => ServerReply::from_async_imap(&formatted, true),
+            Error::Validate(_) => return Self::Unsendable,
+            error => return Self::Transport(error.to_string()),
+        };
+        if let Some(kind) = LimitKind::in_text(&reply.text) {
+            return Self::Limited(reply, kind);
+        }
+        match reply.code.as_deref() {
+            _ if reply.bad => Self::Rejected(reply),
+            None | Some("AUTHENTICATIONFAILED" | "AUTHORIZATIONFAILED" | "EXPIRED" | "ALERT") => {
+                Self::Rejected(reply)
+            }
+            Some("UNAVAILABLE") => Self::Unavailable(reply),
+            // At sign-in these are about the account, not a command: Dovecot
+            // 2.4 refuses connections over its limit with LIMIT.
+            Some("LIMIT") => Self::Limited(reply, LimitKind::Requests),
+            Some("INUSE") => Self::Limited(reply, LimitKind::Busy),
+            Some(_) => Self::Refused(reply),
+        }
+    }
+
+    /// Whether LOGIN may still work after AUTHENTICATE PLAIN failed this
+    /// way. Some servers announce AUTH=PLAIN and then refuse it (K-9 Mail
+    /// #2648 and #9406), and RFC 9051 6.2.3 allows LOGIN once AUTHENTICATE
+    /// has failed. A coded rejection after the credentials went out is
+    /// final, though: RFC 5530 says retrying the same credentials is
+    /// pointless, and every try counts against the server's lockout limits.
+    fn allows_login_after_plain(&self, credentials_sent: bool) -> bool {
+        match self {
+            Self::Transport(_) | Self::Unavailable(_) | Self::Limited(..) | Self::Unsendable => {
+                false
+            }
+            _ if !credentials_sent => true,
+            Self::Rejected(reply) => reply.bad || reply.code.is_none(),
+            Self::Refused(_) => false,
+        }
+    }
+
+    /// The error for a password sign-in. Only a rejection waits for the
+    /// user; anything else is retried like other connection problems.
+    fn into_error(self, target: SignInTarget<'_>, user: &str) -> CoreError {
+        let host = target.host;
+        match self {
+            Self::Rejected(reply) => {
+                let quoted = reply.quoted(target.encrypted);
+                CoreError::Auth(match reply.code.as_deref() {
+                    Some("EXPIRED") => {
+                        format!("{host} says the password for {user} has expired{quoted}")
+                    }
+                    _ if reply.bad => {
+                        format!("{host} did not accept the sign-in for {user}{quoted}")
+                    }
+                    _ => format!("{host} rejected the username {user} or its password{quoted}"),
+                })
+            }
+            Self::Unavailable(reply) => CoreError::Imap(format!(
+                "{host} can't check sign-ins right now{}",
+                reply.quoted(target.encrypted)
+            )),
+            Self::Refused(reply) => CoreError::Imap(format!(
+                "{host} refused the sign-in for {user}{}",
+                reply.quoted(target.encrypted)
+            )),
+            Self::Limited(reply, kind) => CoreError::RateLimited {
+                service: host.to_owned(),
+                kind,
+                retry_after: suggested_backoff(&reply.text),
+                detail: reply.to_string(),
+            },
+            Self::Unsendable => CoreError::Auth(format!(
+                "the username or password for {host} has a line break, which can't be sent"
+            )),
+            Self::Transport(detail) => CoreError::Imap(format!(
+                "connection to {host} failed while signing in: {detail}"
+            )),
+        }
+    }
+}
+
+/// OAuth sign-in failures. Exchange Online sometimes accepts the OAuth
+/// identity but fails to attach the resulting IMAP session to the mailbox,
+/// answering "User is authenticated but not connected." That is a transient
+/// mailbox/backend failure, not evidence that the refresh token was revoked,
+/// so it stays out of `Auth` and the sync actor uses its normal reconnect
+/// backoff instead of pausing indefinitely in `needs_reauth`.
+fn xoauth2_error(
+    target: SignInTarget<'_>,
+    user: &str,
+    error: async_imap::error::Error,
+) -> CoreError {
+    match SignInFailure::from_imap(error) {
+        SignInFailure::Rejected(reply)
+            if reply
+                .text
+                .to_ascii_lowercase()
+                .contains("user is authenticated but not connected") =>
+        {
+            CoreError::Imap(format!(
+                "{} signed in {user} but could not open the mailbox{}",
+                target.host,
+                reply.quoted(target.encrypted)
+            ))
+        }
+        SignInFailure::Rejected(reply) => CoreError::Auth(format!(
+            "{} rejected the OAuth sign-in for {user}{}",
+            target.host,
+            reply.quoted(target.encrypted)
+        )),
+        failure => failure.into_error(target, user),
+    }
+}
+
+impl async_imap::Authenticator for XOAuth2Authenticator {
+    type Response = String;
+    fn process(&mut self, challenge: &[u8]) -> Self::Response {
+        if !self.sent_initial {
+            // First challenge (empty `+`): send the base64 XOAUTH2 credential.
+            self.sent_initial = true;
+            return self.response.clone();
+        }
+        // Auth failed: the server sent an error challenge (a base64 JSON blob
+        // like {"status":"...","schemes":"Bearer",...}). Per SASL XOAUTH2
+        // (RFC 7628) the client MUST reply with an EMPTY response so the server
+        // can emit the tagged `NO <reason>`. Echoing the credential again makes
+        // Gmail/Outlook keep issuing error challenges, deadlocking the exchange
+        // until the socket times out (the "sync never starts" hang).
+        tracing::warn!(
+            challenge = %String::from_utf8_lossy(challenge),
+            "imap xoauth2: server rejected token; replying empty to surface the error"
+        );
+        String::new()
+    }
+}
+
+/// SASL PLAIN (RFC 4616): one message with the username and password as
+/// UTF-8, which LOGIN's quoted strings can't carry to IMAP4rev1 servers.
+struct PlainAuthenticator {
+    message: String,
+    /// Set once the server asked for the credentials, so a refusal tells
+    /// whether they were sent.
+    challenged: Arc<AtomicBool>,
+}
+
+impl async_imap::Authenticator for PlainAuthenticator {
+    type Response = String;
+    fn process(&mut self, _challenge: &[u8]) -> Self::Response {
+        // PLAIN has a single message. A further challenge can only come
+        // before a failure, and an empty reply lets the server send it.
+        if self.challenged.swap(true, Ordering::Relaxed) {
+            return String::new();
+        }
+        std::mem::take(&mut self.message)
+    }
+}
+
+/// What a server announced before sign-in that decides how to sign in.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct SignInCapabilities {
+    /// AUTH=PLAIN: SASL PLAIN is offered.
+    plain: bool,
+    /// LOGINDISABLED: the LOGIN command must not be sent (RFC 9051 6.2.3).
+    login_disabled: bool,
+}
+
+impl SignInCapabilities {
+    fn add(&mut self, capabilities: &[async_imap::imap_proto::Capability<'_>]) {
+        use async_imap::imap_proto::Capability;
+        for capability in capabilities {
+            match capability {
+                Capability::Auth(mechanism) if mechanism.eq_ignore_ascii_case("PLAIN") => {
+                    self.plain = true;
+                }
+                Capability::Atom(name) if name.eq_ignore_ascii_case("LOGINDISABLED") => {
+                    self.login_disabled = true;
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+/// Servers, as "host:port", whose AUTH=PLAIN failed where LOGIN then worked.
+/// Later connections go straight to LOGIN, so a broken mechanism doesn't add
+/// a failed sign-in, which servers count toward lockouts, to every
+/// reconnect.
+static PLAIN_UNUSABLE: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(Default::default);
+
+fn plain_unusable_key(target: SignInTarget<'_>) -> String {
+    format!("{}:{}", target.host.to_ascii_lowercase(), target.port)
+}
+
+/// Sign in with a password: SASL PLAIN when the server offers it and LOGIN
+/// only as the last resort (RFC 9051 6.2.3), like Thunderbird and K-9 Mail.
+/// An account set to one `method` (#252) signs in that way only, even
+/// unannounced, but over an unencrypted connection only as the server offers.
+async fn sign_in_with_password<T>(
+    client: async_imap::Client<T>,
+    target: SignInTarget<'_>,
+    user: &str,
+    password: &str,
+    capabilities: SignInCapabilities,
+    method: crate::models::LoginMethod,
+) -> Result<async_imap::Session<T>>
+where
+    T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + std::fmt::Debug + Send,
+{
+    use crate::models::LoginMethod;
+    let key = plain_unusable_key(target);
+    let plain_unusable = PLAIN_UNUSABLE
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .contains(&key);
+    let mut client = client;
+    let mut plain_failure = None;
+    let host = target.host;
+    let try_plain = match method {
+        LoginMethod::Plain => capabilities.plain || target.encrypted,
+        LoginMethod::Login => false,
+        LoginMethod::Automatic | LoginMethod::None => capabilities.plain && !plain_unusable,
+    };
+    if method == LoginMethod::Plain && !try_plain {
+        return Err(CoreError::Imap(if capabilities.login_disabled {
+            format!(
+                "{host} accepts passwords only over an encrypted connection. Choose STARTTLS or SSL/TLS."
+            )
+        } else {
+            format!(
+                "{host} doesn't offer PLAIN sign-in without encryption. Choose STARTTLS or SSL/TLS, or another sign-in method."
+            )
+        }));
+    }
+    if try_plain {
+        let challenged = Arc::new(AtomicBool::new(false));
+        let authenticator = PlainAuthenticator {
+            message: format!("\0{user}\0{password}"),
+            challenged: challenged.clone(),
+        };
+        match client.authenticate("PLAIN", authenticator).await {
+            Ok(session) => return Ok(session),
+            Err((error, returned)) => {
+                let failure = SignInFailure::from_imap(error);
+                if method == LoginMethod::Plain
+                    || capabilities.login_disabled
+                    || !failure.allows_login_after_plain(challenged.load(Ordering::Relaxed))
+                {
+                    return Err(failure.into_error(target, user));
+                }
+                tracing::info!(
+                    host = target.host,
+                    "imap connect: AUTHENTICATE PLAIN failed; trying LOGIN"
+                );
+                plain_failure = Some(failure);
+                client = returned;
+            }
+        }
+    }
+    if capabilities.login_disabled {
+        return Err(CoreError::Imap(match (method, target.encrypted) {
+            (LoginMethod::Login, true) => {
+                format!("{host} doesn't offer LOGIN sign-in. Choose another sign-in method.")
+            }
+            (LoginMethod::Login, false) if capabilities.plain => format!(
+                "{host} doesn't offer LOGIN sign-in without encryption. Choose STARTTLS or SSL/TLS, or another sign-in method."
+            ),
+            (_, true) => format!("{host} offers no sign-in with a password"),
+            (_, false) => format!(
+                "{host} accepts passwords only over an encrypted connection. Choose STARTTLS or SSL/TLS."
+            ),
+        }));
+    }
+    match client.login(user, password).await {
+        Ok(session) => {
+            if plain_failure.is_some() {
+                PLAIN_UNUSABLE
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .insert(key);
+            }
+            Ok(session)
+        }
+        Err((error, _)) => {
+            let failure = match (SignInFailure::from_imap(error), plain_failure) {
+                // A server may hang up instead of answering LOGIN after a
+                // failed AUTHENTICATE (K-9 Mail #6762); then PLAIN's answer
+                // is the one to report.
+                (SignInFailure::Transport(_), Some(plain)) => plain,
+                (failure, _) => failure,
+            };
+            Err(failure.into_error(target, user))
+        }
+    }
+}
+
+/// Connect with TLS from the first byte, trusting only the system roots,
+/// through the app's proxy.
+pub async fn connect(host: &str, port: u16, creds: ImapCredentials) -> Result<Session> {
+    use crate::models::{ConnectionSecurity, MailConnectionSettings};
+    connect_with_settings(
+        host,
+        port,
+        creds,
+        &MailConnectionSettings::new(ConnectionSecurity::Tls, ConnectionSecurity::Tls),
+    )
+    .await
+}
+
+/// Connect as `settings` say, through the app's proxy.
+pub async fn connect_with_settings(
+    host: &str,
+    port: u16,
+    creds: ImapCredentials,
+    settings: &crate::models::MailConnectionSettings,
+) -> Result<Session> {
+    connect_as(net::proxy::Owner::App, host, port, creds, settings).await
+}
+
+/// Connect as `settings` say, through the proxy of `owner`.
+pub async fn connect_as(
+    owner: net::proxy::Owner,
+    host: &str,
+    port: u16,
+    creds: ImapCredentials,
+    settings: &crate::models::MailConnectionSettings,
+) -> Result<Session> {
+    // Bound the whole handshake so a silent stall (server never sends the
+    // greeting, or an AUTHENTICATE that never gets a tagged response) surfaces
+    // as an error instead of hanging the sync actor forever.
+    const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+    let timeout = net::timeouts::stretch(CONNECT_TIMEOUT, settings.server_timeout());
+    tokio::time::timeout(timeout, connect_inner(owner, host, port, creds, settings))
+        .await
+        .map_err(|_| {
+            tracing::warn!(%host, port, seconds = timeout.as_secs(), "imap connect: timed out");
+            CoreError::Imap(format!(
+                "connect {host}:{port}: timed out after {}s",
+                timeout.as_secs()
+            ))
+        })?
+}
+
+async fn connect_inner(
+    owner: net::proxy::Owner,
+    host: &str,
+    port: u16,
+    creds: ImapCredentials,
+    settings: &crate::models::MailConnectionSettings,
+) -> Result<Session> {
+    use crate::models::ConnectionSecurity;
+    let security = settings.incoming_security;
+    if !security.is_encrypted() && matches!(creds, ImapCredentials::XOAuth2 { .. }) {
+        return Err(CoreError::Tls(
+            "OAuth sign-in needs an encrypted connection.".into(),
+        ));
+    }
+    let connector = net::tls::connector(&settings.trusted_certificate_pem)?;
+    let scheme = if security == ConnectionSecurity::Tls {
+        "imaps"
+    } else {
+        "imap"
+    };
+    let tcp = net::proxy::connect_for(owner, scheme, host, port)
+        .await
+        .map_err(|e| CoreError::Imap(format!("connect {host}:{port}: {e}")))?;
+    let stream = match security {
+        ConnectionSecurity::Tls => tls_handshake(&connector, tcp, host, port).await?,
+        ConnectionSecurity::Starttls => {
+            let mut client = async_imap::Client::new(tcp);
+            read_greeting(&mut client).await?;
+            // Required upgrade: never send credentials if STARTTLS is rejected.
+            client
+                .run_command_and_check_ok("STARTTLS", None)
+                .await
+                .map_err(|e| {
+                    CoreError::Tls(format!(
+                        "IMAP STARTTLS was rejected: {e}. Check the server port and security mode."
+                    ))
+                })?;
+            tls_handshake(&connector, client.into_inner(), host, port).await?
+        }
+        ConnectionSecurity::None => MailStream::Plain(tcp),
+    };
+    let mut client = async_imap::Client::new(stream);
+    // STARTTLS has already consumed the greeting; no second greeting follows,
+    // and what the server announced before TLS can't be trusted (RFC 9051
+    // 6.2.1).
+    let announced = if security == ConnectionSecurity::Starttls {
+        None
+    } else {
+        read_greeting(&mut client).await?
+    };
+
+    let target = SignInTarget {
+        host,
+        port,
+        encrypted: security.is_encrypted(),
+    };
+    let mut session = match creds {
+        ImapCredentials::Password { user, password } => {
+            let capabilities = match announced {
+                Some(capabilities) => capabilities,
+                None => request_capabilities(&mut client).await?,
+            };
+            sign_in_with_password(
+                client,
+                target,
+                &user,
+                &password,
+                capabilities,
+                settings.incoming_login,
+            )
+            .await?
+        }
+        ImapCredentials::XOAuth2 { user, access_token } => {
+            let auth = XOAuth2Authenticator {
+                response: crate::oauth::xoauth2::raw_response(&user, &access_token),
+                sent_initial: false,
+            };
+            client
+                .authenticate("XOAUTH2", auth)
+                .await
+                .map_err(|(error, _)| xoauth2_error(target, &user, error))?
+        }
+    };
+    identify_client(&mut session).await;
+    tracing::debug!(%host, "imap connect: authenticated");
+    Ok(session)
+}
+
+async fn tls_handshake(
+    connector: &TlsConnector,
+    tcp: TcpStream,
+    host: &str,
+    port: u16,
+) -> Result<MailStream> {
+    let tls = net::tls::handshake(connector, tcp, host)
+        .await
+        .map_err(|e| {
+            CoreError::Tls(format!(
+                "IMAP {host}:{port}: {e}. {}",
+                net::tls::handshake_advice(&e)
+            ))
+        })?;
+    Ok(MailStream::Tls(Box::new(tls)))
+}
+
+/// Ask what the server offers for sign-in, before any credentials are sent:
+/// SASL PLAIN, and whether LOGIN is disabled, as servers that accept
+/// passwords only over TLS announce on unencrypted connections.
+async fn request_capabilities<T>(client: &mut async_imap::Client<T>) -> Result<SignInCapabilities>
+where
+    T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + std::fmt::Debug + Send,
+{
+    use async_imap::imap_proto::{Response, Status};
+    use tokio::io::AsyncWriteExt;
+    // async-imap has no CAPABILITY command before sign-in, so send it with a
+    // tag its own counter (A0001, A0002, ...) never produces. Nothing else has
+    // been sent yet, so no buffered command can interleave with it.
+    const TAG: &str = "flectar0";
+    let stream = client.get_mut();
+    stream
+        .write_all(format!("{TAG} CAPABILITY\r\n").as_bytes())
+        .await
+        .map_err(|e| CoreError::Imap(format!("CAPABILITY: {e}")))?;
+    stream
+        .flush()
+        .await
+        .map_err(|e| CoreError::Imap(format!("CAPABILITY: {e}")))?;
+    let mut announced = SignInCapabilities::default();
+    loop {
+        let response = client
+            .read_response()
+            .await
+            .map_err(|e| CoreError::Imap(e.to_string()))?
+            .ok_or_else(|| CoreError::Imap("Server closed during CAPABILITY.".into()))?;
+        match response.parsed() {
+            Response::Capabilities(capabilities) => announced.add(capabilities),
+            Response::Done {
+                tag,
+                status,
+                outcome,
+            } if tag.0 == TAG => {
+                return match status {
+                    Status::Ok => Ok(announced),
+                    _ => Err(CoreError::Imap(format!(
+                        "CAPABILITY failed: {}",
+                        outcome.information.as_deref().unwrap_or_default()
+                    ))),
+                };
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Read the greeting, and the capabilities it announces if it does (RFC 9051
+/// 7.1 lets a greeting carry a CAPABILITY response code).
+async fn read_greeting<T>(client: &mut async_imap::Client<T>) -> Result<Option<SignInCapabilities>>
+where
+    T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + std::fmt::Debug + Send,
+{
+    use async_imap::imap_proto::{Response, ResponseCode};
+    let greeting = client
+        .read_response()
+        .await
+        .map_err(|e| CoreError::Imap(e.to_string()))?
+        .ok_or_else(|| CoreError::Imap("Server closed before the IMAP greeting.".into()))?;
+    Ok(match greeting.parsed() {
+        Response::Data { outcome, .. } => match &outcome.code {
+            Some(ResponseCode::Capabilities(capabilities)) => {
+                let mut announced = SignInCapabilities::default();
+                announced.add(capabilities);
+                Some(announced)
+            }
+            _ => None,
+        },
+        _ => None,
+    })
+}
+
+/// Identify Flectar Mail to servers that implement RFC 2971. Some services
+/// accept authentication but reject mailbox access until the client sends this
+/// command. Keep the payload limited to public application metadata.
+async fn identify_client(session: &mut Session) {
+    // The surrounding connection deadline bounds these best-effort commands.
+    // A standards-compliant server should answer CAPABILITY, but failure to
+    // identify must not make an otherwise usable account incompatible.
+    let capabilities = match session.capabilities().await {
+        Ok(capabilities) => capabilities,
+        Err(error) => {
+            tracing::warn!(%error, "imap connect: could not query ID capability");
+            return;
+        }
+    };
+    if !capabilities.has_str("ID") {
+        return;
+    }
+
+    match session
+        .id([
+            ("name", Some("Flectar Mail")),
+            ("version", Some(env!("CARGO_PKG_VERSION"))),
+            ("vendor", Some("Flectar")),
+        ])
+        .await
+    {
+        Ok(_) => tracing::debug!("imap connect: client identity accepted"),
+        Err(error) => tracing::warn!(%error, "imap connect: server rejected client identity"),
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct RemoteFolder {
+    pub name: String,
+    pub delimiter: Option<String>,
+    /// Lowercased attributes, e.g. "\\sent", "\\noselect".
+    pub attributes: Vec<String>,
+}
+
+/// Decode the modified UTF-7 form used by traditional IMAP mailbox names.
+/// Servers that advertise UTF8=ACCEPT may already return UTF-8; text without
+/// modified UTF-7 runs passes through unchanged.
+pub fn decode_mailbox_name(name: &str) -> String {
+    let mut decoded = String::with_capacity(name.len());
+    let mut rest = name;
+    while let Some(start) = rest.find('&') {
+        decoded.push_str(&rest[..start]);
+        rest = &rest[start + 1..];
+        let Some(end) = rest.find('-') else {
+            decoded.push('&');
+            decoded.push_str(rest);
+            return decoded;
+        };
+        let encoded = &rest[..end];
+        rest = &rest[end + 1..];
+        if encoded.is_empty() {
+            decoded.push('&');
+            continue;
+        }
+        let standard = encoded.replace(',', "/");
+        let Ok(bytes) = STANDARD_NO_PAD.decode(standard) else {
+            decoded.push('&');
+            decoded.push_str(encoded);
+            decoded.push('-');
+            continue;
+        };
+        if !bytes.len().is_multiple_of(2) {
+            decoded.push('&');
+            decoded.push_str(encoded);
+            decoded.push('-');
+            continue;
+        }
+        let units = bytes
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|pair| u16::from_be_bytes(*pair));
+        let text = char::decode_utf16(units).collect::<std::result::Result<String, _>>();
+        match text {
+            Ok(text) => decoded.push_str(&text),
+            Err(_) => {
+                decoded.push('&');
+                decoded.push_str(encoded);
+                decoded.push('-');
+            }
+        }
+    }
+    decoded.push_str(rest);
+    decoded
+}
+
+/// Encode a user-entered mailbox name for an IMAP server that uses modified
+/// UTF-7. Printable ASCII is kept verbatim, except `&`, which is represented
+/// by the special `&-` sequence.
+pub fn encode_mailbox_name(name: &str) -> String {
+    let mut encoded = String::with_capacity(name.len());
+    let mut unicode_run = String::new();
+    let flush = |run: &mut String, output: &mut String| {
+        if run.is_empty() {
+            return;
+        }
+        let bytes = run
+            .encode_utf16()
+            .flat_map(u16::to_be_bytes)
+            .collect::<Vec<_>>();
+        output.push('&');
+        output.push_str(&STANDARD_NO_PAD.encode(bytes).replace('/', ","));
+        output.push('-');
+        run.clear();
+    };
+    for character in name.chars() {
+        if (' '..='~').contains(&character) {
+            flush(&mut unicode_run, &mut encoded);
+            if character == '&' {
+                encoded.push_str("&-");
+            } else {
+                encoded.push(character);
+            }
+        } else {
+            unicode_run.push(character);
+        }
+    }
+    flush(&mut unicode_run, &mut encoded);
+    encoded
+}
+
+pub async fn list_folders(session: &mut Session) -> Result<Vec<RemoteFolder>> {
+    with_deadline("LIST", METADATA_TIMEOUT, list_folders_inner(session)).await
+}
+
+async fn list_folders_inner(session: &mut Session) -> Result<Vec<RemoteFolder>> {
+    let mut out = Vec::new();
+    {
+        let mut stream = session
+            .list(Some(""), Some("*"))
+            .await
+            .map_err(command_error)?;
+        while let Some(item) = stream.next().await {
+            let name = item.map_err(command_error)?;
+            let attributes = name
+                .attributes()
+                .iter()
+                .map(|a| format!("{a:?}").to_lowercase())
+                .collect();
+            out.push(RemoteFolder {
+                name: name.name().to_string(),
+                delimiter: name.delimiter().map(|d| d.to_string()),
+                attributes,
+            });
+        }
+    }
+    Ok(out)
+}
+
+/// The names of the mailboxes the user subscribed to that match `pattern`
+/// (RFC 9051 6.3.7). A subscription can outlive its mailbox, so a name here
+/// may name none. Every IMAP4rev1 server answers LSUB; RFC 9051 deprecates it
+/// in favour of LIST (SUBSCRIBED), which a server that turns LSUB down is
+/// asked instead.
+pub async fn list_subscribed(session: &mut Session, pattern: &str) -> Result<HashSet<String>> {
+    with_deadline(
+        "LSUB",
+        METADATA_TIMEOUT,
+        list_subscribed_inner(session, pattern),
+    )
+    .await
+}
+
+async fn list_subscribed_inner(session: &mut Session, pattern: &str) -> Result<HashSet<String>> {
+    let pattern = quoted_mailbox(pattern)
+        .ok_or_else(|| CoreError::Imap("folder name pattern can't be quoted".into()))?;
+    match subscribed_names(session, &format!("LSUB \"\" {pattern}")).await {
+        Err(CoreError::ImapRefused(_)) => {
+            subscribed_names(session, &format!("LIST (SUBSCRIBED) \"\" {pattern}")).await
+        }
+        result => result,
+    }
+}
+
+/// The mailbox names an LSUB or LIST (SUBSCRIBED) `command` lists. Read
+/// here rather than through async-imap's `lsub`, whose stream ends at the
+/// tagged reply without telling a refusal from an empty list.
+async fn subscribed_names(session: &mut Session, command: &str) -> Result<HashSet<String>> {
+    use async_imap::imap_proto::{MailboxDatum, NameAttribute, Response, Status};
+    let tag = session.run_command(command).await.map_err(command_error)?;
+    let mut names = HashSet::new();
+    loop {
+        let response = session
+            .read_response()
+            .await
+            .map_err(|e| CoreError::Imap(e.to_string()))?
+            .ok_or_else(|| CoreError::Imap("connection closed during LSUB".into()))?;
+        match response.parsed() {
+            Response::Done {
+                tag: done,
+                status,
+                outcome,
+            } if *done == tag => {
+                return match status {
+                    Status::Ok => Ok(names),
+                    _ => Err(refusal(ServerReply::from_outcome(
+                        *status == Status::Bad,
+                        outcome,
+                    ))),
+                };
+            }
+            // imap-proto reads LSUB replies as LIST ones.
+            Response::MailboxData(MailboxDatum::List(listed)) => {
+                // RFC 5258 also lists subscriptions whose mailbox is gone.
+                let gone = listed.name_attributes.iter().any(|attribute| {
+                    matches!(attribute, NameAttribute::Extension(name)
+                        if name.eq_ignore_ascii_case("\\NonExistent"))
+                });
+                if !gone {
+                    names.insert(listed.name.to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Add `name` to the user's subscribed mailboxes, so clients that show only
+/// those, this one among them, list it.
+pub async fn subscribe(session: &mut Session, name: &str) -> Result<()> {
+    with_deadline("SUBSCRIBE", METADATA_TIMEOUT, async {
+        session.subscribe(name).await.map_err(command_error)
+    })
+    .await
+}
+
+pub async fn unsubscribe(session: &mut Session, name: &str) -> Result<()> {
+    with_deadline("UNSUBSCRIBE", METADATA_TIMEOUT, async {
+        session.unsubscribe(name).await.map_err(command_error)
+    })
+    .await
+}
+
+/// `name` as an IMAP quoted string, escaped as APPEND does, or None when it
+/// holds a line break or NUL, which no quoted string can carry.
+fn quoted_mailbox(name: &str) -> Option<String> {
+    if name.chars().any(|c| matches!(c, '\r' | '\n' | '\0')) {
+        return None;
+    }
+    Some(format!(
+        "\"{}\"",
+        name.replace('\\', "\\\\").replace('"', "\\\"")
+    ))
+}
+
+#[derive(Debug, Clone)]
+pub struct SelectedFolder {
+    pub uid_validity: Option<i64>,
+    pub uid_next: Option<i64>,
+    pub exists: u32,
+    /// PERMANENTFLAGS lists `\*`: any new keyword is kept.
+    pub creates_keywords: bool,
+    /// The keywords PERMANENTFLAGS lists by name.
+    pub permanent_keywords: Vec<String>,
+}
+
+impl SelectedFolder {
+    /// Whether the mailbox keeps `keyword` for good, so setting it isn't
+    /// just for this session (RFC 3501 PERMANENTFLAGS).
+    pub fn keeps_keyword(&self, keyword: &str) -> bool {
+        self.creates_keywords
+            || self
+                .permanent_keywords
+                .iter()
+                .any(|kept| kept.eq_ignore_ascii_case(keyword))
+    }
+}
+
+pub async fn select(session: &mut Session, folder: &str) -> Result<SelectedFolder> {
+    with_deadline("SELECT", METADATA_TIMEOUT, select_inner(session, folder)).await
+}
+
+async fn select_inner(session: &mut Session, folder: &str) -> Result<SelectedFolder> {
+    let mb = session.select(folder).await.map_err(command_error)?;
+    Ok(SelectedFolder {
+        uid_validity: mb.uid_validity.map(|v| v as i64),
+        uid_next: mb.uid_next.map(|v| v as i64),
+        exists: mb.exists,
+        creates_keywords: mb
+            .permanent_flags
+            .iter()
+            .any(|flag| matches!(flag, async_imap::types::Flag::MayCreate)),
+        permanent_keywords: mb
+            .permanent_flags
+            .iter()
+            .filter_map(|flag| match flag {
+                async_imap::types::Flag::Custom(name) => Some(name.to_string()),
+                _ => None,
+            })
+            .collect(),
+    })
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct FetchedFlags {
+    pub seen: bool,
+    pub flagged: bool,
+    pub draft: bool,
+    pub deleted: bool,
+    /// Custom IMAP keywords (used to round-trip user labels).
+    pub keywords: Vec<String>,
+    /// `$MDNSent`: a read receipt was sent or declined.
+    pub mdn_sent: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct FetchedHeader {
+    pub uid: u32,
+    pub flags: FetchedFlags,
+    pub internal_date_ms: Option<i64>,
+    pub size: Option<u32>,
+    pub header_bytes: Vec<u8>,
+    /// Derived from BODYSTRUCTURE so the list can flag attachments before the
+    /// full body is ever downloaded.
+    pub has_attachments: bool,
+    /// Selective-fetch plan derived from BODYSTRUCTURE. `None` means the
+    /// server omitted or could not parse BODYSTRUCTURE; callers may retry or
+    /// fall back only when the user explicitly opens the message.
+    pub mime_plan: Option<MimePlan>,
+}
+
+fn flags_of(fetch: &async_imap::types::Fetch) -> FetchedFlags {
+    let mut f = FetchedFlags::default();
+    for flag in fetch.flags() {
+        match flag {
+            async_imap::types::Flag::Seen => f.seen = true,
+            async_imap::types::Flag::Flagged => f.flagged = true,
+            async_imap::types::Flag::Draft => f.draft = true,
+            async_imap::types::Flag::Deleted => f.deleted = true,
+            async_imap::types::Flag::Custom(name) => {
+                // RFC 3503: a read receipt was sent or declined.
+                f.mdn_sent |= name.eq_ignore_ascii_case(MDN_SENT);
+                f.keywords.push(name.to_string());
+            }
+            _ => {}
+        }
+    }
+    f
+}
+
+/// The keyword recording that a read receipt was sent or declined (RFC 3503).
+pub const MDN_SENT: &str = "$MDNSent";
+
+const HEADER_FIELDS: &str = "BODY.PEEK[HEADER.FIELDS (MESSAGE-ID X-FLECTAR-SUBMISSION-ID IN-REPLY-TO REFERENCES SUBJECT FROM TO CC BCC DATE LIST-ID LIST-UNSUBSCRIBE LIST-UNSUBSCRIBE-POST PRECEDENCE AUTO-SUBMITTED AUTHENTICATION-RESULTS RETURN-PATH DISPOSITION-NOTIFICATION-TO DISPOSITION-NOTIFICATION-OPTIONS IMPORTANCE X-PRIORITY X-MSMAIL-PRIORITY PRIORITY)]";
+
+/// Fetch envelope headers + flags for a UID set (e.g. "100:200" or "5,7,9").
+pub async fn fetch_headers(session: &mut Session, uid_set: &str) -> Result<Vec<FetchedHeader>> {
+    fetch_headers_with(session, uid_set, &[]).await
+}
+
+/// [`fetch_headers`] with the headers `extra` too, such as those the
+/// account's rules test (#238). Names are letters, digits and dashes.
+pub async fn fetch_headers_with(
+    session: &mut Session,
+    uid_set: &str,
+    extra: &[String],
+) -> Result<Vec<FetchedHeader>> {
+    with_deadline(
+        "UID FETCH headers",
+        METADATA_TIMEOUT,
+        fetch_headers_inner(session, uid_set, extra),
+    )
+    .await
+}
+
+/// The header section a fetch of headers asks for, with `extra` headers.
+fn header_section(extra: &[String]) -> String {
+    let names = extra
+        .iter()
+        .filter(|name| {
+            !name.is_empty()
+                && name
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        })
+        .map(|name| format!(" {}", name.to_ascii_uppercase()))
+        .collect::<String>();
+    match HEADER_FIELDS.strip_suffix(")]") {
+        Some(start) if !names.is_empty() => format!("{start}{names})]"),
+        _ => HEADER_FIELDS.to_owned(),
+    }
+}
+
+async fn fetch_headers_inner(
+    session: &mut Session,
+    uid_set: &str,
+    extra: &[String],
+) -> Result<Vec<FetchedHeader>> {
+    // Keep header sync independent from BODYSTRUCTURE: an incompatible MIME
+    // response must not prevent historical headers from being stored. MIME
+    // plans are fetched separately when preparing or opening message bodies.
+    let query = format!(
+        "(UID FLAGS INTERNALDATE RFC822.SIZE {})",
+        header_section(extra)
+    );
+    let mut out = Vec::new();
+    {
+        let mut stream = session
+            .uid_fetch(uid_set, &query)
+            .await
+            .map_err(command_error)?;
+        while let Some(item) = stream.next().await {
+            let fetch = item.map_err(command_error)?;
+            let Some(uid) = fetch.uid else { continue };
+            let mime_plan = fetch.bodystructure().map(mime::plan_bodystructure);
+            out.push(FetchedHeader {
+                uid,
+                flags: flags_of(&fetch),
+                internal_date_ms: fetch.internal_date().map(|d| d.timestamp_millis()),
+                size: fetch.size,
+                header_bytes: fetch.header().map(|h| h.to_vec()).unwrap_or_default(),
+                has_attachments: mime_plan
+                    .as_ref()
+                    .is_some_and(MimePlan::has_file_attachments),
+                mime_plan,
+            });
+        }
+    }
+    Ok(out)
+}
+
+/// A BODYSTRUCTURE-derived selective-fetch plan for one remote UID.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FetchedMimePlan {
+    pub uid: u32,
+    pub plan: MimePlan,
+}
+
+const MIME_PLAN_QUERY: &str = "(UID BODYSTRUCTURE)";
+
+/// Do not include response bytes: they can contain private headers.
+fn unparsed_selective_fetch() -> CoreError {
+    CoreError::ImapParse("could not parse selective FETCH response".into())
+}
+
+fn selective_fetch_error(error: async_imap::error::Error) -> CoreError {
+    match error {
+        async_imap::error::Error::Parse(_) => unparsed_selective_fetch(),
+        // async-imap (0.11 and 0.12) wraps its wire decoder's nom errors in
+        // Io(Other) rather than Parse. Match that decoder format only, never
+        // NO/BAD or an arbitrary transport error. Keep the embedded response
+        // private.
+        async_imap::error::Error::Io(ref detail)
+            if detail.kind() == std::io::ErrorKind::Other
+                && (detail.to_string().starts_with("Error(")
+                    || detail.to_string().starts_with("Failure("))
+                && detail.to_string().contains(" during parsing of ") =>
+        {
+            unparsed_selective_fetch()
+        }
+        error => command_error(error),
+    }
+}
+
+/// async-imap's FETCH stream discards the tagged completion status. Read
+/// selective responses directly so NO/BAD cannot masquerade as missing MIME.
+/// The main actor independently reconciles unsolicited flags and expunges.
+async fn selective_fetch(
+    session: &mut Session,
+    uid_set: &str,
+    query: &str,
+    mut consume: impl FnMut(u32, &[async_imap::imap_proto::AttributeValue<'_>]),
+) -> Result<()> {
+    use async_imap::imap_proto::{AttributeValue, Response, Status};
+    let tag = session
+        .run_command(format!("UID FETCH {uid_set} {query}"))
+        .await
+        .map_err(selective_fetch_error)?;
+    loop {
+        let response = session
+            .read_response()
+            .await
+            .map_err(|error| selective_fetch_error(error.into()))?
+            .ok_or_else(|| CoreError::Imap("connection closed before FETCH completed".into()))?;
+        match response.parsed() {
+            Response::Done {
+                tag: received,
+                status,
+                outcome,
+            } if *received == tag => {
+                return match status {
+                    Status::Ok => Ok(()),
+                    _ => Err(refusal(ServerReply::from_outcome(
+                        *status == Status::Bad,
+                        outcome,
+                    ))),
+                };
+            }
+            Response::Done { .. } => {
+                return Err(CoreError::ImapParse(
+                    "unexpected FETCH completion tag".into(),
+                ));
+            }
+            Response::Data {
+                status: Status::Bye,
+                ..
+            } => return Err(CoreError::Imap("server closed FETCH session".into())),
+            Response::Fetch(_, attributes) => {
+                if let Some(uid) = attributes.iter().find_map(|attr| match attr {
+                    AttributeValue::Uid(uid) => Some(*uid),
+                    _ => None,
+                }) {
+                    consume(uid, attributes);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+async fn fetch_mime_plans_batch_inner(
+    session: &mut Session,
+    uids: &[u32],
+) -> Result<Vec<FetchedMimePlan>> {
+    let uid_set = normalized_uid_set(uids)?;
+    if uid_set.is_empty() {
+        return Ok(Vec::new());
+    }
+    use async_imap::imap_proto::AttributeValue;
+    let requested: std::collections::HashSet<u32> = uids.iter().copied().collect();
+    let mut result = std::collections::BTreeMap::<u32, MimePlan>::new();
+    let mut unparsed = std::collections::HashSet::new();
+    selective_fetch(session, &uid_set, MIME_PLAN_QUERY, |uid, attributes| {
+        if requested.contains(&uid) {
+            for attribute in attributes {
+                match attribute {
+                    AttributeValue::BodyStructure(bodystructure) => {
+                        result.insert(uid, mime::plan_bodystructure(bodystructure));
+                    }
+                    AttributeValue::Unknown => {
+                        unparsed.insert(uid);
+                    }
+                    _ => {}
+                }
+            }
+        }
+    })
+    .await?;
+    // imap-proto 0.17 reads an attribute it can't parse, such as a malformed
+    // BODYSTRUCTURE, as Unknown instead of failing the response. A missing
+    // plan with one of those in its place is that parse failure.
+    if unparsed.iter().any(|uid| !result.contains_key(uid)) {
+        return Err(unparsed_selective_fetch());
+    }
+    Ok(result
+        .into_iter()
+        .map(|(uid, plan)| FetchedMimePlan { uid, plan })
+        .collect())
+}
+
+/// Fetch only UID + BODYSTRUCTURE for several messages in one metadata
+/// command. Results are sorted by UID; vanished UIDs or responses without a
+/// BODYSTRUCTURE are absent, and one that can't be parsed is an
+/// `ImapParse` error.
+pub async fn fetch_mime_plans_batch(
+    session: &mut Session,
+    uids: &[u32],
+) -> Result<Vec<FetchedMimePlan>> {
+    with_deadline(
+        "UID FETCH MIME plans batch",
+        METADATA_TIMEOUT,
+        fetch_mime_plans_batch_inner(session, uids),
+    )
+    .await
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FetchedSection {
+    pub section: String,
+    /// The bytes returned for `BODY.PEEK[<section>.MIME]`.
+    pub mime_header: Vec<u8>,
+    /// The still-transfer-encoded bytes returned for `BODY.PEEK[<section>]`.
+    pub body: Vec<u8>,
+}
+
+/// Selectively fetched MIME sections for one UID in a multi-message FETCH.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FetchedMessageSections {
+    pub uid: u32,
+    pub sections: Vec<FetchedSection>,
+}
+
+fn section_numbers(section: &str) -> Result<Vec<u32>> {
+    if section.is_empty() {
+        return Err(CoreError::Imap("empty IMAP body section".into()));
+    }
+    section
+        .split('.')
+        .map(|part| {
+            part.parse::<u32>()
+                .ok()
+                .filter(|value| *value > 0)
+                .ok_or_else(|| CoreError::Imap(format!("invalid IMAP body section: {section}")))
+        })
+        .collect()
+}
+
+fn section_paths(sections: &[String]) -> Result<Vec<(String, Vec<u32>)>> {
+    sections
+        .iter()
+        .map(|section| Ok((section.clone(), section_numbers(section)?)))
+        .collect()
+}
+
+fn section_fetch_query(paths: &[(String, Vec<u32>)]) -> String {
+    format!(
+        "(UID {})",
+        paths
+            .iter()
+            .flat_map(|(section, _)| {
+                [
+                    format!("BODY.PEEK[{section}.MIME]"),
+                    format!("BODY.PEEK[{section}]"),
+                ]
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
+    )
+}
+
+/// `uids` in any order as one UID set, runs of them as ranges.
+pub(crate) fn normalized_uid_set(uids: &[u32]) -> Result<String> {
+    if uids.contains(&0) {
+        return Err(CoreError::Imap("IMAP UID must be greater than zero".into()));
+    }
+    let mut sorted = uids.to_vec();
+    sorted.sort_unstable();
+    sorted.dedup();
+    Ok(uid_set(&sorted))
+}
+
+async fn fetch_sections_batch_inner(
+    session: &mut Session,
+    uids: &[u32],
+    sections: &[String],
+) -> Result<Vec<FetchedMessageSections>> {
+    use async_imap::imap_proto::{MessageSection, SectionPath};
+
+    // Validate both interpolated command components before touching the
+    // session. UIDs are numeric, sorted, and de-duplicated; sections accept
+    // only positive dot-separated integers.
+    let paths = section_paths(sections)?;
+    let uid_set = normalized_uid_set(uids)?;
+    if paths.is_empty() || uid_set.is_empty() {
+        return Ok(Vec::new());
+    }
+    let query = section_fetch_query(&paths);
+    let requested: std::collections::HashSet<u32> = uids.iter().copied().collect();
+
+    let mut result = std::collections::BTreeMap::<u32, Vec<FetchedSection>>::new();
+    selective_fetch(session, &uid_set, &query, |uid, attributes| {
+        if !requested.contains(&uid) {
+            return;
+        }
+        let section_bytes = |path: &SectionPath| {
+            attributes.iter().find_map(|attribute| match attribute {
+                async_imap::imap_proto::AttributeValue::BodySection {
+                    section: Some(section),
+                    data: Some(data),
+                    ..
+                } if section == path => Some(data.to_vec()),
+                _ => None,
+            })
+        };
+        let fetched = result.entry(uid).or_default();
+        for (section, numbers) in &paths {
+            let body_path = SectionPath::Part(numbers.clone(), None);
+            let mime_path = SectionPath::Part(numbers.clone(), Some(MessageSection::Mime));
+            if let Some(body) = section_bytes(&body_path) {
+                if fetched.iter().any(|item| item.section == *section) {
+                    continue;
+                }
+                fetched.push(FetchedSection {
+                    section: section.clone(),
+                    mime_header: section_bytes(&mime_path).unwrap_or_default(),
+                    body,
+                });
+            }
+        }
+    })
+    .await?;
+    Ok(result
+        .into_iter()
+        .map(|(uid, sections)| FetchedMessageSections { uid, sections })
+        .collect())
+}
+
+/// Fetch the same planned readable MIME sections for several messages in one
+/// UID FETCH command. Missing/expunged UIDs are absent from the result.
+pub async fn fetch_content_sections_batch(
+    session: &mut Session,
+    uids: &[u32],
+    sections: &[String],
+) -> Result<Vec<FetchedMessageSections>> {
+    with_deadline(
+        "UID FETCH content sections batch",
+        CONTENT_TIMEOUT,
+        fetch_sections_batch_inner(session, uids, sections),
+    )
+    .await
+}
+
+/// Fetch only the planned readable MIME sections for one message. Callers
+/// should pass `MimePlan::text_section_ids()`; non-text attachment sections
+/// are never added implicitly.
+pub async fn fetch_content_sections(
+    session: &mut Session,
+    uid: u32,
+    sections: &[String],
+) -> Result<Vec<FetchedSection>> {
+    let mut messages = fetch_content_sections_batch(session, &[uid], sections).await?;
+    Ok(messages
+        .pop()
+        .map(|message| message.sections)
+        .unwrap_or_default())
+}
+
+/// Fetch one attachment/inline section on demand. The section is validated as
+/// a numeric BODY path before being interpolated into the IMAP command.
+pub async fn fetch_attachment_section(
+    session: &mut Session,
+    uid: u32,
+    section: &str,
+) -> Result<Option<FetchedSection>> {
+    let sections = [section.to_owned()];
+    let mut messages = with_deadline(
+        "UID FETCH attachment section",
+        ATTACHMENT_TIMEOUT,
+        fetch_sections_batch_inner(session, &[uid], &sections),
+    )
+    .await?;
+    Ok(messages
+        .pop()
+        .and_then(|mut message| message.sections.pop()))
+}
+
+/// Fetch flags only, for a UID window (change detection without CONDSTORE).
+pub async fn fetch_flags(session: &mut Session, uid_set: &str) -> Result<Vec<(u32, FetchedFlags)>> {
+    with_deadline(
+        "UID FETCH flags",
+        METADATA_TIMEOUT,
+        fetch_flags_inner(session, uid_set),
+    )
+    .await
+}
+
+async fn fetch_flags_inner(
+    session: &mut Session,
+    uid_set: &str,
+) -> Result<Vec<(u32, FetchedFlags)>> {
+    let mut out = Vec::new();
+    {
+        let mut stream = session
+            .uid_fetch(uid_set, "(UID FLAGS)")
+            .await
+            .map_err(command_error)?;
+        while let Some(item) = stream.next().await {
+            let fetch = item.map_err(command_error)?;
+            if let Some(uid) = fetch.uid {
+                out.push((uid, flags_of(&fetch)));
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// When the server got each message of `uid_set`, in milliseconds.
+pub async fn fetch_internal_dates(
+    session: &mut Session,
+    uid_set: &str,
+) -> Result<Vec<(u32, Option<i64>)>> {
+    with_deadline("UID FETCH dates", METADATA_TIMEOUT, async {
+        let mut out = Vec::new();
+        {
+            let mut stream = session
+                .uid_fetch(uid_set, "(UID INTERNALDATE)")
+                .await
+                .map_err(command_error)?;
+            while let Some(item) = stream.next().await {
+                let fetch = item.map_err(command_error)?;
+                if let Some(uid) = fetch.uid {
+                    out.push((uid, fetch.internal_date().map(|d| d.timestamp_millis())));
+                }
+            }
+        }
+        Ok(out)
+    })
+    .await
+}
+
+/// Full raw RFC 5322 bytes of one message.
+pub async fn fetch_full(session: &mut Session, uid: u32) -> Result<Option<Vec<u8>>> {
+    with_deadline(
+        "UID FETCH message",
+        CONTENT_TIMEOUT,
+        fetch_full_inner(session, uid),
+    )
+    .await
+}
+
+async fn fetch_full_inner(session: &mut Session, uid: u32) -> Result<Option<Vec<u8>>> {
+    let mut body = None;
+    {
+        let mut stream = session
+            .uid_fetch(uid.to_string(), "(UID BODY.PEEK[])")
+            .await
+            .map_err(command_error)?;
+        while let Some(item) = stream.next().await {
+            let fetch = item.map_err(command_error)?;
+            if let Some(b) = fetch.body() {
+                body = Some(b.to_vec());
+            }
+        }
+    }
+    Ok(body)
+}
+
+/// Full raw bytes for a whole UID set in a single FETCH round-trip, returned as
+/// (uid, bytes) pairs. Backfill fetches bodies in bulk this way: one command
+/// for a chunk of messages instead of one round-trip per message.
+pub async fn fetch_full_batch(session: &mut Session, uid_set: &str) -> Result<Vec<(u32, Vec<u8>)>> {
+    with_deadline(
+        "UID FETCH message batch",
+        CONTENT_TIMEOUT,
+        fetch_full_batch_inner(session, uid_set),
+    )
+    .await
+}
+
+async fn fetch_full_batch_inner(
+    session: &mut Session,
+    uid_set: &str,
+) -> Result<Vec<(u32, Vec<u8>)>> {
+    let mut out = Vec::new();
+    {
+        let mut stream = session
+            .uid_fetch(uid_set, "(UID BODY.PEEK[])")
+            .await
+            .map_err(command_error)?;
+        while let Some(item) = stream.next().await {
+            let fetch = item.map_err(command_error)?;
+            if let (Some(uid), Some(b)) = (fetch.uid, fetch.body()) {
+                out.push((uid, b.to_vec()));
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// All UIDs currently in the selected folder, including `\\Deleted` messages.
+pub async fn uid_search_all(session: &mut Session) -> Result<Vec<u32>> {
+    with_deadline(
+        "UID SEARCH ALL",
+        METADATA_TIMEOUT,
+        uid_search_all_inner(session),
+    )
+    .await
+}
+
+async fn uid_search_all_inner(session: &mut Session) -> Result<Vec<u32>> {
+    let set = session.uid_search("ALL").await.map_err(command_error)?;
+    let mut v: Vec<u32> = set.into_iter().collect();
+    v.sort_unstable();
+    Ok(v)
+}
+
+/// UIDs of the selected folder's messages that `criteria` match, newest
+/// first. The criteria come from a search's translation, with any
+/// `CHARSET` in front.
+pub async fn uid_search_matching(session: &mut Session, criteria: &str) -> Result<Vec<u32>> {
+    with_deadline("UID SEARCH", METADATA_TIMEOUT, async {
+        let set = session.uid_search(criteria).await.map_err(command_error)?;
+        let mut uids: Vec<u32> = set.into_iter().collect();
+        uids.sort_unstable_by(|a, b| b.cmp(a));
+        uids.dedup();
+        Ok(uids)
+    })
+    .await
+}
+
+/// UIDs visible in the selected folder, excluding messages awaiting expunge.
+pub async fn uid_search_undeleted(session: &mut Session) -> Result<Vec<u32>> {
+    with_deadline("UID SEARCH UNDELETED", METADATA_TIMEOUT, async {
+        let set = session
+            .uid_search("UNDELETED")
+            .await
+            .map_err(command_error)?;
+        let mut uids: Vec<u32> = set.into_iter().collect();
+        uids.sort_unstable();
+        Ok(uids)
+    })
+    .await
+}
+
+/// Find messages by one RFC 5322 header in the selected mailbox. This is used
+/// to make retrying Sent-folder APPEND idempotent after a connection loss.
+pub async fn uid_search_header(
+    session: &mut Session,
+    header: &str,
+    value: &str,
+) -> Result<Vec<u32>> {
+    if header.is_empty()
+        || !header
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        || value.len() > 998
+        || value.bytes().any(|byte| matches!(byte, b'\r' | b'\n' | 0))
+    {
+        return Err(CoreError::Imap("invalid header search criterion".into()));
+    }
+    let escaped = value.replace('\\', "\\\\").replace('"', "\\\"");
+    let query = format!("HEADER {header} \"{escaped}\"");
+    with_deadline("UID SEARCH header", METADATA_TIMEOUT, async move {
+        let set = session.uid_search(&query).await.map_err(command_error)?;
+        let mut uids: Vec<u32> = set.into_iter().collect();
+        uids.sort_unstable();
+        uids.dedup();
+        Ok(uids)
+    })
+    .await
+}
+
+/// Undeleted UIDs greater than `last_seen` in the currently selected mailbox.
+///
+/// `UIDNEXT` is only a prediction in IMAP4rev1 and older/quirky servers may
+/// omit it from SELECT entirely. SEARCH is the interoperable source of truth
+/// for incremental discovery. Keep the client-side filter even though the
+/// criterion contains the same lower bound: IMAP's `n:*` range reverses when
+/// `n` is above the mailbox's highest UID and can therefore return that older
+/// highest UID.
+pub async fn uid_search_after(session: &mut Session, last_seen: u32) -> Result<Vec<u32>> {
+    if last_seen == u32::MAX {
+        return Ok(Vec::new());
+    }
+    with_deadline(
+        "UID SEARCH newer messages",
+        METADATA_TIMEOUT,
+        uid_search_after_inner(session, last_seen),
+    )
+    .await
+}
+
+async fn uid_search_after_inner(session: &mut Session, last_seen: u32) -> Result<Vec<u32>> {
+    let query = format!("UID {}:* UNDELETED", last_seen + 1);
+    let set = session.uid_search(&query).await.map_err(command_error)?;
+    let mut uids: Vec<u32> = set.into_iter().filter(|uid| *uid > last_seen).collect();
+    uids.sort_unstable();
+    uids.dedup();
+    Ok(uids)
+}
+
+pub async fn uid_search_since(session: &mut Session, date: chrono::NaiveDate) -> Result<Vec<u32>> {
+    with_deadline(
+        "UID SEARCH SINCE",
+        METADATA_TIMEOUT,
+        uid_search_since_inner(session, date),
+    )
+    .await
+}
+
+async fn uid_search_since_inner(
+    session: &mut Session,
+    date: chrono::NaiveDate,
+) -> Result<Vec<u32>> {
+    // IMAP date format: 1-Jan-2024
+    let q = format!("SINCE {} UNDELETED", date.format("%-d-%b-%Y"));
+    let set = session.uid_search(&q).await.map_err(command_error)?;
+    let mut v: Vec<u32> = set.into_iter().collect();
+    v.sort_unstable();
+    Ok(v)
+}
+
+pub async fn store_flag(session: &mut Session, uid: u32, flag: &str, add: bool) -> Result<()> {
+    with_deadline(
+        "UID STORE",
+        METADATA_TIMEOUT,
+        store_flag_inner(session, uid, flag, add),
+    )
+    .await
+}
+
+async fn store_flag_inner(session: &mut Session, uid: u32, flag: &str, add: bool) -> Result<()> {
+    store_flag_set_inner(session, &uid.to_string(), flag, add).await
+}
+
+/// UIDs per command when a server turns down one command for the whole
+/// mailbox, such as for a message limit (RFC 9738).
+const MARK_SEEN_WINDOW: u32 = 10_000;
+
+/// Mark every message of the selected mailbox up to UID `through` seen
+/// (#234). One command does it, as `.SILENT` without CONDSTORE draws no
+/// per-message replies. A server that turns that down gets windows of
+/// [`MARK_SEEN_WINDOW`] UIDs from the newest down: a window that wide holds
+/// at most that many messages.
+pub async fn mark_seen_through(session: &mut Session, through: u32) -> Result<()> {
+    let whole = with_deadline(
+        "UID STORE seen",
+        CONTENT_TIMEOUT,
+        store_flag_set_inner(session, &format!("1:{through}"), "\\Seen", true),
+    )
+    .await;
+    match whole {
+        Err(CoreError::ImapRefused(reply)) if through > MARK_SEEN_WINDOW => {
+            tracing::info!(%reply, "marking a mailbox read in windows");
+            let mut high = through;
+            while high > 0 {
+                let low = high.saturating_sub(MARK_SEEN_WINDOW - 1).max(1);
+                with_deadline(
+                    "UID STORE seen",
+                    CONTENT_TIMEOUT,
+                    store_flag_set_inner(session, &format!("{low}:{high}"), "\\Seen", true),
+                )
+                .await?;
+                high = low - 1;
+            }
+            Ok(())
+        }
+        other => other,
+    }
+}
+
+async fn store_flag_set_inner(
+    session: &mut Session,
+    uid_set: &str,
+    flag: &str,
+    add: bool,
+) -> Result<()> {
+    let op = if add {
+        "+FLAGS.SILENT"
+    } else {
+        "-FLAGS.SILENT"
+    };
+    // The command's own status says whether the server made the change: a
+    // FETCH stream ends at a tagged NO or BAD just as it does at OK.
+    session
+        .run_command_and_check_ok(format!("UID STORE {uid_set} {op} ({flag})"))
+        .await
+        .map_err(command_error)
+}
+
+/// Move one UID without guessing at unsupported server extensions.
+///
+/// RFC 6851 only permits `UID MOVE` when `MOVE` is advertised. Legacy IMAP
+/// servers use COPY + \Deleted instead. Prefer UID EXPUNGE for that fallback;
+/// without UIDPLUS, leave the source marked \Deleted because mailbox-wide
+/// EXPUNGE could remove another client's deleted mail.
+pub async fn uid_move(session: &mut Session, uid: u32, target: &str) -> Result<()> {
+    with_deadline(
+        "UID MOVE",
+        METADATA_TIMEOUT,
+        uid_move_inner(session, uid, target),
+    )
+    .await
+}
+
+async fn uid_move_inner(session: &mut Session, uid: u32, target: &str) -> Result<()> {
+    if uid == 0 {
+        return Err(CoreError::Imap("IMAP UID must be greater than zero".into()));
+    }
+
+    let capabilities = session.capabilities().await.map_err(command_error)?;
+    if capabilities.has_str("MOVE") {
+        // A failed RFC 6851 MOVE may already have moved this UID. Falling back
+        // after such a failure can duplicate the message, so propagate it and
+        // let the durable action reconcile before retrying.
+        return session
+            .uid_mv(uid.to_string(), target)
+            .await
+            .map_err(command_error);
+    }
+
+    session
+        .uid_copy(uid.to_string(), target)
+        .await
+        .map_err(command_error)?;
+    store_flag_set_inner(session, &uid.to_string(), "\\Deleted", true).await?;
+
+    if capabilities.has_str("UIDPLUS") {
+        let stream = session
+            .uid_expunge(uid.to_string())
+            .await
+            .map_err(command_error)?;
+        futures::pin_mut!(stream);
+        while let Some(item) = stream.next().await {
+            item.map_err(command_error)?;
+        }
+        return Ok(());
+    }
+
+    // There is no race-free way to expunge one UID in base IMAP. Even a
+    // SEARCH immediately before EXPUNGE cannot prevent another client from
+    // marking a different message \Deleted between those commands.
+    tracing::debug!(
+        uid,
+        "legacy IMAP move left source marked deleted because UIDPLUS is unavailable"
+    );
+    Ok(())
+}
+
+/// UIDPLUS receipt; a UID is meaningful only within this UIDVALIDITY.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AppendReceipt {
+    pub uid_validity: u32,
+    pub uid: u32,
+}
+
+pub async fn append(session: &mut Session, folder: &str, raw: &[u8], seen: bool) -> Result<()> {
+    append_with_receipt(session, folder, raw, seen)
+        .await
+        .map(|_| ())
+}
+
+pub async fn append_with_receipt(
+    session: &mut Session,
+    folder: &str,
+    raw: &[u8],
+    seen: bool,
+) -> Result<Option<AppendReceipt>> {
+    let flags = if seen { " (\\Seen)" } else { "" };
+    with_deadline(
+        "APPEND",
+        CONTENT_TIMEOUT,
+        append_inner(session, folder, raw, flags, ""),
+    )
+    .await
+}
+
+/// How [`append_message`] files a message.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct AppendOptions {
+    pub seen: bool,
+    pub flagged: bool,
+    /// `$MDNSent`: a read receipt the message asks for is answered.
+    pub mdn_sent: bool,
+    /// The message's internal date, instead of the time it is appended.
+    pub internal_date: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// Append a message with its flags and date, such as one copied from
+/// elsewhere. A large message gets time to upload at 64 KiB/s.
+pub async fn append_message(
+    session: &mut Session,
+    folder: &str,
+    raw: &[u8],
+    options: AppendOptions,
+) -> Result<Option<AppendReceipt>> {
+    let mut flags = Vec::new();
+    if options.seen {
+        flags.push("\\Seen");
+    }
+    if options.flagged {
+        flags.push("\\Flagged");
+    }
+    if options.mdn_sent {
+        flags.push(MDN_SENT);
+    }
+    let flags = if flags.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", flags.join(" "))
+    };
+    let date = options
+        .internal_date
+        .map(|date| format!(" \"{}\"", date.format("%d-%b-%Y %H:%M:%S %z")))
+        .unwrap_or_default();
+    let deadline = CONTENT_TIMEOUT.max(Duration::from_secs(raw.len() as u64 / (64 * 1024)));
+    with_deadline(
+        "APPEND",
+        deadline,
+        append_inner(session, folder, raw, &flags, &date),
+    )
+    .await
+}
+
+async fn append_inner(
+    session: &mut Session,
+    folder: &str,
+    raw: &[u8],
+    flags: &str,
+    date: &str,
+) -> Result<Option<AppendReceipt>> {
+    use async_imap::imap_proto::rfc4315::UidSetMember;
+    use async_imap::imap_proto::{Response, ResponseCode, Status};
+    use tokio::io::AsyncWriteExt;
+
+    if folder.chars().any(|c| matches!(c, '\r' | '\n' | '\0')) {
+        return Err(CoreError::Imap("invalid APPEND mailbox".into()));
+    }
+    let folder = folder.replace('\\', "\\\\").replace('"', "\\\"");
+    let tag = session
+        .run_command(format!(
+            "APPEND \"{folder}\"{flags}{date} {{{}}}",
+            raw.len()
+        ))
+        .await
+        .map_err(|e| CoreError::Imap(format!("APPEND connection failed: {e}")))?;
+    let mut sent_literal = false;
+    loop {
+        let response = session
+            .read_response()
+            .await
+            .map_err(|e| CoreError::Imap(format!("APPEND connection failed: {e}")))?
+            .ok_or_else(|| CoreError::Imap("connection closed before APPEND completed".into()))?;
+        match response.parsed() {
+            Response::Continue(_) if !sent_literal => {
+                let stream = session.as_mut();
+                stream
+                    .write_all(raw)
+                    .await
+                    .map_err(|e| CoreError::Imap(format!("APPEND connection failed: {e}")))?;
+                stream
+                    .write_all(b"\r\n")
+                    .await
+                    .map_err(|e| CoreError::Imap(format!("APPEND connection failed: {e}")))?;
+                stream
+                    .flush()
+                    .await
+                    .map_err(|e| CoreError::Imap(format!("APPEND connection failed: {e}")))?;
+                sent_literal = true;
+            }
+            Response::Done {
+                tag: received,
+                status,
+                outcome,
+            } if *received == tag => {
+                if *status != Status::Ok {
+                    return Err(refusal(ServerReply::from_outcome(
+                        *status == Status::Bad,
+                        outcome,
+                    )));
+                }
+                if !sent_literal {
+                    return Err(CoreError::Imap(
+                        "APPEND completed before literal was sent".into(),
+                    ));
+                }
+                return Ok(match &outcome.code {
+                    Some(ResponseCode::AppendUid(validity, uids)) if *validity > 0 => {
+                        match uids.as_slice() {
+                            [UidSetMember::Uid(uid)] if *uid > 0 => Some(AppendReceipt {
+                                uid_validity: *validity,
+                                uid: *uid,
+                            }),
+                            _ => None,
+                        }
+                    }
+                    _ => None,
+                });
+            }
+            Response::Done { .. } | Response::Continue(_) => {
+                return Err(CoreError::Imap(
+                    "unexpected APPEND response; connection must close".into(),
+                ));
+            }
+            Response::Data {
+                status: Status::Bye,
+                ..
+            } => {
+                return Err(CoreError::Imap("server closed APPEND session".into()));
+            }
+            // Flags and expunges are reconciled by the sync actor.
+            _ => {}
+        }
+    }
+}
+
+pub async fn create_folder(session: &mut Session, name: &str) -> Result<()> {
+    with_deadline(
+        "CREATE",
+        METADATA_TIMEOUT,
+        create_folder_inner(session, name),
+    )
+    .await
+}
+
+pub async fn rename_folder(session: &mut Session, from: &str, to: &str) -> Result<()> {
+    with_deadline("RENAME", METADATA_TIMEOUT, async {
+        session.rename(from, to).await.map_err(command_error)
+    })
+    .await
+}
+
+pub async fn delete_folder(session: &mut Session, name: &str) -> Result<()> {
+    with_deadline("DELETE", METADATA_TIMEOUT, async {
+        session.delete(name).await.map_err(command_error)
+    })
+    .await
+}
+
+async fn create_folder_inner(session: &mut Session, name: &str) -> Result<()> {
+    session.create(name).await.map_err(command_error)
+}
+
+/// Expunge all \Deleted messages in the selected folder.
+pub async fn expunge_all(session: &mut Session) -> Result<()> {
+    with_deadline("EXPUNGE", METADATA_TIMEOUT, expunge_all_inner(session)).await
+}
+
+/// Expunge only the selected UID. A mailbox-wide EXPUNGE could also erase
+/// messages another client has marked deleted, so UIDPLUS is required.
+pub async fn uid_delete_permanently(session: &mut Session, uid: u32) -> Result<()> {
+    with_deadline("UID EXPUNGE", METADATA_TIMEOUT, async {
+        if uid == 0 {
+            return Err(CoreError::Imap("IMAP UID must be greater than zero".into()));
+        }
+        let capabilities = session.capabilities().await
+            .map_err(command_error)?;
+        if !capabilities.has_str("UIDPLUS") {
+            return Err(CoreError::Imap(
+                "this IMAP server does not support safe permanent deletion of individual messages (UIDPLUS)".into(),
+            ));
+        }
+        store_flag_inner(session, uid, "\\Deleted", true).await?;
+        let stream = session.uid_expunge(uid.to_string()).await
+            .map_err(command_error)?;
+        futures::pin_mut!(stream);
+        while let Some(item) = stream.next().await {
+            item.map_err(command_error)?;
+        }
+        Ok(())
+    }).await
+}
+
+/// Empty the selected Trash mailbox. Mailbox-wide EXPUNGE is appropriate here
+/// because the user explicitly chose to remove every message in that mailbox.
+pub async fn empty_selected_trash(session: &mut Session) -> Result<()> {
+    with_deadline("EMPTY TRASH", METADATA_TIMEOUT, async {
+        if uid_search_all(session).await?.is_empty() {
+            return Ok(());
+        }
+        store_flag_set_inner(session, "1:*", "\\Deleted", true).await?;
+        expunge_all_inner(session).await
+    })
+    .await
+}
+
+async fn expunge_all_inner(session: &mut Session) -> Result<()> {
+    let stream = session.expunge().await.map_err(command_error)?;
+    futures::pin_mut!(stream);
+    while let Some(item) = stream.next().await {
+        item.map_err(command_error)?;
+    }
+    Ok(())
+}
+
+pub async fn noop(session: &mut Session) -> Result<()> {
+    with_deadline("NOOP", METADATA_TIMEOUT, noop_inner(session)).await
+}
+
+async fn noop_inner(session: &mut Session) -> Result<()> {
+    session.noop().await.map_err(command_error)
+}
+
+pub async fn logout(mut session: Session) {
+    // Logout is best-effort cleanup; a broken server must not hold actor
+    // shutdown or reconnect hostage indefinitely.
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), session.logout()).await;
+}
+
+/// Whether the server advertises the IDLE extension (RFC 2177). Issues a
+/// CAPABILITY command; callers cache the result for the connection's lifetime.
+/// What a server offers that syncing uses, read once per connection.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ServerCapabilities {
+    /// IDLE (RFC 2177): the server pushes changes to the selected mailbox.
+    pub idle: bool,
+    /// The STATUS return option of LIST (RFC 5819): one command reports the
+    /// STATUS of every mailbox.
+    pub list_status: bool,
+}
+
+pub async fn capabilities(session: &mut Session) -> Result<ServerCapabilities> {
+    with_deadline("CAPABILITY", METADATA_TIMEOUT, capabilities_inner(session)).await
+}
+
+async fn capabilities_inner(session: &mut Session) -> Result<ServerCapabilities> {
+    let caps = session.capabilities().await.map_err(command_error)?;
+    Ok(ServerCapabilities {
+        idle: caps.has_str("IDLE"),
+        // IMAP4rev2 includes LIST-STATUS, but a server that also speaks
+        // IMAP4rev1 enables only the IMAP4rev1 base until ENABLE IMAP4rev2
+        // (RFC 9051, section 6.1.1), so it must name the extension.
+        list_status: caps.has_str("LIST-STATUS")
+            || (caps.has_str("IMAP4rev2") && !caps.has_str("IMAP4rev1")),
+    })
+}
+
+/// A mailbox's STATUS: what tells whether mail arrived, left or was read
+/// elsewhere since the client last looked.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MailboxStatus {
+    pub messages: u32,
+    pub uid_next: Option<u32>,
+    pub unseen: Option<u32>,
+    pub uid_validity: Option<u32>,
+}
+
+const STATUS_ITEMS: &str = "(MESSAGES UIDNEXT UNSEEN UIDVALIDITY)";
+
+fn mailbox_status(attributes: &[async_imap::imap_proto::StatusAttribute]) -> MailboxStatus {
+    use async_imap::imap_proto::StatusAttribute;
+    let mut status = MailboxStatus::default();
+    for attribute in attributes {
+        match attribute {
+            StatusAttribute::Messages(messages) => status.messages = *messages,
+            StatusAttribute::UidNext(uid_next) => status.uid_next = Some(*uid_next),
+            StatusAttribute::Unseen(unseen) => status.unseen = Some(*unseen),
+            StatusAttribute::UidValidity(uid_validity) => status.uid_validity = Some(*uid_validity),
+            _ => {}
+        }
+    }
+    status
+}
+
+/// The STATUS of one mailbox. RFC 9051 asks clients not to use it on the
+/// selected mailbox, whose changes the server reports on its own.
+pub async fn status(session: &mut Session, folder: &str) -> Result<MailboxStatus> {
+    with_deadline("STATUS", METADATA_TIMEOUT, async {
+        let mailbox = session
+            .status(folder, STATUS_ITEMS)
+            .await
+            .map_err(command_error)?;
+        Ok(MailboxStatus {
+            messages: mailbox.exists,
+            uid_next: mailbox.uid_next,
+            unseen: mailbox.unseen,
+            uid_validity: mailbox.uid_validity,
+        })
+    })
+    .await
+}
+
+/// RFC 7162 section 4 asks clients to keep a command line near 8192 octets
+/// and split longer requests; this leaves room for the rest of LIST-STATUS.
+const LIST_PATTERNS_MAX: usize = 8000;
+
+/// The STATUS of every mailbox, or of just `mailboxes`, by mailbox name as
+/// LIST names it: one LIST-STATUS command for every mailbox, and as few as
+/// keep each command line short for a list of them (RFC 5258 patterns). A
+/// server may leave out a mailbox it could not look up (RFC 5819), so a
+/// missing name means "unknown", not "unchanged".
+pub async fn list_status(
+    session: &mut Session,
+    mailboxes: Option<&[&str]>,
+) -> Result<HashMap<String, MailboxStatus>> {
+    with_deadline("LIST-STATUS", METADATA_TIMEOUT, async {
+        let mut statuses = HashMap::new();
+        for patterns in list_status_patterns(mailboxes) {
+            list_status_inner(session, &patterns, &mut statuses).await?;
+        }
+        Ok(statuses)
+    })
+    .await
+}
+
+/// The mailbox argument of each LIST-STATUS command that reports
+/// `mailboxes`: all of them when None. A name no quoted string can carry
+/// goes unreported.
+fn list_status_patterns(mailboxes: Option<&[&str]>) -> Vec<String> {
+    let Some(mailboxes) = mailboxes else {
+        return vec!["\"*\"".into()];
+    };
+    let mut commands = Vec::new();
+    let mut patterns = String::new();
+    for quoted in mailboxes.iter().filter_map(|name| quoted_mailbox(name)) {
+        // The space before the name and the parentheses around the list.
+        if !patterns.is_empty() && patterns.len() + quoted.len() + 3 > LIST_PATTERNS_MAX {
+            commands.push(format!("({patterns})"));
+            patterns.clear();
+        }
+        if !patterns.is_empty() {
+            patterns.push(' ');
+        }
+        patterns.push_str(&quoted);
+    }
+    if !patterns.is_empty() {
+        commands.push(format!("({patterns})"));
+    }
+    commands
+}
+
+async fn list_status_inner(
+    session: &mut Session,
+    patterns: &str,
+    statuses: &mut HashMap<String, MailboxStatus>,
+) -> Result<()> {
+    use async_imap::imap_proto::{MailboxDatum, Response, Status};
+    let tag = session
+        .run_command(format!(
+            "LIST \"\" {patterns} RETURN (STATUS {STATUS_ITEMS})"
+        ))
+        .await
+        .map_err(command_error)?;
+    loop {
+        let response = session
+            .read_response()
+            .await
+            .map_err(|e| CoreError::Imap(e.to_string()))?
+            .ok_or_else(|| CoreError::Imap("connection closed during LIST-STATUS".into()))?;
+        match response.parsed() {
+            Response::Done {
+                tag: done,
+                status,
+                outcome,
+            } if *done == tag => {
+                return match status {
+                    Status::Ok => Ok(()),
+                    _ => Err(refusal(ServerReply::from_outcome(
+                        *status == Status::Bad,
+                        outcome,
+                    ))),
+                };
+            }
+            Response::MailboxData(MailboxDatum::Status { mailbox, status }) => {
+                statuses.insert(mailbox.to_string(), mailbox_status(status));
+            }
+            // LIST replies, and changes to the selected mailbox, which its
+            // next SELECT reads again.
+            _ => {}
+        }
+    }
+}
+
+/// What a push during IDLE says changed in the selected mailbox.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MailboxChange {
+    /// New mail (EXISTS), or a push that names nothing more specific.
+    Arrival,
+    /// A message's flags changed, as when it is read on another device.
+    Flags,
+    /// A message was removed.
+    Removal,
+}
+
+impl MailboxChange {
+    fn of(response: &async_imap::imap_proto::Response<'_>) -> Self {
+        use async_imap::imap_proto::Response;
+        match response {
+            Response::Fetch(..) => Self::Flags,
+            Response::Expunge(_) | Response::Vanished { .. } => Self::Removal,
+            _ => Self::Arrival,
+        }
+    }
+}
+
+/// Why an `idle_wait` returned. Generic over the actor's command type `C` so
+/// this module stays free of any `sync::engine` dependency.
+pub enum IdleOutcome<C> {
+    /// The server pushed a change to the selected mailbox: run a sync.
+    Activity(MailboxChange),
+    /// The max-idle cap elapsed with no activity: run a sync as a backstop.
+    Timeout,
+    /// A command arrived on the actor channel; hand it back to the caller.
+    Command(C),
+    /// The command channel closed (sender dropped): caller should shut down.
+    ChannelClosed,
+}
+
+/// Enter IDLE on the currently-selected mailbox and wait until the server
+/// reports activity, `max` elapses, or a command arrives on `rx` - whichever
+/// comes first. Always leaves IDLE (`DONE`) on the happy path so the returned
+/// session is reusable. On any IMAP/IO error the session is consumed and `Err`
+/// is returned; the caller must reconnect.
+pub async fn idle_wait<C>(
+    session: Session,
+    rx: &mut tokio::sync::mpsc::Receiver<C>,
+    max: std::time::Duration,
+) -> Result<(Session, IdleOutcome<C>)> {
+    use async_imap::extensions::idle::IdleResponse;
+
+    let mut idle = session.idle();
+    idle.init()
+        .await
+        .map_err(|e| CoreError::Imap(e.to_string()))?;
+
+    // The wait future borrows `idle` mutably and `done()` consumes it, so the
+    // future and its StopSource must live only inside this block and be dropped
+    // before we call `done()`. `_stop` is named (not a bare `_`) so it is NOT
+    // dropped early - dropping it would interrupt the wait immediately.
+    let outcome = {
+        let (wait_fut, _stop) = idle.wait_with_timeout(max);
+        tokio::pin!(wait_fut);
+        tokio::select! {
+            res = &mut wait_fut => match res {
+                Ok(IdleResponse::NewData(data)) => {
+                    IdleOutcome::Activity(MailboxChange::of(data.parsed()))
+                }
+                // We interrupt via `rx.recv()`, not the StopSource, so a
+                // ManualInterrupt here is unexpected; treat it as a backstop.
+                Ok(IdleResponse::Timeout) | Ok(IdleResponse::ManualInterrupt) => IdleOutcome::Timeout,
+                // Connection broke mid-IDLE: don't attempt DONE on a dead
+                // socket. Dropping `idle` closes it; the caller reconnects.
+                Err(e) => return Err(CoreError::Imap(e.to_string())),
+            },
+            cmd = rx.recv() => match cmd {
+                Some(c) => IdleOutcome::Command(c),
+                None => IdleOutcome::ChannelClosed,
+            },
+        }
+    };
+
+    // Leave IDLE. Bound DONE so a server that never acks can't wedge the actor.
+    let done = net::timeouts::scaled(std::time::Duration::from_secs(10));
+    let session = match tokio::time::timeout(done, idle.done()).await {
+        Ok(r) => r.map_err(|e| CoreError::Imap(e.to_string()))?,
+        Err(_) => return Err(CoreError::Imap("IDLE DONE timed out".into())),
+    };
+    Ok((session, outcome))
+}
+
+/// Compress a sorted UID list into an IMAP set string ("1:5,8,10:12").
+pub fn uid_set(uids: &[u32]) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < uids.len() {
+        let start = uids[i];
+        let mut end = start;
+        while i + 1 < uids.len() && end.checked_add(1) == Some(uids[i + 1]) {
+            i += 1;
+            end = uids[i];
+        }
+        if start == end {
+            parts.push(start.to_string());
+        } else {
+            parts.push(format!("{start}:{end}"));
+        }
+        i += 1;
+    }
+    parts.join(",")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        MIME_PLAN_QUERY, PLAIN_UNUSABLE, ServerReply, SignInCapabilities, SignInFailure,
+        SignInTarget, command_error, normalized_uid_set, plain_unusable_key, section_fetch_query,
+        section_paths, suggested_backoff,
+    };
+    use crate::error::{CoreError, LimitKind};
+    use base64::Engine as _;
+    use std::time::Duration;
+
+    #[test]
+    fn idle_pushes_name_what_changed() {
+        use super::MailboxChange;
+        use async_imap::imap_proto::{MailboxDatum, Response};
+        assert_eq!(
+            MailboxChange::of(&Response::Fetch(3, Vec::new())),
+            MailboxChange::Flags
+        );
+        assert_eq!(
+            MailboxChange::of(&Response::Expunge(3)),
+            MailboxChange::Removal
+        );
+        assert_eq!(
+            MailboxChange::of(&Response::MailboxData(MailboxDatum::Exists(4))),
+            MailboxChange::Arrival
+        );
+    }
+
+    const TARGET: SignInTarget<'static> = SignInTarget {
+        host: "mail.example.com",
+        port: 993,
+        encrypted: true,
+    };
+
+    fn reply(bad: bool, code: Option<&str>, text: &str) -> ServerReply {
+        ServerReply {
+            bad,
+            code: code.map(str::to_owned),
+            text: text.to_owned(),
+        }
+    }
+
+    /// What async-imap's own LOGIN returns for a server's reply, so the tests
+    /// read async-imap's real formatting.
+    async fn refused_login(reply: &'static str) -> async_imap::error::Error {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let (client, server) = tokio::io::duplex(4096);
+        let server = tokio::spawn(async move {
+            let (read, mut write) = tokio::io::split(server);
+            let mut read = BufReader::new(read);
+            let mut command = String::new();
+            read.read_line(&mut command).await.unwrap();
+            let tag = command.split_whitespace().next().unwrap().to_owned();
+            write
+                .write_all(format!("{tag} {reply}\r\n").as_bytes())
+                .await
+                .unwrap();
+            // Stay connected until the client is done with the reply.
+            read.read_line(&mut command).await.unwrap();
+        });
+        let Err((error, client)) = async_imap::Client::new(client)
+            .login("user", "password")
+            .await
+        else {
+            panic!("the server accepted the sign-in");
+        };
+        drop(client);
+        server.await.unwrap();
+        error
+    }
+
+    #[tokio::test]
+    async fn sign_in_refusals_are_sorted_by_response_code() {
+        for (server, expected) in [
+            (
+                "NO [AUTHENTICATIONFAILED] Authentication failed.",
+                SignInFailure::Rejected(reply(
+                    false,
+                    Some("AUTHENTICATIONFAILED"),
+                    "[AUTHENTICATIONFAILED] Authentication failed.",
+                )),
+            ),
+            (
+                "NO LOGIN failed.",
+                SignInFailure::Rejected(reply(false, None, "LOGIN failed.")),
+            ),
+            (
+                "NO [EXPIRED] That password isn't valid any more",
+                SignInFailure::Rejected(reply(
+                    false,
+                    Some("EXPIRED"),
+                    "[EXPIRED] That password isn't valid any more",
+                )),
+            ),
+            (
+                "NO [ALERT] Please log in via your web browser",
+                SignInFailure::Rejected(reply(
+                    false,
+                    Some("ALERT"),
+                    "Please log in via your web browser",
+                )),
+            ),
+            (
+                "BAD Error in IMAP command LOGIN: Invalid characters",
+                SignInFailure::Rejected(reply(
+                    true,
+                    None,
+                    "Error in IMAP command LOGIN: Invalid characters",
+                )),
+            ),
+            (
+                "NO [UNAVAILABLE] Temporary authentication failure.",
+                SignInFailure::Unavailable(reply(
+                    false,
+                    Some("UNAVAILABLE"),
+                    "[UNAVAILABLE] Temporary authentication failure.",
+                )),
+            ),
+            (
+                "NO [CONTACTADMIN] Account suspended",
+                SignInFailure::Refused(reply(
+                    false,
+                    Some("CONTACTADMIN"),
+                    "[CONTACTADMIN] Account suspended",
+                )),
+            ),
+            // Gmail's limits come as an ALERT, which isn't about the password.
+            (
+                "NO [ALERT] Account exceeded command or bandwidth limits. (Failure)",
+                SignInFailure::Limited(
+                    reply(
+                        false,
+                        Some("ALERT"),
+                        "Account exceeded command or bandwidth limits. (Failure)",
+                    ),
+                    LimitKind::Requests,
+                ),
+            ),
+            (
+                "NO [ALERT] Too many simultaneous connections. (Failure)",
+                SignInFailure::Limited(
+                    reply(
+                        false,
+                        Some("ALERT"),
+                        "Too many simultaneous connections. (Failure)",
+                    ),
+                    LimitKind::Connections,
+                ),
+            ),
+            // Dovecot 2.3 and 2.4 over mail_max_userip_connections.
+            (
+                "NO [UNAVAILABLE] Maximum number of connections from user+IP exceeded (mail_max_userip_connections=10)",
+                SignInFailure::Limited(
+                    reply(
+                        false,
+                        Some("UNAVAILABLE"),
+                        "[UNAVAILABLE] Maximum number of connections from user+IP exceeded (mail_max_userip_connections=10)",
+                    ),
+                    LimitKind::Connections,
+                ),
+            ),
+            (
+                "NO [LIMIT] Maximum number of connections from user+IP exceeded (mail_max_userip_connections=10)",
+                SignInFailure::Limited(
+                    reply(
+                        false,
+                        Some("LIMIT"),
+                        "[LIMIT] Maximum number of connections from user+IP exceeded (mail_max_userip_connections=10)",
+                    ),
+                    LimitKind::Connections,
+                ),
+            ),
+            (
+                "NO [LIMIT] Rate limit hit.",
+                SignInFailure::Limited(
+                    reply(false, Some("LIMIT"), "[LIMIT] Rate limit hit."),
+                    LimitKind::Requests,
+                ),
+            ),
+            (
+                "NO [LIMIT] Try again in a while",
+                SignInFailure::Limited(
+                    reply(false, Some("LIMIT"), "[LIMIT] Try again in a while"),
+                    LimitKind::Requests,
+                ),
+            ),
+            (
+                "NO [INUSE] Mailbox is locked by another session",
+                SignInFailure::Limited(
+                    reply(
+                        false,
+                        Some("INUSE"),
+                        "[INUSE] Mailbox is locked by another session",
+                    ),
+                    LimitKind::Busy,
+                ),
+            ),
+            // UTF-8, quotes and backslashes come back exactly as sent.
+            (
+                "NO [AUTHENTICATIONFAILED] Échec de l'authentification – \"réessayez\" \\o/",
+                SignInFailure::Rejected(reply(
+                    false,
+                    Some("AUTHENTICATIONFAILED"),
+                    "[AUTHENTICATIONFAILED] Échec de l'authentification – \"réessayez\" \\o/",
+                )),
+            ),
+        ] {
+            assert_eq!(
+                SignInFailure::from_imap(refused_login(server).await),
+                expected,
+                "{server}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_dropped_connection_is_not_a_refusal() {
+        let (client, server) = tokio::io::duplex(64);
+        drop(server);
+        let Err((error, _)) = async_imap::Client::new(client)
+            .login("user", "password")
+            .await
+        else {
+            panic!("signed in without a server");
+        };
+        assert!(matches!(
+            SignInFailure::from_imap(error),
+            SignInFailure::Transport(_)
+        ));
+    }
+
+    /// What async-imap's own SELECT returns for a server's reply. It writes
+    /// a refused SELECT, EXAMINE or STATUS unlike a refused LOGIN.
+    async fn refused_select(reply: &'static str) -> async_imap::error::Error {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let (client, server) = tokio::io::duplex(4096);
+        let server = tokio::spawn(async move {
+            let (read, mut write) = tokio::io::split(server);
+            let mut read = BufReader::new(read);
+            let mut command = String::new();
+            for answer in ["OK signed in", reply] {
+                command.clear();
+                read.read_line(&mut command).await.unwrap();
+                let tag = command.split_whitespace().next().unwrap().to_owned();
+                write
+                    .write_all(format!("{tag} {answer}\r\n").as_bytes())
+                    .await
+                    .unwrap();
+            }
+            // Stay connected until the client is done with the reply.
+            read.read_line(&mut command).await.unwrap();
+        });
+        let Ok(mut session) = async_imap::Client::new(client)
+            .login("user", "password")
+            .await
+        else {
+            panic!("the server refused the sign-in");
+        };
+        let Err(error) = session.select("Gone").await else {
+            panic!("the server opened the folder");
+        };
+        drop(session);
+        server.await.unwrap();
+        error
+    }
+
+    #[tokio::test]
+    async fn a_refusal_keeps_the_server_reply_and_is_not_a_broken_connection() {
+        for server in [
+            // Gmail, once a label is renamed or deleted (issue #215).
+            "NO [NONEXISTENT] Unknown Mailbox: Gone (now in authenticated state) (Failure)",
+            // imap-proto takes the codes it knows out of the text.
+            "NO [TRYCREATE] Mailbox doesn't exist: Gone",
+            "NO Mailbox does not exist",
+            "BAD Error in IMAP command SELECT: Invalid mailbox name",
+            "NO [NONEXISTENT] Ordner \"Gelöscht\" fehlt \\o/",
+        ] {
+            match command_error(refused_select(server).await) {
+                CoreError::ImapRefused(reply) => assert_eq!(reply, server),
+                other => panic!("{server}: {other:?}"),
+            }
+        }
+        match command_error(refused_login("NO [UNAVAILABLE] Try again later").await) {
+            CoreError::ImapRefused(reply) => assert_eq!(reply, "NO [UNAVAILABLE] Try again later"),
+            other => panic!("{other:?}"),
+        }
+        assert!(matches!(
+            command_error(async_imap::error::Error::ConnectionLost),
+            CoreError::Imap(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_command_refused_for_a_limit_asks_to_wait() {
+        // Exchange Online names the wait.
+        let throttled = "BAD Request is throttled. Suggested Backoff Time: 165839 milliseconds";
+        match command_error(refused_select(throttled).await) {
+            CoreError::RateLimited {
+                kind,
+                retry_after,
+                detail,
+                ..
+            } => {
+                assert_eq!(kind, LimitKind::Requests);
+                assert_eq!(retry_after, Some(Duration::from_millis(165_839)));
+                assert_eq!(detail, throttled);
+            }
+            other => panic!("{other:?}"),
+        }
+        // Yahoo turns down a command once it rate-limits the account.
+        assert!(matches!(
+            command_error(refused_select("NO [LIMIT] Rate limit hit.").await),
+            CoreError::RateLimited {
+                kind: LimitKind::Requests,
+                retry_after: None,
+                ..
+            }
+        ));
+        // A code alone is about the command: LIMIT is about too many flags
+        // in RFC 5530's own example.
+        let flags = "NO [LIMIT] At most 32 flags in one mailbox";
+        match command_error(refused_select(flags).await) {
+            CoreError::ImapRefused(reply) => assert_eq!(reply, flags),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn exchange_names_its_backoff_in_milliseconds_or_seconds() {
+        assert_eq!(
+            suggested_backoff("Request is throttled. Suggested Backoff Time: 2500 milliseconds"),
+            Some(Duration::from_millis(2500))
+        );
+        assert_eq!(
+            suggested_backoff("suggested backoff time: 30 s"),
+            Some(Duration::from_secs(30))
+        );
+        assert_eq!(suggested_backoff("Request is throttled."), None);
+        assert_eq!(suggested_backoff("Suggested Backoff Time: soon"), None);
+    }
+
+    #[test]
+    fn a_limit_at_sign_in_is_not_a_wrong_password() {
+        let error = SignInFailure::Limited(
+            reply(
+                false,
+                Some("ALERT"),
+                "Account exceeded command or bandwidth limits. (Failure)",
+            ),
+            LimitKind::Requests,
+        )
+        .into_error(TARGET, "jane@example.com");
+        match error {
+            CoreError::RateLimited {
+                service,
+                kind,
+                retry_after,
+                ..
+            } => {
+                assert_eq!(service, "mail.example.com");
+                assert_eq!(kind, LimitKind::Requests);
+                assert_eq!(retry_after, None);
+            }
+            other => panic!("{other:?}"),
+        }
+        // A limit never goes on to try LOGIN after AUTHENTICATE PLAIN.
+        let limited = SignInFailure::Limited(
+            reply(false, Some("LIMIT"), "[LIMIT] Rate limit hit."),
+            LimitKind::Requests,
+        );
+        assert!(!limited.allows_login_after_plain(true));
+        assert!(!limited.allows_login_after_plain(false));
+    }
+
+    #[test]
+    fn sign_in_errors_name_the_server_and_username() {
+        let rejected = reply(
+            false,
+            Some("AUTHENTICATIONFAILED"),
+            "[AUTHENTICATIONFAILED] Authentication failed.",
+        );
+        let error =
+            SignInFailure::Rejected(rejected.clone()).into_error(TARGET, "jane@example.com");
+        assert!(matches!(error, CoreError::Auth(_)));
+        assert_eq!(
+            error.to_string(),
+            "auth failed: mail.example.com rejected the username jane@example.com or its password ([AUTHENTICATIONFAILED] Authentication failed.)"
+        );
+
+        // Only rejections wait for the user. The rest is retried like any
+        // other connection problem.
+        for failure in [
+            SignInFailure::Unavailable(reply(
+                false,
+                Some("UNAVAILABLE"),
+                "[UNAVAILABLE] Try later",
+            )),
+            SignInFailure::Refused(reply(false, Some("CONTACTADMIN"), "[CONTACTADMIN] Call us")),
+            SignInFailure::Transport("connection lost".into()),
+        ] {
+            let error = failure.into_error(TARGET, "jane");
+            assert!(matches!(error, CoreError::Imap(_)), "{error}");
+            assert!(error.to_string().contains("mail.example.com"), "{error}");
+        }
+
+        let plain = SignInTarget {
+            encrypted: false,
+            ..TARGET
+        };
+        let error = SignInFailure::Rejected(rejected).into_error(plain, "jane");
+        assert!(
+            error.to_string().contains(
+                "(unverified reply over an unencrypted connection: [AUTHENTICATIONFAILED] Authentication failed.)"
+            ),
+            "{error}"
+        );
+    }
+
+    /// The server side of a scripted IMAP conversation.
+    struct ScriptedServer {
+        read: tokio::io::BufReader<tokio::io::ReadHalf<tokio::io::DuplexStream>>,
+        write: tokio::io::WriteHalf<tokio::io::DuplexStream>,
+    }
+
+    impl ScriptedServer {
+        fn start() -> (tokio::io::DuplexStream, Self) {
+            let (client, server) = tokio::io::duplex(4096);
+            let (read, write) = tokio::io::split(server);
+            let read = tokio::io::BufReader::new(read);
+            (client, Self { read, write })
+        }
+
+        /// The client's next line, or None once it hung up.
+        async fn next_line(&mut self) -> Option<String> {
+            use tokio::io::AsyncBufReadExt;
+            let mut line = String::new();
+            (self.read.read_line(&mut line).await.unwrap() > 0).then_some(line)
+        }
+
+        /// Expect a command, returning its tag.
+        async fn expect(&mut self, command: &str) -> String {
+            let line = self.next_line().await.expect("the client hung up");
+            let (tag, rest) = line.split_once(' ').unwrap();
+            assert!(
+                rest.starts_with(command),
+                "expected {command}, got {line:?}"
+            );
+            tag.to_owned()
+        }
+
+        async fn send(&mut self, line: &str) {
+            use tokio::io::AsyncWriteExt;
+            self.write
+                .write_all(format!("{line}\r\n").as_bytes())
+                .await
+                .unwrap();
+        }
+
+        /// Answer AUTHENTICATE PLAIN's continuation and return the decoded
+        /// credentials.
+        async fn read_plain_credentials(&mut self) -> String {
+            self.send("+ ").await;
+            let line = self.next_line().await.unwrap();
+            let decoded = base64::engine::general_purpose::STANDARD
+                .decode(line.trim_end())
+                .unwrap();
+            String::from_utf8(decoded).unwrap()
+        }
+    }
+
+    const PLAIN: SignInCapabilities = SignInCapabilities {
+        plain: true,
+        login_disabled: false,
+    };
+
+    fn target(host: &'static str) -> SignInTarget<'static> {
+        SignInTarget { host, ..TARGET }
+    }
+
+    async fn sign_in(
+        client: tokio::io::DuplexStream,
+        target: SignInTarget<'static>,
+        capabilities: SignInCapabilities,
+    ) -> crate::error::Result<async_imap::Session<tokio::io::DuplexStream>> {
+        sign_in_with(
+            client,
+            target,
+            capabilities,
+            crate::models::LoginMethod::Automatic,
+        )
+        .await
+    }
+
+    async fn sign_in_with(
+        client: tokio::io::DuplexStream,
+        target: SignInTarget<'static>,
+        capabilities: SignInCapabilities,
+        method: crate::models::LoginMethod,
+    ) -> crate::error::Result<async_imap::Session<tokio::io::DuplexStream>> {
+        super::sign_in_with_password(
+            async_imap::Client::new(client),
+            target,
+            "jane@example.com",
+            "pässwörd",
+            capabilities,
+            method,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn an_account_set_to_login_never_tries_plain() {
+        let (client, mut server) = ScriptedServer::start();
+        let script = tokio::spawn(async move {
+            let tag = server.expect("LOGIN \"jane@example.com\"").await;
+            server.send(&format!("{tag} OK signed in")).await;
+        });
+        sign_in_with(
+            client,
+            target("login-only.example"),
+            PLAIN,
+            crate::models::LoginMethod::Login,
+        )
+        .await
+        .unwrap();
+        script.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_account_set_to_plain_tries_it_unannounced_and_never_falls_back() {
+        let (client, mut server) = ScriptedServer::start();
+        let script = tokio::spawn(async move {
+            let tag = server.expect("AUTHENTICATE PLAIN").await;
+            server
+                .send(&format!("{tag} NO AUTHENTICATE mechanism not supported"))
+                .await;
+        });
+        let error = sign_in_with(
+            client,
+            target("plain-only.example"),
+            SignInCapabilities::default(),
+            crate::models::LoginMethod::Plain,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, CoreError::Auth(_)), "{error:?}");
+        script.await.unwrap();
+    }
+
+    /// Unencrypted, a password goes out only as the server offers, whatever
+    /// the account is set to.
+    #[tokio::test]
+    async fn a_chosen_method_sends_no_password_unannounced_without_encryption() {
+        let unencrypted = SignInTarget {
+            encrypted: false,
+            ..target("cleartext.example")
+        };
+        for (method, capabilities, expected) in [
+            (
+                crate::models::LoginMethod::Plain,
+                SignInCapabilities::default(),
+                "doesn't offer PLAIN sign-in without encryption",
+            ),
+            (
+                crate::models::LoginMethod::Plain,
+                SignInCapabilities {
+                    plain: false,
+                    login_disabled: true,
+                },
+                "accepts passwords only over an encrypted connection",
+            ),
+            (
+                crate::models::LoginMethod::Login,
+                SignInCapabilities {
+                    plain: true,
+                    login_disabled: true,
+                },
+                "doesn't offer LOGIN sign-in without encryption",
+            ),
+        ] {
+            let (client, mut server) = ScriptedServer::start();
+            let script = tokio::spawn(async move {
+                assert_eq!(server.next_line().await, None, "a password was sent");
+            });
+            let error = sign_in_with(client, unencrypted, capabilities, method)
+                .await
+                .err()
+                .unwrap();
+            assert!(error.to_string().contains(expected), "{method:?}: {error}");
+            script.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn an_account_set_to_login_says_when_the_server_refuses_it() {
+        let (client, mut server) = ScriptedServer::start();
+        let script = tokio::spawn(async move {
+            assert_eq!(server.next_line().await, None, "a password was sent");
+        });
+        let error = sign_in_with(
+            client,
+            target("plain-only.example"),
+            SignInCapabilities {
+                plain: true,
+                login_disabled: true,
+            },
+            crate::models::LoginMethod::Login,
+        )
+        .await
+        .err()
+        .unwrap();
+        assert!(
+            error
+                .to_string()
+                .contains("doesn't offer LOGIN sign-in. Choose another sign-in method."),
+            "{error}"
+        );
+        script.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn signs_in_with_plain_when_offered() {
+        let (client, mut server) = ScriptedServer::start();
+        let script = tokio::spawn(async move {
+            let tag = server.expect("AUTHENTICATE PLAIN").await;
+            // UTF-8 as typed, which LOGIN's quoted strings can't carry.
+            assert_eq!(
+                server.read_plain_credentials().await,
+                "\0jane@example.com\0pässwörd"
+            );
+            server.send(&format!("{tag} OK signed in")).await;
+        });
+        sign_in(client, target("plain.example"), PLAIN)
+            .await
+            .unwrap();
+        script.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn signs_in_with_login_when_plain_is_not_offered() {
+        let (client, mut server) = ScriptedServer::start();
+        let script = tokio::spawn(async move {
+            let tag = server.expect("LOGIN \"jane@example.com\"").await;
+            server.send(&format!("{tag} OK signed in")).await;
+        });
+        sign_in(
+            client,
+            target("login.example"),
+            SignInCapabilities::default(),
+        )
+        .await
+        .unwrap();
+        script.await.unwrap();
+    }
+
+    /// fh-koeln.de and scarlet.be announce AUTH=PLAIN and refuse it before
+    /// asking for credentials (K-9 Mail #9406, #2648).
+    #[tokio::test]
+    async fn falls_back_to_login_when_plain_is_refused_and_remembers_it() {
+        let (client, mut server) = ScriptedServer::start();
+        let script = tokio::spawn(async move {
+            let tag = server.expect("AUTHENTICATE PLAIN").await;
+            server
+                .send(&format!(
+                    "{tag} NO AUTHENTICATE mechanism not supported, mate"
+                ))
+                .await;
+            let tag = server.expect("LOGIN").await;
+            server.send(&format!("{tag} OK signed in")).await;
+        });
+        sign_in(client, target("broken-plain.example"), PLAIN)
+            .await
+            .unwrap();
+        script.await.unwrap();
+
+        // The next connection goes straight to LOGIN.
+        let (client, mut server) = ScriptedServer::start();
+        let script = tokio::spawn(async move {
+            let tag = server.expect("LOGIN").await;
+            server.send(&format!("{tag} OK signed in")).await;
+        });
+        sign_in(client, target("broken-plain.example"), PLAIN)
+            .await
+            .unwrap();
+        script.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_rejected_password_is_not_sent_again_with_login() {
+        let (client, mut server) = ScriptedServer::start();
+        let script = tokio::spawn(async move {
+            let tag = server.expect("AUTHENTICATE PLAIN").await;
+            server.read_plain_credentials().await;
+            server
+                .send(&format!(
+                    "{tag} NO [AUTHENTICATIONFAILED] Authentication failed."
+                ))
+                .await;
+            assert_eq!(server.next_line().await, None, "credentials sent again");
+        });
+        let error = sign_in(client, target("rejected.example"), PLAIN)
+            .await
+            .err()
+            .unwrap();
+        assert!(matches!(error, CoreError::Auth(_)), "{error}");
+        script.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_unexplained_plain_failure_is_tried_with_login() {
+        let (client, mut server) = ScriptedServer::start();
+        let script = tokio::spawn(async move {
+            let tag = server.expect("AUTHENTICATE PLAIN").await;
+            server.read_plain_credentials().await;
+            server.send(&format!("{tag} NO AUTHENTICATE failed.")).await;
+            let tag = server.expect("LOGIN").await;
+            server.send(&format!("{tag} NO LOGIN failed.")).await;
+        });
+        let error = sign_in(client, target("unexplained.example"), PLAIN)
+            .await
+            .err()
+            .unwrap();
+        assert!(matches!(error, CoreError::Auth(_)), "{error}");
+        script.await.unwrap();
+        // Both failed, so PLAIN isn't marked as unusable.
+        assert!(
+            !PLAIN_UNUSABLE
+                .lock()
+                .unwrap()
+                .contains(&plain_unusable_key(target("unexplained.example")))
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unavailable_server_is_not_tried_with_login() {
+        let (client, mut server) = ScriptedServer::start();
+        let script = tokio::spawn(async move {
+            let tag = server.expect("AUTHENTICATE PLAIN").await;
+            server.read_plain_credentials().await;
+            server
+                .send(&format!(
+                    "{tag} NO [UNAVAILABLE] Temporary authentication failure."
+                ))
+                .await;
+            assert_eq!(server.next_line().await, None, "credentials sent again");
+        });
+        let error = sign_in(client, target("unavailable.example"), PLAIN)
+            .await
+            .err()
+            .unwrap();
+        assert!(matches!(error, CoreError::Imap(_)), "{error}");
+        script.await.unwrap();
+    }
+
+    /// A server may hang up instead of answering LOGIN after a failed
+    /// AUTHENTICATE (K-9 Mail #6762). PLAIN's answer is the one to report.
+    #[tokio::test]
+    async fn a_hang_up_after_plain_reports_what_plain_got() {
+        let (client, mut server) = ScriptedServer::start();
+        let script = tokio::spawn(async move {
+            let tag = server.expect("AUTHENTICATE PLAIN").await;
+            server.read_plain_credentials().await;
+            server
+                .send(&format!("{tag} NO Authentication failed"))
+                .await;
+            server.expect("LOGIN").await;
+        });
+        let error = sign_in(client, target("hang-up.example"), PLAIN)
+            .await
+            .err()
+            .unwrap();
+        assert!(matches!(error, CoreError::Auth(_)), "{error}");
+        assert!(
+            error.to_string().contains("Authentication failed"),
+            "{error}"
+        );
+        script.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn no_password_is_sent_where_login_is_disabled() {
+        let (client, mut server) = ScriptedServer::start();
+        let script = tokio::spawn(async move {
+            assert_eq!(server.next_line().await, None, "a password was sent");
+        });
+        let error = sign_in(
+            client,
+            target("disabled.example"),
+            SignInCapabilities {
+                plain: false,
+                login_disabled: true,
+            },
+        )
+        .await
+        .err()
+        .unwrap();
+        assert!(matches!(error, CoreError::Imap(_)), "{error}");
+        script.await.unwrap();
+    }
+
+    #[test]
+    fn exchange_authenticated_but_not_connected_is_retryable() {
+        let error = super::xoauth2_error(
+            TARGET,
+            "user@example.com",
+            async_imap::error::Error::No(
+                "code: None, info: Some(\"User is authenticated but not connected.\")".into(),
+            ),
+        );
+        assert!(matches!(error, CoreError::Imap(_)));
+    }
+
+    #[test]
+    fn ordinary_xoauth2_rejection_still_requires_reauth() {
+        let no =
+            |info: &str| async_imap::error::Error::No(format!("code: None, info: Some({info:?})"));
+        let error = super::xoauth2_error(
+            TARGET,
+            "user@example.com",
+            no("[AUTHENTICATIONFAILED] Invalid credentials (Failure)"),
+        );
+        assert!(matches!(error, CoreError::Auth(_)));
+        // A server that can't check the token right now hasn't revoked it.
+        let error = super::xoauth2_error(
+            TARGET,
+            "user@example.com",
+            no("[UNAVAILABLE] Temporary System Problem. Try again later"),
+        );
+        assert!(matches!(error, CoreError::Imap(_)));
+    }
+
+    #[test]
+    fn uid_set_compresses() {
+        assert_eq!(super::uid_set(&[1, 2, 3, 5, 7, 8]), "1:3,5,7:8");
+        assert_eq!(super::uid_set(&[]), "");
+        assert_eq!(super::uid_set(&[42]), "42");
+        assert_eq!(super::uid_set(&[u32::MAX]), u32::MAX.to_string());
+    }
+
+    #[test]
+    fn modified_utf7_round_trips_unicode_and_ampersands() {
+        for name in ["Inbox", "A & B", "📁 Projects", "🚗🚙", "旅行/東京", "😀"] {
+            assert_eq!(
+                super::decode_mailbox_name(&super::encode_mailbox_name(name)),
+                name
+            );
+        }
+        assert_eq!(super::decode_mailbox_name("Envoy&AOk-"), "Envoyé");
+        assert_eq!(super::decode_mailbox_name("&Jjo-"), "☺");
+    }
+
+    #[test]
+    fn malformed_modified_utf7_is_preserved() {
+        for name in ["broken&", "broken&ab-", "broken&!!!!-"] {
+            assert_eq!(super::decode_mailbox_name(name), name);
+        }
+    }
+
+    #[test]
+    fn batch_uid_set_is_sorted_deduplicated_and_rejects_zero() {
+        assert_eq!(normalized_uid_set(&[9, 2, 3, 2, 4]).unwrap(), "2:4,9");
+        assert_eq!(normalized_uid_set(&[]).unwrap(), "");
+        assert!(normalized_uid_set(&[1, 0, 2]).is_err());
+    }
+
+    #[test]
+    fn selective_section_query_accepts_only_numeric_paths() {
+        let sections = vec!["1".to_string(), "2.3".to_string()];
+        let paths = section_paths(&sections).unwrap();
+        assert_eq!(
+            section_fetch_query(&paths),
+            "(UID BODY.PEEK[1.MIME] BODY.PEEK[1] BODY.PEEK[2.3.MIME] BODY.PEEK[2.3])"
+        );
+
+        for invalid in ["", "0", "1.0", "1..2", "1] BODY.PEEK[]", "-1", "1.a"] {
+            assert!(
+                section_paths(&[invalid.to_string()]).is_err(),
+                "accepted invalid section {invalid:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn mime_plan_batch_query_is_bodystructure_only() {
+        assert_eq!(MIME_PLAN_QUERY, "(UID BODYSTRUCTURE)");
+        for excluded in ["FLAGS", "INTERNALDATE", "RFC822.SIZE", "HEADER.FIELDS"] {
+            assert!(!MIME_PLAN_QUERY.contains(excluded));
+        }
+    }
+
+    #[test]
+    fn list_status_asks_for_every_mailbox_or_the_named_ones() {
+        use super::{LIST_PATTERNS_MAX, list_status_patterns, quoted_mailbox};
+        assert_eq!(list_status_patterns(None), ["\"*\""]);
+        assert!(list_status_patterns(Some(&[])).is_empty());
+        assert_eq!(
+            list_status_patterns(Some(&["INBOX", r#"Say "hi"\now"#, "Bad\r\nname"])),
+            [r#"("INBOX" "Say \"hi\"\\now")"#]
+        );
+        assert_eq!(quoted_mailbox("a\0b"), None);
+
+        // A long list is split so no command line runs past the limit, and
+        // every name is asked for once.
+        let names = (0..2000)
+            .map(|i| format!("Shared/Folder {i}"))
+            .collect::<Vec<_>>();
+        let names = names.iter().map(String::as_str).collect::<Vec<_>>();
+        let commands = list_status_patterns(Some(&names));
+        assert!(commands.len() > 1);
+        assert!(
+            commands
+                .iter()
+                .all(|command| command.len() <= LIST_PATTERNS_MAX)
+        );
+        let asked = commands
+            .iter()
+            .flat_map(|command| command.trim_matches(['(', ')']).split("\" \""))
+            .count();
+        assert_eq!(asked, names.len());
+    }
+}

@@ -1,0 +1,56 @@
+name: FlectarMail
+options:
+  bundleIdPrefix: com.flectar
+settings:
+  base:
+    ENABLE_USER_SCRIPT_SANDBOXING: NO
+    PRODUCT_BUNDLE_IDENTIFIER: com.flectar.mail
+    # scripts/package-ios.sh sets both from Cargo.toml; these values only
+    # apply to builds started from Xcode.
+    MARKETING_VERSION: "0.1.0"
+    CURRENT_PROJECT_VERSION: "1"
+    ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+    # Alternate icons chosen in Settings; resources/app-icon/generate.py
+    # writes their icon sets and checks this list.
+    ASSETCATALOG_COMPILER_ALTERNATE_APPICON_NAMES: "AppIconGraphite AppIconLight AppIconBlue AppIconGreen AppIconPurple"
+targets:
+  FlectarMail:
+    type: application
+    platform: iOS
+    deploymentTarget: "17.0"
+    info:
+      path: Info.plist
+      properties:
+        # Background checks for new mail (platform/ios/BackgroundChecks.m).
+        BGTaskSchedulerPermittedIdentifiers: [com.flectar.mail.check]
+        CFBundleDisplayName: Flectar Mail
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        NSLocalNetworkUsageDescription: Flectar Mail connects to mail servers on your local network.
+        UIBackgroundModes: [fetch]
+        UILaunchScreen: {}
+        UIRequiresFullScreen: false
+    sources:
+      - path: Assets.xcassets
+        buildPhase: resources
+    postCompileScripts:
+      - name: Build Rust application
+        script: |
+          "$SRCROOT/build-with-cargo.sh" flectar-mail
+        basedOnDependencyAnalysis: false
+    postBuildScripts:
+      - name: Bundle license notices
+        script: |
+          license_root="$TARGET_BUILD_DIR/$UNLOCALIZED_RESOURCES_FOLDER_PATH/Licenses"
+          app_license_dir="$license_root/Flectar Mail"
+          google_font_license_dir="$license_root/Google Sans Flex"
+          emoji_font_license_dir="$license_root/Noto Emoji"
+          mkdir -p "$app_license_dir" "$google_font_license_dir" "$emoji_font_license_dir"
+          cp "$SRCROOT/../../LICENSE" "$app_license_dir/LICENSE"
+          cp -R "$SRCROOT/../../LICENSES" "$app_license_dir/LICENSES"
+          cp "$SRCROOT/../../THIRD_PARTY_NOTICES.md" "$app_license_dir/THIRD_PARTY_NOTICES.md"
+          cp "$SRCROOT/../../resources/fonts/google-sans-flex/OFL.txt" "$google_font_license_dir/OFL.txt"
+          cp "$SRCROOT/../../resources/fonts/google-sans-flex/README.md" "$google_font_license_dir/README.md"
+          cp "$SRCROOT/../../resources/fonts/noto-emoji/OFL.txt" "$emoji_font_license_dir/OFL.txt"
+          cp "$SRCROOT/../../resources/fonts/noto-emoji/README.md" "$emoji_font_license_dir/README.md"
+        basedOnDependencyAnalysis: false

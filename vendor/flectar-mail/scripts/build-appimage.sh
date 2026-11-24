@@ -1,0 +1,156 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+project_dir="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
+build_dir="$project_dir/target/appimage"
+app_dir="$build_dir/flectar-mail.AppDir"
+output_path="$build_dir/flectar-mail.AppImage"
+staged_output="$build_dir/.flectar-mail.AppImage.new"
+tools_dir="$build_dir/tools"
+executable="$project_dir/target/release/flectar-mail"
+
+download_tool() {
+  local url="$1"
+  local destination="$2"
+  if [[ -x "$destination" ]]; then
+    return
+  fi
+  mkdir -p "$(dirname "$destination")"
+  if command -v curl >/dev/null 2>&1; then
+    curl --fail --location --silent --show-error "$url" --output "$destination.new"
+  elif command -v wget >/dev/null 2>&1; then
+    wget -q "$url" -O "$destination.new"
+  else
+    printf 'curl or wget is required to obtain the AppImage deployment tools.\n' >&2
+    exit 1
+  fi
+  chmod +x "$destination.new"
+  mv -f "$destination.new" "$destination"
+}
+
+mkdir -p "$build_dir"
+# Include both renderer choices; CPU remains the initial runtime selection.
+# FLECTAR_APP_FEATURES can enable additional application features.
+app_features="${FLECTAR_APP_FEATURES:-}"
+build_args=(--locked --bin flectar-mail --manifest-path "$project_dir/Cargo.toml" --release --no-default-features --features remote-content,gpu-renderer)
+if [[ -n "$app_features" ]]; then
+  build_args+=(--features "$app_features")
+fi
+# The controls are app-owned and the Linux shell uses winit directly.
+if [[ "${FLECTAR_SKIP_BUILD:-0}" == "1" ]]; then
+  if [[ ! -x "$executable" ]]; then
+    printf 'FLECTAR_SKIP_BUILD=1 requires an existing release executable.\n' >&2
+    exit 1
+  fi
+else
+  cargo build "${build_args[@]}"
+fi
+# Name the package and its tools after the executable's architecture.
+architecture="$(python3 "$project_dir/scripts/linux-elf.py" arch "$executable")"
+read -r machine _ pdfium_target <<<"$architecture"
+
+if ldd "$executable" | grep -q 'libQt'; then
+  printf 'The release binary unexpectedly links Qt; refusing to package it.\n' >&2
+  exit 1
+fi
+
+rm -rf "$app_dir"
+mkdir -p \
+  "$app_dir/usr/bin" \
+  "$app_dir/usr/share/applications" \
+  "$app_dir/usr/share/doc/flectar-mail/google-sans-flex" \
+  "$app_dir/usr/share/icons/hicolor/512x512/apps" \
+  "$app_dir/usr/share/icons/hicolor/scalable/apps" \
+  "$app_dir/usr/share/metainfo"
+cp "$executable" "$app_dir/usr/bin/flectar-mail"
+python3 "$project_dir/scripts/stage-pdfium.py" "$pdfium_target" "$app_dir/usr/lib/flectar-mail"
+app_version="$(python3 "$project_dir/scripts/stage-linux-metadata.py" --arch "$machine" "$app_dir")"
+cp "$project_dir/resources/app-icon/flectar-mail-masked-512.png" "$app_dir/usr/share/icons/hicolor/512x512/apps/com.flectar.mail.png"
+cp "$project_dir/resources/app-icon/flectar-mail-masked.svg" "$app_dir/usr/share/icons/hicolor/scalable/apps/com.flectar.mail.svg"
+cp "$project_dir/LICENSE" "$app_dir/usr/share/doc/flectar-mail/LICENSE"
+cp -R "$project_dir/LICENSES" "$app_dir/usr/share/doc/flectar-mail/LICENSES"
+cp "$project_dir/THIRD_PARTY_NOTICES.md" "$app_dir/usr/share/doc/flectar-mail/THIRD_PARTY_NOTICES.md"
+cp "$project_dir/resources/fonts/google-sans-flex/OFL.txt" \
+  "$app_dir/usr/share/doc/flectar-mail/google-sans-flex/OFL.txt"
+cp "$project_dir/resources/fonts/google-sans-flex/README.md" \
+  "$app_dir/usr/share/doc/flectar-mail/google-sans-flex/README.md"
+cp "$project_dir/resources/AppRun" "$app_dir/AppRun"
+chmod +x "$app_dir/AppRun" "$app_dir/usr/bin/flectar-mail"
+
+linuxdeploy="${LINUXDEPLOY:-$tools_dir/linuxdeploy-$machine.AppImage}"
+download_tool \
+  "https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-$machine.AppImage" \
+  "$linuxdeploy"
+appimagetool="${APPIMAGETOOL:-$tools_dir/appimagetool-$machine.AppImage}"
+download_tool \
+  "https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-$machine.AppImage" \
+  "$appimagetool"
+
+# Winit opens libxkbcommon-x11 with dlopen(), so linuxdeploy cannot discover
+# it from the executable. Hosts without it (Ubuntu without Qt, minimal X11
+# sessions such as the AppImageHub test runner) panic before the first window.
+# It is not on the AppImage excludelist; bundle it with its xkbcommon/xcb-xkb
+# dependencies, like the deb and rpm packages declare it.
+xkbcommon_x11_dir="$(pkg-config --variable=libdir xkbcommon-x11)"
+xkbcommon_x11="$xkbcommon_x11_dir/libxkbcommon-x11.so.0"
+if [[ ! -f "$xkbcommon_x11" ]]; then
+  printf 'libxkbcommon-x11.so.0 was not found; install libxkbcommon-x11-dev.\n' >&2
+  exit 1
+fi
+
+# Deploy ordinary ELF dependencies. Winit uses the host Wayland/X11 client
+# libraries through its normal backend discovery rather than a toolkit plugin.
+VERSION="$app_version" APPIMAGE_EXTRACT_AND_RUN="${APPIMAGE_EXTRACT_AND_RUN:-1}" \
+  "$linuxdeploy" \
+  --appdir "$app_dir" \
+  --executable "$app_dir/usr/bin/flectar-mail" \
+  --library "$xkbcommon_x11"
+for library in libxkbcommon-x11.so.0 libxkbcommon.so.0; do
+  if [[ ! -e "$app_dir/usr/lib/$library" ]]; then
+    printf 'linuxdeploy did not bundle %s.\n' "$library" >&2
+    exit 1
+  fi
+done
+
+# AppRun leaves LD_LIBRARY_PATH to the host, so the executable and bundled
+# libraries must find usr/lib through the RUNPATH linuxdeploy sets.
+require_runpath() {
+  local dynamic
+  dynamic="$(readelf -d "$1")"
+  if [[ "$dynamic" != *"Library runpath: [$2]"* ]]; then
+    printf '%s does not have RUNPATH %s.\n' "$1" "$2" >&2
+    exit 1
+  fi
+}
+require_runpath "$app_dir/usr/bin/flectar-mail" '$ORIGIN/../lib'
+for library in "$app_dir"/usr/lib/*.so*; do
+  require_runpath "$library" '$ORIGIN'
+done
+
+# Preserve the renderer default and stable process name from our launcher.
+cp "$project_dir/resources/AppRun" "$app_dir/AppRun"
+chmod +x "$app_dir/AppRun"
+
+# The pinned PDFium runtime depends only on the ordinary glibc runtime. Keep
+# its private path intact and verify it after deployment has adjusted the ELF files.
+python3 "$project_dir/scripts/test-pdf-preview.py" "$app_dir/usr/bin/flectar-mail"
+# Deployment rewrites ELF files; they must still load on 16 and 64 KiB pages.
+python3 "$project_dir/scripts/linux-elf.py" verify "$app_dir"
+
+# AppDir specifies a PNG .DirIcon for file-manager thumbnails. linuxdeploy
+# prefers the scalable icon for the root entry, so restore the PNG thumbnail
+# explicitly while retaining the SVG and themed icon copies for integration.
+cp "$project_dir/resources/app-icon/flectar-mail-masked-512.png" "$app_dir/flectar-mail.png"
+ln -sfn flectar-mail.png "$app_dir/.DirIcon"
+
+mkdir -p "$(dirname "$output_path")"
+rm -f "$staged_output"
+VERSION="$app_version" APPIMAGE_EXTRACT_AND_RUN="${APPIMAGE_EXTRACT_AND_RUN:-1}" \
+  "$appimagetool" "$app_dir" "$staged_output"
+# The AppImage starts with appimagetool's runtime, which is an ELF executable.
+python3 "$project_dir/scripts/linux-elf.py" verify "$staged_output"
+# Renaming over an executing AppImage is atomic on Linux; the running process
+# keeps its old inode while new launches receive the freshly packaged build.
+mv -f "$staged_output" "$output_path"
+
+printf 'Built %s\n' "$output_path"

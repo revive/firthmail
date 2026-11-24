@@ -1,0 +1,27 @@
+// What the system allows of new-mail notifications, for Settings.
+// src/notifications/ui.rs fills this in.
+
+export global SystemNotifications {
+    // "" where the app shows no notifications on this platform, which hides
+    // their settings. "allowed"; "not-asked" until the system asks the user
+    // (macOS); "denied" when they are turned off in the system settings;
+    // "refused" when the system won't take them from this copy of the app
+    // (macOS); "unavailable" when the system has no notification service to
+    // show them.
+    in property <string> availability;
+    // The system's settings for the app's notifications can be opened.
+    in property <bool> settings-openable;
+    // The desktop decides whether notifications play a sound.
+    in property <bool> sound-fixed;
+    // The system shows a count of unread mail on the app icon.
+    in property <bool> badge-supported;
+    // How the system checks for new mail while the app is in the background,
+    // where it decides when: "on"; "off" when the app may not run in the
+    // background (Background App Refresh off on iOS, a background restriction
+    // on Android); "low-power" while Low Power Mode or Battery Saver pauses
+    // it. "" where the app follows the accounts itself.
+    in property <string> background-checks;
+    callback open-settings();
+    // The app's page in the system settings, where Background App Refresh is.
+    callback open-app-settings();
+}

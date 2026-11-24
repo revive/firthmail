@@ -1,0 +1,27 @@
+[package]
+name = "flectar-mail-sync-client"
+description = "Client of Flectar Mail Sync: sessions, membership, pairing and record sync"
+license = "Apache-2.0"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.92"
+repository = "https://github.com/flectar/mail-sync-client"
+
+# Inlined from the repository's workspace.dependencies: this crate is
+# consumed as a path dependency from another workspace.
+
+[dependencies]
+flectar-mail-sync-crypto = { path = "../flectar-mail-sync-crypto", version = "0.1.0", features = ["kem"] }
+flectar-mail-sync-proto = { path = "../flectar-mail-sync-proto", version = "0.1.0" }
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "stream"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["sync", "time"] }
+tracing = "0.1"
+url = "2"
+zeroize = { version = "1.9", features = ["derive"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net"] }

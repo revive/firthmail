@@ -1,0 +1,527 @@
+use super::*;
+use crate::accounts::credentials::DevelopmentFileCredentialStore;
+use crate::models::{
+    ActionKind, ActionTarget, ConnectionSecurity, MailConnectionSettings, PerformActionArgs,
+};
+use crate::{Core, config::Paths, db::testutil};
+use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex};
+use tokio::{
+    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+    net::TcpListener,
+};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Stored {
+    uid: u32,
+    message_id: String,
+    flags: Vec<String>,
+}
+
+fn stored(uid: u32, message_id: &str, flags: &[&str]) -> Stored {
+    Stored {
+        uid,
+        message_id: message_id.into(),
+        flags: flags.iter().map(|flag| flag.to_string()).collect(),
+    }
+}
+
+/// Mailboxes by name: the next UID and the messages.
+type Mailboxes = BTreeMap<String, (u32, Vec<Stored>)>;
+
+/// A server that moves and flags messages. Its SEARCH matches loosely, as
+/// word-based server searches do, and returns every message.
+struct Server {
+    port: u16,
+    mailboxes: Arc<Mutex<Mailboxes>>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Server {
+    async fn start(mailboxes: Mailboxes) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let mailboxes = Arc::new(Mutex::new(mailboxes));
+        let state = mailboxes.clone();
+        let task = tokio::spawn(async move {
+            loop {
+                let (tcp, _) = listener.accept().await.unwrap();
+                let mut stream = BufReader::new(tcp);
+                stream.write_all(b"* OK ready\r\n").await.unwrap();
+                let mut selected = String::new();
+                loop {
+                    let mut line = String::new();
+                    if stream.read_line(&mut line).await.unwrap() == 0 {
+                        break;
+                    }
+                    let (tag, command) = line.trim_end().split_once(' ').unwrap();
+                    let response = respond(&mut state.lock().unwrap(), &mut selected, command);
+                    stream
+                        .write_all(format!("{response}{tag} OK done\r\n").as_bytes())
+                        .await
+                        .unwrap();
+                }
+            }
+        });
+        Self {
+            port,
+            mailboxes,
+            task,
+        }
+    }
+
+    async fn connect(&self) -> Session {
+        imap::connect_with_settings(
+            "127.0.0.1",
+            self.port,
+            imap::ImapCredentials::Password {
+                user: "me".into(),
+                password: "password".into(),
+            },
+            &MailConnectionSettings::new(ConnectionSecurity::None, ConnectionSecurity::None),
+        )
+        .await
+        .unwrap()
+    }
+
+    fn mailbox(&self, name: &str) -> Vec<Stored> {
+        self.mailboxes.lock().unwrap()[name].1.clone()
+    }
+}
+
+impl Drop for Server {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+/// The untagged part of the reply to one command.
+fn respond(mailboxes: &mut Mailboxes, selected: &mut String, command: &str) -> String {
+    if command.starts_with("LOGIN ") {
+        String::new()
+    } else if command == "CAPABILITY" {
+        "* CAPABILITY IMAP4rev1 MOVE UIDPLUS\r\n".into()
+    } else if let Some(name) = command.strip_prefix("SELECT ") {
+        *selected = name.trim_matches('"').into();
+        let (next, messages) = &mailboxes[selected.as_str()];
+        format!(
+            "* {} EXISTS\r\n* OK [UIDVALIDITY 7] valid\r\n* OK [UIDNEXT {next}] next\r\n",
+            messages.len()
+        )
+    } else if command.starts_with("UID SEARCH HEADER Message-ID ") {
+        let uids = mailboxes[selected.as_str()]
+            .1
+            .iter()
+            .map(|message| format!(" {}", message.uid))
+            .collect::<String>();
+        format!("* SEARCH{uids}\r\n")
+    } else if let Some(rest) = command.strip_prefix("UID FETCH ") {
+        let (set, _) = rest.split_once(' ').unwrap();
+        let messages = &mailboxes[selected.as_str()].1;
+        let mut out = String::new();
+        for (index, message) in messages.iter().enumerate() {
+            if set.split(',').any(|uid| uid == message.uid.to_string()) {
+                let header = format!(
+                    "Message-ID: <{}>\r\nSubject: Plans\r\n\r\n",
+                    message.message_id
+                );
+                out += &format!(
+                    "* {} FETCH (UID {} FLAGS ({}) BODY[HEADER.FIELDS (MESSAGE-ID SUBJECT)] {{{}}}\r\n{header})\r\n",
+                    index + 1,
+                    message.uid,
+                    message.flags.join(" "),
+                    header.len()
+                );
+            }
+        }
+        out
+    } else if let Some(rest) = command.strip_prefix("UID MOVE ") {
+        let (uid, target) = rest.split_once(' ').unwrap();
+        let source = &mut mailboxes.get_mut(selected.as_str()).unwrap().1;
+        let position = source
+            .iter()
+            .position(|message| message.uid.to_string() == uid)
+            .unwrap();
+        let mut message = source.remove(position);
+        let (next, messages) = mailboxes.get_mut(target.trim_matches('"')).unwrap();
+        message.uid = *next;
+        *next += 1;
+        messages.push(message);
+        String::new()
+    } else if let Some(rest) = command.strip_prefix("UID STORE ") {
+        let (uid, change) = rest.split_once(' ').unwrap();
+        let flag = change
+            .strip_prefix("+FLAGS.SILENT (")
+            .and_then(|flag| flag.strip_suffix(')'))
+            .unwrap();
+        let messages = &mut mailboxes.get_mut(selected.as_str()).unwrap().1;
+        let message = messages
+            .iter_mut()
+            .find(|message| message.uid.to_string() == uid)
+            .unwrap();
+        message.flags.push(flag.into());
+        String::new()
+    } else {
+        panic!("unexpected command: {command}");
+    }
+}
+
+#[tokio::test]
+async fn undo_and_star_find_a_moved_message_before_its_mailbox_syncs() {
+    let temp = tempfile::tempdir().unwrap();
+    let credentials = Arc::new(DevelopmentFileCredentialStore::new(
+        temp.path().join("credentials.json"),
+    ));
+    let core = Core::start_mail_ui_with_credentials(Paths::for_tests(temp.path()), credentials)
+        .await
+        .unwrap();
+    let (config, thread_id, message_id) = core
+        .db
+        .write(|conn| {
+            testutil::seed_account(conn);
+            conn.execute_batch(
+                "UPDATE folders SET uidvalidity = 7;
+                 INSERT INTO folders (id, account_id, path, role, uidvalidity)
+                   VALUES (2, 1, 'Archive', 'archive', 7);",
+            )?;
+            let (thread_id, message_id) =
+                testutil::seed_message(conn, "alice@test.dev", "Plans", false);
+            conn.execute(
+                "UPDATE messages SET uid = 5, message_id = 'plans@test.dev' WHERE id = ?1",
+                [message_id],
+            )?;
+            Ok((
+                repo::accounts::get_config(conn, 1)?.unwrap(),
+                thread_id,
+                message_id,
+            ))
+        })
+        .await
+        .unwrap();
+    let server = Server::start(BTreeMap::from([
+        ("INBOX".into(), (6, vec![stored(5, "plans@test.dev", &[])])),
+        (
+            "Archive".into(),
+            (
+                10,
+                vec![
+                    stored(3, "notes@test.dev", &[]),
+                    stored(4, "plans@test.dev", &["\\Deleted"]),
+                ],
+            ),
+        ),
+    ]))
+    .await;
+    let mut session = server.connect().await;
+    let ctx = core.sync_ctx();
+    let perform = |kind| {
+        core.perform_action(PerformActionArgs {
+            kind,
+            target: ActionTarget::Threads(vec![thread_id]),
+            params: None,
+        })
+    };
+    let states = || {
+        core.db.read(|conn| {
+            let mut statement =
+                conn.prepare("SELECT kind, state FROM pending_actions ORDER BY id")?;
+            let rows = statement.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+            Ok(rows.collect::<rusqlite::Result<Vec<(String, String)>>>()?)
+        })
+    };
+
+    perform(ActionKind::Archive).await.unwrap();
+    execute_due(&ctx, &config, &mut session).await.unwrap();
+    assert_eq!(
+        server.mailbox("Archive").last(),
+        Some(&stored(10, "plans@test.dev", &[]))
+    );
+
+    // The archive already ran, so the server's copy has a UID this device
+    // has not seen yet.
+    assert!(core.undo_last().await.unwrap());
+    execute_due(&ctx, &config, &mut session).await.unwrap();
+    assert_eq!(server.mailbox("INBOX"), [stored(6, "plans@test.dev", &[])]);
+    assert_eq!(
+        server.mailbox("Archive"),
+        [
+            stored(3, "notes@test.dev", &[]),
+            stored(4, "plans@test.dev", &["\\Deleted"]),
+        ]
+    );
+
+    perform(ActionKind::Star).await.unwrap();
+    execute_due(&ctx, &config, &mut session).await.unwrap();
+    assert_eq!(
+        server.mailbox("INBOX"),
+        [stored(6, "plans@test.dev", &["\\Flagged"])]
+    );
+    assert_eq!(
+        states().await.unwrap(),
+        [
+            ("archive".into(), "done".into()),
+            ("move".into(), "done".into()),
+            ("star".into(), "done".into()),
+        ]
+    );
+    let row = core
+        .db
+        .read(move |conn| repo::messages::get_row(conn, message_id))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.folder_id, Some(1));
+}
+
+/// A notice's Undo takes back just its gesture: an archive still waiting
+/// never reaches the server, one the server has goes back, and the star
+/// given before it stays.
+#[tokio::test]
+async fn undoing_a_gesture_takes_back_only_its_own_actions() {
+    let temp = tempfile::tempdir().unwrap();
+    let credentials = Arc::new(DevelopmentFileCredentialStore::new(
+        temp.path().join("credentials.json"),
+    ));
+    let core = Core::start_mail_ui_with_credentials(Paths::for_tests(temp.path()), credentials)
+        .await
+        .unwrap();
+    let (config, thread_id, message_id) = core
+        .db
+        .write(|conn| {
+            testutil::seed_account(conn);
+            conn.execute_batch(
+                "UPDATE folders SET uidvalidity = 7;
+                 INSERT INTO folders (id, account_id, path, role, uidvalidity)
+                   VALUES (2, 1, 'Archive', 'archive', 7);",
+            )?;
+            let (thread_id, message_id) =
+                testutil::seed_message(conn, "alice@test.dev", "Plans", false);
+            conn.execute(
+                "UPDATE messages SET uid = 5, message_id = 'plans@test.dev' WHERE id = ?1",
+                [message_id],
+            )?;
+            Ok((
+                repo::accounts::get_config(conn, 1)?.unwrap(),
+                thread_id,
+                message_id,
+            ))
+        })
+        .await
+        .unwrap();
+    let server = Server::start(BTreeMap::from([
+        ("INBOX".into(), (6, vec![stored(5, "plans@test.dev", &[])])),
+        ("Archive".into(), (10, Vec::new())),
+    ]))
+    .await;
+    let mut session = server.connect().await;
+    let ctx = core.sync_ctx();
+    let perform = |kind| {
+        core.perform_action(PerformActionArgs {
+            kind,
+            target: ActionTarget::Threads(vec![thread_id]),
+            params: None,
+        })
+    };
+    let folder = || {
+        core.db
+            .read(move |conn| repo::messages::get_row(conn, message_id))
+    };
+
+    // Taken back before it ran: nothing reaches the server.
+    let archived = perform(ActionKind::Archive).await.unwrap().action_ids;
+    assert!(core.undo_actions(archived.clone()).await.unwrap());
+    execute_due(&ctx, &config, &mut session).await.unwrap();
+    assert_eq!(server.mailbox("INBOX"), [stored(5, "plans@test.dev", &[])]);
+    assert_eq!(folder().await.unwrap().unwrap().folder_id, Some(1));
+    // Taken back once, there is nothing left to take back.
+    assert!(!core.undo_actions(archived).await.unwrap());
+
+    // Starred, then archived on the server: undoing the archive brings the
+    // message back, still starred.
+    perform(ActionKind::Star).await.unwrap();
+    execute_due(&ctx, &config, &mut session).await.unwrap();
+    let archived = perform(ActionKind::Archive).await.unwrap().action_ids;
+    execute_due(&ctx, &config, &mut session).await.unwrap();
+    assert!(server.mailbox("INBOX").is_empty());
+    assert!(core.undo_actions(archived).await.unwrap());
+    execute_due(&ctx, &config, &mut session).await.unwrap();
+    assert_eq!(
+        server.mailbox("INBOX"),
+        [stored(6, "plans@test.dev", &["\\Flagged"])]
+    );
+    assert!(
+        server
+            .mailbox("Archive")
+            .iter()
+            .all(|message| message.flags.contains(&"\\Deleted".to_string()))
+    );
+    assert_eq!(folder().await.unwrap().unwrap().folder_id, Some(1));
+}
+
+/// A star given just before an archive, with both still waiting, reaches the
+/// message where the server still has it: the archive's local move must not
+/// send the star to the Archive mailbox, where the message isn't yet.
+#[tokio::test]
+async fn a_star_waiting_before_an_archive_reaches_the_message() {
+    let temp = tempfile::tempdir().unwrap();
+    let credentials = Arc::new(DevelopmentFileCredentialStore::new(
+        temp.path().join("credentials.json"),
+    ));
+    let core = Core::start_mail_ui_with_credentials(Paths::for_tests(temp.path()), credentials)
+        .await
+        .unwrap();
+    let (config, thread_id) = core
+        .db
+        .write(|conn| {
+            testutil::seed_account(conn);
+            conn.execute_batch(
+                "UPDATE folders SET uidvalidity = 7;
+                 INSERT INTO folders (id, account_id, path, role, uidvalidity)
+                   VALUES (2, 1, 'Archive', 'archive', 7);",
+            )?;
+            let (thread_id, message_id) =
+                testutil::seed_message(conn, "alice@test.dev", "Plans", false);
+            conn.execute(
+                "UPDATE messages SET uid = 5, message_id = 'plans@test.dev' WHERE id = ?1",
+                [message_id],
+            )?;
+            Ok((repo::accounts::get_config(conn, 1)?.unwrap(), thread_id))
+        })
+        .await
+        .unwrap();
+    let server = Server::start(BTreeMap::from([
+        ("INBOX".into(), (6, vec![stored(5, "plans@test.dev", &[])])),
+        ("Archive".into(), (10, Vec::new())),
+    ]))
+    .await;
+    let mut session = server.connect().await;
+    let ctx = core.sync_ctx();
+    let perform = |kind| {
+        core.perform_action(PerformActionArgs {
+            kind,
+            target: ActionTarget::Threads(vec![thread_id]),
+            params: None,
+        })
+    };
+
+    perform(ActionKind::Star).await.unwrap();
+    perform(ActionKind::Archive).await.unwrap();
+    execute_due(&ctx, &config, &mut session).await.unwrap();
+    assert!(server.mailbox("INBOX").is_empty());
+    assert_eq!(
+        server.mailbox("Archive"),
+        [stored(10, "plans@test.dev", &["\\Flagged"])]
+    );
+}
+
+#[tokio::test]
+async fn blocking_a_sender_moves_their_inbox_mail_to_spam_until_undone() {
+    let temp = tempfile::tempdir().unwrap();
+    let credentials = Arc::new(DevelopmentFileCredentialStore::new(
+        temp.path().join("credentials.json"),
+    ));
+    let core = Core::start_mail_ui_with_credentials(Paths::for_tests(temp.path()), credentials)
+        .await
+        .unwrap();
+    let (config, sale, friend) = core
+        .db
+        .write(|conn| {
+            testutil::seed_account(conn);
+            conn.execute_batch(
+                "UPDATE folders SET uidvalidity = 7;
+                 INSERT INTO folders (id, account_id, path, role, uidvalidity)
+                   VALUES (2, 1, 'Junk', 'spam', 7);",
+            )?;
+            let seed = |from: &str, uid: i64, message_id: &str| {
+                let (_, id) = testutil::seed_message(conn, from, "Hello", false);
+                conn.execute(
+                    "UPDATE messages SET uid = ?2, message_id = ?3 WHERE id = ?1",
+                    rusqlite::params![id, uid, message_id],
+                )
+                .map(|_| id)
+            };
+            let sale = seed("Deals@Shop.test", 5, "sale@shop.test")?;
+            let friend = seed("friend@test.dev", 6, "hi@test.dev")?;
+            Ok((repo::accounts::get_config(conn, 1)?.unwrap(), sale, friend))
+        })
+        .await
+        .unwrap();
+    let server = Server::start(BTreeMap::from([
+        (
+            "INBOX".into(),
+            (
+                8,
+                vec![
+                    stored(5, "sale@shop.test", &[]),
+                    stored(6, "hi@test.dev", &[]),
+                    stored(7, "again@shop.test", &[]),
+                ],
+            ),
+        ),
+        ("Junk".into(), (1, Vec::new())),
+    ]))
+    .await;
+    let mut session = server.connect().await;
+    let ctx = core.sync_ctx();
+    let folder = |id| {
+        core.db
+            .read(move |conn| Ok(repo::messages::get_row(conn, id)?.unwrap().folder_id))
+    };
+
+    let offer = core.block_offer(" Deals@Shop.test").await.unwrap().unwrap();
+    assert_eq!(offer.address, "deals@shop.test");
+    assert_eq!(offer.inbox_count, 1);
+    assert!(core.block_offer("Deals").await.unwrap().is_none());
+    let blocked = core.block_sender("Deals@Shop.test").await.unwrap();
+    assert_eq!(blocked.address, "deals@shop.test");
+    assert_eq!(blocked.moved, 1);
+    execute_due(&ctx, &config, &mut session).await.unwrap();
+    assert_eq!(folder(sale).await.unwrap(), Some(2));
+    assert_eq!(folder(friend).await.unwrap(), Some(1));
+    assert_eq!(
+        server
+            .mailbox("INBOX")
+            .into_iter()
+            .map(|stored| stored.message_id)
+            .collect::<Vec<_>>(),
+        ["hi@test.dev", "again@shop.test"]
+    );
+    assert_eq!(server.mailbox("Junk").len(), 1);
+
+    // Their next message, as sync stores it, follows the first.
+    let again = core
+        .db
+        .write(|conn| {
+            let (_, again) = testutil::seed_message(conn, "deals@shop.test", "Again", false);
+            conn.execute(
+                "UPDATE messages SET uid = 7, message_id = 'again@shop.test' WHERE id = ?1",
+                [again],
+            )?;
+            let tx = conn.transaction()?;
+            assert!(crate::turn_away(&tx, again)?);
+            tx.commit()?;
+            Ok(again)
+        })
+        .await
+        .unwrap();
+    execute_due(&ctx, &config, &mut session).await.unwrap();
+    assert_eq!(folder(again).await.unwrap(), Some(2));
+    assert_eq!(server.mailbox("INBOX"), [stored(6, "hi@test.dev", &[])]);
+    assert_eq!(server.mailbox("Junk").len(), 2);
+
+    // Undo takes back the block's own move, and the block.
+    assert!(core.undo_actions(blocked.action_ids).await.unwrap());
+    core.unblock_sender("Deals@Shop.test").await.unwrap();
+    execute_due(&ctx, &config, &mut session).await.unwrap();
+    assert_eq!(folder(sale).await.unwrap(), Some(1));
+    assert_eq!(folder(again).await.unwrap(), Some(2));
+    assert!(core.blocked_senders().await.unwrap().is_empty());
+    assert_eq!(
+        server
+            .mailbox("INBOX")
+            .into_iter()
+            .map(|stored| stored.message_id)
+            .collect::<Vec<_>>(),
+        ["hi@test.dev", "sale@shop.test"]
+    );
+}

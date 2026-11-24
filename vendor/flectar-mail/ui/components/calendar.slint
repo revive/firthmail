@@ -1,0 +1,1276 @@
+import { SidebarRowSurface, SidebarStyle } from "sidebar-row.slint";
+import { CalendarBar, CalendarDay, CalendarEventRow, CalendarSourceRow, CalendarTimedBlock, CalendarWeekDay } from "../models.slint";
+import { Button } from "button.slint";
+import { IconButton, ToolbarIconButton } from "controls.slint";
+import { CalendarDetailsDialog } from "../dialogs/calendar-details-dialog.slint";
+import { ConfirmationDialog } from "confirmation-dialog.slint";
+import { HorizontalBox, ListView, ScrollView, VerticalBox } from "std-widgets.slint";
+import { TypeScale } from "../typography.slint";
+import { LayoutMetrics } from "../design-system.slint";
+import { CollapsibleWorkspaceSidebar, CompactPageHeader, WorkspaceMiniHeading } from "workspace-layout.slint";
+import { CalendarAgenda, CalendarAgendaFilter } from "calendar-agenda.slint";
+import { CalendarAgendaRow, CalendarAgendaFilterRow } from "../models.slint";
+import { ScrollFade } from "scroll-fade.slint";
+import { WindowControlsClearance } from "../window-chrome.slint";
+import { TabSwitcherButton } from "tab-overview.slint";
+import { TabsUi } from "tabs-ui.slint";
+
+// "+N more" under a day's lanes of bars. It lists all the day's events.
+component DayMoreButton inherits Rectangle {
+    in property <int> count;
+    in property <string> date-label;
+    in property <color> text-color;
+    in property <color> hover-color;
+    callback clicked;
+    border-radius: 4px;
+    background: more-hit.has-hover ? root.hover-color : transparent;
+    Text {
+        x: 6px;
+        width: parent.width - 10px;
+        height: parent.height;
+        text: @tr("+{n} more" | "+{n} more" % root.count);
+        color: root.text-color;
+        font-size: TypeScale.caption;
+        font-weight: 600;
+        overflow: elide;
+        vertical-alignment: center;
+    }
+    more-hit := TouchArea {
+        accessible-role: button;
+        accessible-label: @tr("Show all events on {}", root.date-label);
+        accessible-action-default => { root.clicked(); }
+        clicked => { root.clicked(); }
+        mouse-cursor: pointer;
+    }
+}
+
+export component CalendarEvent inherits Rectangle {
+    in property <string> title;
+    in property <string> detail;
+    in property <color> fill-color;
+    in property <color> event-border-color;
+    in property <color> title-color;
+    in property <color> detail-color;
+    in property <bool> compact: false;
+    // An invitation still waiting for the user's answer: outlined.
+    in property <bool> pending: false;
+    // Declined or cancelled: faded, its title struck through.
+    in property <bool> faded: false;
+    // How the event stands, for screen readers.
+    in property <string> state;
+    // Shown before the title, such as where a timed event starts.
+    in property <string> time-label;
+    // An event that goes on past a row or day draws past the clipped edge
+    // there, so its rounded end is hidden. These move its text back in.
+    in property <length> inset-left: 0px;
+    in property <length> inset-top: 0px;
+    callback clicked;
+
+    border-radius: 7px;
+    border-width: root.pending ? 1.5px : 1px;
+    border-color: root.event-border-color;
+    background: event-hit.has-hover ? root.fill-color.brighter(8%) : root.fill-color;
+    opacity: root.faded ? 0.55 : 1;
+    clip: true;
+
+    Rectangle {
+        x: 0px;
+        width: 3px;
+        height: parent.height;
+        background: root.event-border-color;
+    }
+    event-title := Text {
+        x: 9px + root.inset-left;
+        y: (root.compact ? 3px : 7px) + root.inset-top;
+        width: parent.width - 15px - root.inset-left;
+        height: root.compact ? parent.height - 6px - root.inset-top : max(18px, self.preferred-height);
+        text: root.time-label == "" ? root.title : root.time-label + "  " + root.title;
+        color: root.title-color;
+        font-size: root.compact ? TypeScale.caption : TypeScale.secondary;
+        font-weight: 700;
+        overflow: elide;
+        vertical-alignment: center;
+    }
+    if root.faded : Rectangle {
+        x: event-title.x;
+        y: event-title.y + event-title.height / 2;
+        width: min(event-title.width, event-title.preferred-width);
+        height: 1px;
+        background: root.title-color;
+    }
+    Text {
+        // A short event shows its title alone when the time doesn't fit.
+        visible: !root.compact && self.y + self.height <= root.height - 2px;
+        x: event-title.x;
+        y: event-title.y + event-title.height + 2px;
+        width: event-title.width;
+        height: max(15px, self.preferred-height);
+        text: root.detail;
+        color: root.detail-color;
+        font-size: TypeScale.caption;
+        overflow: elide;
+    }
+    event-hit := TouchArea {
+        accessible-role: button;
+        accessible-label: @tr("View details for {}", root.title);
+        accessible-description: root.state;
+        accessible-action-default => { root.clicked(); }
+        clicked => { root.clicked(); }
+        mouse-cursor: pointer;
+    }
+}
+
+// Data-driven calendar surface. Dates and event placement come from Rust's
+// chrono-backed local state; the UI is intentionally service-agnostic.
+export component FunctionalCalendarSidebar inherits CollapsibleWorkspaceSidebar {
+    in property <bool> active: true;
+    private property <length> source-scroll-y: 0px;
+    in property <[CalendarDay]> days: [];
+    in property <[CalendarSourceRow]> sources: [];
+    in property <string> month-title;
+    in property <color> title-color;
+    in property <color> body-color;
+    in property <color> secondary-color;
+    in property <color> muted-color;
+    in property <color> subtle-border-color;
+    in property <color> control-color;
+    in property <color> control-hover-color;
+    in property <color> accent-color;
+    in property <color> accent-background;
+    callback navigate-month(int);
+    callback select-date(string);
+    callback new-event;
+    callback source-clicked(CalendarSourceRow);
+    callback source-toggled(int, bool);
+
+    pure function calendar-color(index: int) -> color {
+        return index == 0 ? #3478f6
+            : index == 1 ? #8b5cf6
+            : index == 2 ? #e87924
+            : #26a269;
+    }
+
+    divider-color: root.subtle-border-color;
+
+    if root.active && !root.collapsed: Rectangle {
+        x: 0px;
+        y: 0px;
+        width: parent.width;
+        height: parent.height;
+        Button {
+            x: LayoutMetrics.sidebar-inset;
+            y: LayoutMetrics.sidebar-action-top;
+            width: max(0px, parent.width - 2 * LayoutMetrics.sidebar-inset);
+            height: LayoutMetrics.sidebar-action-height;
+            text: @tr("New event");
+            icon: @image-url("../icons/lucide/filled/calendar-add.svg");
+            has-icon: true;
+            primary: true;
+            clicked => { root.new-event(); }
+        }
+
+        Text {
+            x: LayoutMetrics.sidebar-inset;
+            y: 60px;
+            width: parent.width - 84px;
+            height: 30px;
+            text: root.month-title;
+            color: root.title-color;
+            font-size: TypeScale.body-large;
+            font-weight: 700;
+            overflow: elide;
+            vertical-alignment: center;
+        }
+
+        IconButton {
+            x: parent.width - 72px;
+            y: 69px;
+            width: 28px;
+            height: 28px;
+            icon-size: 14px;
+            icon: @image-url("../icons/lucide/outline/chevron-left.svg");
+            icon-color: root.secondary-color;
+            idle-background: transparent;
+            hover-background: root.control-hover-color;
+            tooltip-text: @tr("Previous month");
+            clicked => { root.navigate-month(-1); }
+        }
+
+        IconButton {
+            x: parent.width - 42px;
+            y: 69px;
+            width: 28px;
+            height: 28px;
+            icon-size: 14px;
+            icon: @image-url("../icons/lucide/outline/chevron-right.svg");
+            icon-color: root.secondary-color;
+            idle-background: transparent;
+            hover-background: root.control-hover-color;
+            tooltip-text: @tr("Next month");
+            clicked => { root.navigate-month(1); }
+        }
+
+        for name[index] in [
+            @tr("Monday initial" => "M"),
+            @tr("Tuesday initial" => "T"),
+            @tr("Wednesday initial" => "W"),
+            @tr("Thursday initial" => "T"),
+            @tr("Friday initial" => "F"),
+            @tr("Saturday initial" => "S"),
+            @tr("Sunday initial" => "S")
+        ]: Text {
+            x: LayoutMetrics.sidebar-inset + index * ((root.width - 2 * LayoutMetrics.sidebar-inset) / 7);
+            y: 94px;
+            width: (root.width - 2 * LayoutMetrics.sidebar-inset) / 7;
+            height: max(18px, self.preferred-height);
+            text: name;
+            color: root.muted-color;
+            font-size: TypeScale.caption;
+            font-weight: 700;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+        }
+        for day[index] in root.days: Rectangle {
+            x: LayoutMetrics.sidebar-inset + mod(index, 7) * ((root.width - 2 * LayoutMetrics.sidebar-inset) / 7);
+            y: 114px + floor(index / 7) * 28px;
+            width: (root.width - 2 * LayoutMetrics.sidebar-inset) / 7;
+            height: 26px;
+            background: transparent;
+            Rectangle {
+                x: (parent.width - 26px) / 2;
+                width: 26px;
+                height: 26px;
+                border-radius: 13px;
+                background: day.is-selected ? root.accent-color : mini-day-hit.has-hover ? root.accent-background : transparent;
+                Text {
+                    text: day.day;
+                    color: day.is-selected ? white : day.outside-month ? root.muted-color : root.body-color;
+                    font-size: TypeScale.caption;
+                    font-weight: day.is-today || day.is-selected ? 700 : 500;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+
+                Rectangle {
+                    visible: day.has-events && !day.is-selected;
+                    x: (parent.width - 3px) / 2;
+                    y: parent.height - 4px;
+                    width: 3px;
+                    height: 3px;
+                    border-radius: 2px;
+                    background: root.accent-color;
+                }
+
+                mini-day-hit := TouchArea {
+                    accessible-role: button;
+                    accessible-label: @tr("Select {}", day.date-label);
+                    accessible-checked: day.is-selected;
+                    accessible-action-default => { root.select-date(day.iso-date); }
+                    clicked => { root.select-date(day.iso-date); }
+                    mouse-cursor: pointer;
+                }
+            }
+        }
+        Rectangle {
+            x: LayoutMetrics.sidebar-inset;
+            y: 292px;
+            width: parent.width - 2 * LayoutMetrics.sidebar-inset;
+            height: 1px;
+            background: root.subtle-border-color;
+        }
+
+        WorkspaceMiniHeading {
+            x: LayoutMetrics.sidebar-inset;
+            y: 308px;
+            width: parent.width - 2 * LayoutMetrics.sidebar-inset;
+            label: @tr("MY CALENDARS");
+            label-color: root.muted-color;
+        }
+
+        source-scroll := ListView {
+            // Keep a direct ListView repeater; Slint does not
+            // virtualize through a wrapper or inherited ListView.
+            content-width: self.visible-width;
+            horizontal-scrollbar-policy: always-off;
+            x: 0px;
+            y: 330px;
+            width: parent.width - LayoutMetrics.divider-width;
+            height: max(0px, parent.height - self.y);
+            content-y <=> root.source-scroll-y;
+            for calendar in root.sources: Rectangle {
+                width: max(0px, source-scroll.visible-width - LayoutMetrics.sidebar-scrollbar-gutter);
+                private property <length> row-y: calendar.group-start ? 26px : 0px;
+                height: row-y + 34px;
+                if calendar.group-start: Text {
+                    x: 12px;
+                    y: 3px;
+                    width: parent.width - 24px;
+                    height: 18px;
+                    text: calendar.email != "" ? calendar.email : calendar.account-name;
+                    color: root.muted-color;
+                    font-size: TypeScale.micro;
+                    font-weight: 600;
+                    overflow: elide;
+                    vertical-alignment: center;
+                }
+                row-background := SidebarRowSurface {
+                    x: 4px;
+                    y: parent.row-y;
+                    width: parent.width - 8px;
+                    height: 32px;
+                    hover-background: root.control-hover-color;
+                    hovered: calendar-hit.has-hover;
+                    calendar-hit := TouchArea {
+                        accessible-role: button;
+                        accessible-label: @tr("View details for {}", calendar.name != "" ? calendar.name : @tr("Calendar"));
+                        accessible-action-default => { root.source-clicked(calendar); }
+                        clicked => { root.source-clicked(calendar); }
+                        mouse-cursor: pointer;
+                    }
+
+                    Text {
+                        x: 34px;
+                        width: parent.width - 62px;
+                        height: parent.height;
+                        text: calendar.name != "" ? calendar.name : @tr("Calendar");
+                        color: root.body-color;
+                        opacity: calendar.enabled ? 1 : 0.55;
+                        font-size: SidebarStyle.label-size;
+                        font-weight: calendar.is-default ? SidebarStyle.selected-weight : SidebarStyle.normal-weight;
+                        overflow: elide;
+                        vertical-alignment: center;
+                    }
+
+                    Text {
+                        visible: calendar-hit.has-hover;
+                        x: parent.width - 25px;
+                        width: 17px;
+                        height: parent.height;
+                        text: "⋯";
+                        color: root.muted-color;
+                        font-size: TypeScale.secondary;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+
+                    Rectangle {
+                        x: 10px;
+                        y: 9px;
+                        width: 14px;
+                        height: 14px;
+                        border-radius: 4px;
+                        border-width: calendar.enabled ? 0px : 2px;
+                        border-color: root.calendar-color(calendar.color-index);
+                        background: calendar.enabled ? root.calendar-color(calendar.color-index) : transparent;
+                    }
+
+                    toggle-hit := TouchArea {
+                        x: 2px;
+                        width: 30px;
+                        height: parent.height;
+                        accessible-role: checkbox;
+                        accessible-label: calendar.enabled
+                            ? @tr("Hide {}", calendar.name != "" ? calendar.name : @tr("Calendar"))
+                            : @tr("Show {}", calendar.name != "" ? calendar.name : @tr("Calendar"));
+                        accessible-checked: calendar.enabled;
+                        accessible-action-default => { root.source-toggled(calendar.id, !calendar.enabled); }
+                        clicked => { root.source-toggled(calendar.id, !calendar.enabled); }
+                        mouse-cursor: pointer;
+                    }
+                }
+            }
+        }
+
+        ScrollFade {
+            x: source-scroll.x;
+            y: source-scroll.y;
+            width: source-scroll.visible-width;
+            height: source-scroll.visible-height;
+            surface-color: root.surface-color;
+            content-y: source-scroll.content-y;
+            content-height: source-scroll.content-height;
+            visible-height: source-scroll.visible-height;
+        }
+
+        Rectangle {
+            x: 0px;
+            y: 330px;
+            width: parent.width;
+            visible: root.sources.length == 0;
+            height: root.sources.length == 0 ? 88px : 0px;
+            Text {
+                x: 14px;
+                width: parent.width - 28px;
+                height: parent.height;
+                text: @tr("No calendars yet. Connect Google Calendar, Outlook or any CalDAV server in Settings.");
+                color: root.muted-color;
+                font-size: TypeScale.secondary;
+                wrap: word-wrap;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
+        }
+    }
+}
+
+export component FunctionalCalendarView inherits Rectangle {
+    private property <bool> toolbar-roomy: true;
+    in property <bool> active: true;
+    in property <bool> compact: false;
+    in-out property <bool> sidebar-collapsed: false;
+    in property <bool> dark-mode: false;
+    in property <[CalendarDay]> month-days: [];
+    in property <[CalendarWeekDay]> week-days: [];
+    // The month grid's bars, and how many lanes each of its six weeks fills.
+    in property <[CalendarBar]> month-bars: [];
+    in property <[int]> month-row-lanes: [];
+    // The week view: bars in its all-day strip and boxes in its hours.
+    in property <[CalendarBar]> week-bars: [];
+    in property <int> week-lanes: 0;
+    in property <[CalendarTimedBlock]> timed-blocks: [];
+    // Every event on the selected date, for the phone's list under its month.
+    in property <[CalendarEventRow]> selected-day-events: [];
+    in property <[CalendarAgendaRow]> agenda-rows: [];
+    in property <[CalendarAgendaFilterRow]> agenda-filters: [];
+    in property <int> agenda-filter-count: 0;
+    in property <int> agenda-event-count: 0;
+    in property <float> agenda-anchor: 0;
+    in property <int> agenda-scroll-request: 0;
+    in property <string> timezone;
+    in property <[CalendarSourceRow]> sources: [];
+    in property <string> month-title;
+    in property <string> period-title;
+    in property <string> week-label;
+    in property <string> selected-date;
+    in property <string> selected-date-label;
+    in property <bool> selected-date-has-events: false;
+    // The week view's ruler labels for each hour of the day.
+    in property <[string]> hour-labels: ["00:00", "01:00", "02:00", "03:00", "04:00", "05:00", "06:00", "07:00", "08:00", "09:00", "10:00", "11:00", "12:00", "13:00", "14:00", "15:00", "16:00", "17:00", "18:00", "19:00", "20:00", "21:00", "22:00", "23:00"];
+    in property <string> view-mode: "week";
+    in property <color> background-color;
+    in property <color> sidebar-color;
+    in property <color> surface-color;
+    in property <color> ui-border-color;
+    in property <color> subtle-border-color;
+    in property <color> title-color;
+    in property <color> body-color;
+    in property <color> secondary-color;
+    in property <color> muted-color;
+    in property <color> control-color;
+    in property <color> control-hover-color;
+    in property <color> accent-color;
+    in property <color> accent-background;
+    callback navigate(string, int);
+    callback select-date(string);
+    callback set-view(string);
+    callback today;
+    callback new-event;
+    callback open-link(string);
+    callback set-source-enabled(int, bool);
+    callback toggle-agenda-filter(int, bool);
+    callback clear-agenda-filters;
+    callback edit-event(int);
+    callback delete-event(int);
+    // Answer the invitation with this id: "accepted", "tentative" or
+    // "declined", and for one occurrence its RECURRENCE-ID (else empty).
+    callback answer-event(int, string, string);
+    // Open an event's details when asked from elsewhere, such as the card
+    // above an invitation in mail.
+    in property <CalendarEventRow> reveal-event;
+    in property <int> reveal-request: 0;
+    changed reveal-request => { root.show-event(root.reveal-event); }
+
+    private property <bool> detail-open: false;
+    private property <string> detail-kind: "event";
+    private property <string> detail-title: "";
+    private property <string> detail-subtitle: "";
+    private property <string> detail-provider: "local";
+    private property <string> detail-date-time: "";
+    private property <string> detail-calendar: "";
+    private property <string> detail-account: "";
+    private property <string> detail-location: "";
+    private property <string> detail-organizer: "";
+    private property <string> detail-access: "";
+    private property <string> detail-sync: "";
+    private property <string> detail-status: "";
+    private property <string> detail-rsvp: "";
+    private property <string> detail-recurrence: "";
+    private property <string> detail-attendees: "";
+    private property <string> detail-description: "";
+    private property <string> detail-join-url: "";
+    private property <int> detail-event-id: 0;
+    private property <bool> detail-event-editable: false;
+    private property <bool> detail-answerable: false;
+    private property <bool> detail-removable: false;
+    private property <string> detail-my-answer: "";
+    private property <bool> detail-repeats: false;
+    private property <string> detail-recurrence-id: "";
+    private property <bool> delete-confirmation-open: false;
+    // The list a "+N more" opens, over its day.
+    private property <string> day-list-title;
+    private property <[CalendarEventRow]> day-list-events;
+    private property <length> day-list-x;
+    private property <length> day-list-y;
+    private property <length> day-list-width: min(320px, root.width - 16px);
+    private property <length> day-list-height: min(root.height - 16px, 58px + root.day-list-events.length * 56px);
+
+    // List every event of a day, in a card over the day's cell at x, y.
+    function show-day(title: string, events: [CalendarEventRow], x: length, y: length) {
+        root.day-list-title = title;
+        root.day-list-events = events;
+        root.day-list-x = max(8px, min(x, root.width - root.day-list-width - 8px));
+        root.day-list-y = max(8px, min(y, root.height - root.day-list-height - 8px));
+        day-list.show();
+    }
+
+    function show-source(source: CalendarSourceRow) {
+        root.detail-kind = "calendar";
+        root.detail-title = source.name != "" ? source.name : @tr("Calendar");
+        root.detail-subtitle = source.account-name != "" ? source.account-name : source.email;
+        root.detail-provider = source.provider;
+        root.detail-date-time = "";
+        root.detail-calendar = "";
+        root.detail-account = source.account-name == "" || source.account-name == source.email
+            ? source.email : source.account-name + " · " + source.email;
+        root.detail-location = "";
+        root.detail-organizer = "";
+        root.detail-access = source.read-only ? @tr("Read only") : @tr("Read and write");
+        root.detail-sync = source.last-synced != "" ? @tr("Last synced {}", source.last-synced) : @tr("Not synced yet");
+        root.detail-status = (source.enabled ? @tr("Enabled") : @tr("Paused"))
+            + (source.is-default ? " · " + @tr("Default calendar") : "")
+            + (source.color != "" ? " · " + source.color : "");
+        root.detail-rsvp = "";
+        root.detail-recurrence = "";
+        root.detail-attendees = "";
+        root.detail-description = "";
+        root.detail-join-url = "";
+        root.detail-event-id = 0;
+        root.detail-event-editable = false;
+        root.detail-answerable = false;
+        root.detail-removable = false;
+        root.detail-my-answer = "";
+        root.detail-repeats = false;
+        root.detail-recurrence-id = "";
+        root.detail-open = true;
+    }
+
+    function show-event(event: CalendarEventRow) {
+        root.detail-kind = "event";
+        root.detail-title = event.title;
+        root.detail-subtitle = event.source == "local" ? @tr("Created in Flectar Mail") : @tr("Synced provider event");
+        root.detail-provider = event.provider;
+        root.detail-date-time = event.date-label + " · " + event.detail;
+        root.detail-calendar = event.calendar != "" ? event.calendar : @tr("Default calendar");
+        root.detail-account = event.account;
+        root.detail-location = event.location;
+        root.detail-organizer = event.organizer;
+        root.detail-access = "";
+        root.detail-sync = "";
+        root.detail-status = root.status-label(event.status);
+        root.detail-rsvp = root.answer-label(event.rsvp-status);
+        root.detail-recurrence = event.recurrence;
+        root.detail-attendees = event.attendees;
+        root.detail-description = event.description;
+        root.detail-join-url = event.join-url;
+        root.detail-event-id = event.id;
+        root.detail-event-editable = event.editable;
+        root.detail-answerable = event.answerable;
+        root.detail-removable = event.removable;
+        root.detail-my-answer = event.rsvp-status;
+        root.detail-repeats = event.recurrence != "" && event.recurrence-id != "";
+        root.detail-recurrence-id = event.recurrence-id;
+        root.detail-open = true;
+    }
+
+    // An invitation still waiting for the user's answer.
+    pure function pending(event: CalendarEventRow) -> bool {
+        return event.answerable && event.rsvp-status == "";
+    }
+
+    // Declined, or cancelled by its organizer.
+    pure function faded(event: CalendarEventRow) -> bool {
+        return event.rsvp-status == "DECLINED" || event.status == "CANCELLED" || event.status == "cancelled";
+    }
+
+    // How the event stands, as screen readers say it.
+    pure function state(event: CalendarEventRow) -> string {
+        return event.status == "CANCELLED" || event.status == "cancelled" ? @tr("Cancelled")
+            : event.rsvp-status == "DECLINED" ? @tr("Declined")
+            : root.pending(event) ? @tr("Not answered yet") : "";
+    }
+
+    pure function answer-label(answer: string) -> string {
+        return answer == "ACCEPTED" ? @tr("Accepted")
+            : answer == "TENTATIVE" ? @tr("Maybe")
+            : answer == "DECLINED" ? @tr("Declined") : answer;
+    }
+
+    // An event's STATUS (RFC 5545), which servers write in either case.
+    pure function status-label(status: string) -> string {
+        return status == "CONFIRMED" || status == "confirmed" ? @tr("Confirmed")
+            : status == "TENTATIVE" || status == "tentative" ? @tr("Tentative")
+            : status == "CANCELLED" || status == "cancelled" ? @tr("Cancelled") : status;
+    }
+
+    private property <length> main-x: root.compact ? 0px : calendar-sidebar.current-width;
+    private property <length> main-width: max(0px, root.width - root.main-x);
+    // The time gutter fits its widest label in the platform font and language.
+    private property <length> time-gutter: max(58px, max(local-label-width.preferred-width, max(all-day-label-width.preferred-width, hour-label-width.preferred-width + 6px)) + 14px);
+    private property <length> column-width: max(1px, (root.main-width - root.time-gutter) / 7);
+    // All-day events show one caption line that grows with the platform font.
+    private property <length> all-day-height: max(30px, all-day-line.preferred-height + 12px);
+    private property <length> grid-top: 112px + root.all-day-height;
+    // Ten hours fill the window, as with one lane of all-day events; the
+    // rest of the day scrolls.
+    private property <length> hour-height: max(36px, (root.height - root.grid-top) / 10);
+    // The all-day strip stacks up to three lanes. A busier week shows two
+    // and "+N more" on the days with others.
+    private property <length> strip-bar-height: root.all-day-height - 6px;
+    private property <length> strip-pitch: root.strip-bar-height + 3px;
+    private property <int> strip-lanes: root.week-lanes <= 3 ? root.week-lanes : 2;
+    private property <length> strip-height: 3px + max(1, min(root.week-lanes, 3)) * root.strip-pitch;
+    // Month cells stack bars under the day number, as many as fit. A week
+    // with more keeps the last lane for "+N more".
+    private property <length> month-cell-height: (root.height - LayoutMetrics.desktop-mail-toolbar-height - 34px) / 6;
+    private property <length> month-bar-height: max(20px, month-line.preferred-height + 4px);
+    private property <length> month-pitch: root.month-bar-height + 2px;
+    private property <int> month-lane-room: max(1, floor((root.month-cell-height - 36px) / root.month-pitch));
+    // How far an event's cut end runs past the clipped edge of its grid.
+    private property <length> overhang: 8px;
+    background: root.background-color;
+
+    local-label-width := Text { visible: false; text: @tr("LOCAL"); font-size: TypeScale.caption; }
+    all-day-label-width := Text { visible: false; text: @tr("ALL DAY"); font-size: TypeScale.caption; }
+    all-day-line := Text { visible: false; text: "Ag"; font-size: TypeScale.caption; font-weight: 700; }
+    month-line := Text { visible: false; text: "Ag"; font-size: TypeScale.caption; font-weight: 600; }
+    // One of the widest hour labels, such as "22:00" or "10 PM".
+    hour-label-width := Text { visible: false; text: root.hour-labels[22]; font-size: TypeScale.caption; }
+
+    // Lanes a month week shows: all of them when they fit.
+    pure function month-lanes(row: int) -> int {
+        return root.month-row-lanes[row] <= root.month-lane-room ? root.month-lane-room : root.month-lane-room - 1;
+    }
+
+    pure function event-fill(event: CalendarEventRow) -> color {
+        return root.pending(event) ? root.surface-color
+            : event.color-index == 0 ? (root.dark-mode ? #1b2e46 : #e9f3ff)
+            : event.color-index == 1 ? (root.dark-mode ? #31234b : #f2eaff)
+            : event.color-index == 2 ? (root.dark-mode ? #352518 : #fff1df)
+            : (root.dark-mode ? #173528 : #e7f8ef);
+    }
+
+    pure function event-color(event: CalendarEventRow) -> color {
+        return event.color-index == 0 ? #3478f6 : event.color-index == 1 ? #8b5cf6 : event.color-index == 2 ? #e87924 : #26a269;
+    }
+
+    calendar-sidebar := FunctionalCalendarSidebar {
+        active: root.active && !root.compact;
+        visible: !root.compact;
+        x: 0px;
+        y: 0px;
+        height: parent.height;
+        collapsed <=> root.sidebar-collapsed;
+        days: root.month-days;
+        sources: root.sources;
+        month-title: root.month-title;
+        surface-color: root.sidebar-color;
+        title-color: root.title-color;
+        body-color: root.body-color;
+        secondary-color: root.secondary-color;
+        muted-color: root.muted-color;
+        subtle-border-color: root.subtle-border-color;
+        control-color: root.control-color;
+        control-hover-color: root.control-hover-color;
+        accent-color: root.accent-color;
+        accent-background: root.accent-background;
+        navigate-month(direction) => { root.navigate("month", direction); }
+        select-date(date) => { root.select-date(date); }
+        new-event => { root.new-event(); }
+        source-clicked(source) => { root.show-source(source); }
+        source-toggled(calendar-id, enabled) => { root.set-source-enabled(calendar-id, enabled); }
+    }
+    Rectangle {
+        visible: !root.compact;
+        x: root.main-x;
+        y: 0px;
+        width: root.main-width;
+        height: parent.height;
+        background: root.surface-color;
+
+        Rectangle {
+            x: 0px;
+            y: 0px;
+            width: parent.width;
+            height: LayoutMetrics.desktop-mail-toolbar-height;
+            background: root.surface-color;
+            z: 20;
+            // Integrated window controls can cover the trailing corner; the
+            // period title and week number give way before the view buttons.
+            private property <bool> roomy-now: self.width
+                - max(LayoutMetrics.content-inset, toolbar-clearance.leading)
+                - max(LayoutMetrics.content-inset, toolbar-clearance.trailing) >= 640px;
+            changed roomy-now => { root.toolbar-roomy = self.roomy-now; }
+            init => { root.toolbar-roomy = self.roomy-now; }
+            toolbar-clearance := WindowControlsClearance { width: parent.width; height: parent.height; }
+            HorizontalBox {
+                padding-left: max(LayoutMetrics.content-inset, toolbar-clearance.leading);
+                padding-right: max(LayoutMetrics.content-inset, toolbar-clearance.trailing);
+                spacing: 6px;
+                cross-axis-alignment: center;
+
+                ToolbarIconButton {
+                    icon: @image-url("../icons/lucide/outline/sidebar-collapse.svg");
+                    icon-color: root.secondary-color;
+                    hover-background: root.control-hover-color;
+                    active-background: root.accent-background;
+                    tooltip-text: root.sidebar-collapsed ? @tr("Show calendars") : @tr("Hide calendars");
+                    accessible-id: "calendar-sidebar-button";
+                    clicked => { root.sidebar-collapsed = !root.sidebar-collapsed; }
+                }
+                Text { horizontal-stretch: 1; min-width: root.toolbar-roomy ? 120px : 0px; text: root.period-title; color: root.title-color; font-size: TypeScale.heading-small; font-weight: 600; vertical-alignment: center; overflow: elide; }
+                Text { visible: root.view-mode == "week" && root.toolbar-roomy; width: self.visible ? max(42px, self.preferred-width) : 0px; text: root.week-label; color: root.muted-color; font-size: TypeScale.caption; font-weight: 700; vertical-alignment: center; }
+                ToolbarIconButton {
+                    visible: root.sidebar-collapsed;
+                    width: root.sidebar-collapsed ? LayoutMetrics.desktop-icon-button-size : 0px;
+                    icon: @image-url("../icons/lucide/filled/calendar-add.svg");
+                    primary: true;
+                    tooltip-text: @tr("New event");
+                    accessible-id: "calendar-new-event-desktop";
+                    clicked => { root.new-event(); }
+                }
+                ToolbarIconButton { icon: @image-url("../icons/lucide/outline/chevron-left.svg"); icon-color: root.secondary-color; hover-background: root.control-hover-color; tooltip-text: @tr("Previous period"); clicked => { root.navigate("period", -1); } }
+                ToolbarIconButton { icon: @image-url("../icons/lucide/outline/chevron-right.svg"); icon-color: root.secondary-color; hover-background: root.control-hover-color; tooltip-text: @tr("Next period"); clicked => { root.navigate("period", 1); } }
+                Button { width: max(66px, self.content-width); height: LayoutMetrics.sidebar-action-height; text: @tr("Week"); selected: root.view-mode == "week"; clicked => { root.set-view("week"); } }
+                Button { width: max(72px, self.content-width); height: LayoutMetrics.sidebar-action-height; text: @tr("Month"); selected: root.view-mode == "month"; clicked => { root.set-view("month"); } }
+                Button { width: max(78px, self.content-width); height: LayoutMetrics.sidebar-action-height; text: @tr("Agenda"); selected: root.view-mode == "agenda"; clicked => { root.set-view("agenda"); } }
+                Button { width: max(72px, self.content-width); height: LayoutMetrics.sidebar-action-height; text: @tr("Today"); clicked => { root.today(); } }
+            }
+        }
+        Rectangle { x: 0px; y: LayoutMetrics.desktop-mail-toolbar-height - LayoutMetrics.divider-width; height: LayoutMetrics.divider-width; width: parent.width; background: root.ui-border-color; z: 21; }
+
+        if root.view-mode == "agenda": HorizontalBox {
+            y: LayoutMetrics.desktop-mail-toolbar-height;
+            width: parent.width;
+            height: 44px;
+            padding-left: LayoutMetrics.content-inset;
+            padding-right: LayoutMetrics.content-inset;
+            spacing: 10px;
+            cross-axis-alignment: center;
+            Text { text: @tr("Local time · {}", root.timezone); color: root.muted-color; font-size: TypeScale.caption; overflow: elide; horizontal-stretch: 1; }
+            Text { text: @tr("{n} event" | "{n} events" % root.agenda-event-count); color: root.secondary-color; font-size: TypeScale.caption; }
+            CalendarAgendaFilter {
+                filters: root.agenda-filters;
+                filter-count: root.agenda-filter-count;
+                toggled(id, checked) => { root.toggle-agenda-filter(id, checked); }
+                cleared => { root.clear-agenda-filters(); }
+            }
+        }
+
+        if root.view-mode == "week" : Rectangle {
+            x: 0px;
+            y: LayoutMetrics.desktop-mail-toolbar-height;
+            width: parent.width;
+            height: parent.height - LayoutMetrics.desktop-mail-toolbar-height;
+            background: root.surface-color;
+
+            Rectangle {
+                x: 0px;
+                y: 0px;
+                height: 48px;
+                width: parent.width;
+                Text { x: 12px; width: root.time-gutter - 14px; height: parent.height; text: @tr("LOCAL"); color: root.muted-color; font-size: TypeScale.caption; vertical-alignment: center; }
+                for day[index] in root.week-days : Rectangle {
+                    x: root.time-gutter + index * root.column-width;
+                    width: root.column-width;
+                    height: parent.height;
+                    background: day.is-today ? root.accent-background : transparent;
+                    Text { text: day.weekday + "\n" + day.day; color: day.is-today ? root.accent-color : root.secondary-color; font-size: TypeScale.caption; font-weight: day.is-today ? 700 : 600; horizontal-alignment: center; vertical-alignment: center; }
+                    TouchArea { accessible-role: button; accessible-label: @tr("Select {}", day.date-label); accessible-action-default => { root.select-date(day.iso-date); } clicked => { root.select-date(day.iso-date); } mouse-cursor: pointer; }
+                }
+            }
+            Rectangle { y: 47px; width: parent.width; height: 1px; background: root.ui-border-color; }
+            Rectangle {
+                x: 0px;
+                y: 48px;
+                width: parent.width;
+                height: root.strip-height;
+                Text { x: 12px; y: 0px; width: root.time-gutter - 14px; height: root.all-day-height; text: @tr("ALL DAY"); color: root.muted-color; font-size: TypeScale.caption; vertical-alignment: center; }
+                // Bars that go on into another week run past these edges.
+                Rectangle {
+                    x: root.time-gutter;
+                    width: 7 * root.column-width;
+                    height: parent.height;
+                    clip: true;
+                    for bar in root.week-bars : CalendarEvent {
+                        visible: bar.lane < root.strip-lanes;
+                        x: bar.column * root.column-width + (bar.continues-before ? -root.overhang : 4px);
+                        width: (bar.column + bar.span) * root.column-width + (bar.continues-after ? root.overhang : -4px) - self.x;
+                        y: 3px + bar.lane * root.strip-pitch;
+                        height: root.strip-bar-height;
+                        title: bar.event.title;
+                        detail: bar.event.detail;
+                        time-label: bar.time-label;
+                        compact: true;
+                        inset-left: bar.continues-before ? root.overhang + 4px : 0px;
+                        pending: root.pending(bar.event);
+                        faded: root.faded(bar.event);
+                        state: root.state(bar.event);
+                        fill-color: root.event-fill(bar.event);
+                        event-border-color: root.event-color(bar.event);
+                        title-color: root.title-color;
+                        detail-color: root.secondary-color;
+                        clicked => { root.show-event(bar.event); }
+                    }
+                    for day[index] in root.week-days : DayMoreButton {
+                        count: day.more-from[root.strip-lanes];
+                        visible: self.count > 0;
+                        x: index * root.column-width + 4px;
+                        y: 3px + root.strip-lanes * root.strip-pitch;
+                        width: root.column-width - 8px;
+                        height: root.strip-bar-height;
+                        date-label: day.date-label;
+                        text-color: root.secondary-color;
+                        hover-color: root.control-hover-color;
+                        clicked => {
+                            root.show-day(day.date-label, day.events,
+                                root.main-x + root.time-gutter + index * root.column-width,
+                                LayoutMetrics.desktop-mail-toolbar-height + 48px);
+                        }
+                    }
+                }
+            }
+            Rectangle { y: 47px + root.strip-height; width: parent.width; height: 1px; background: root.ui-border-color; }
+            hour-scroll := ScrollView {
+                x: 0px;
+                y: 48px + root.strip-height;
+                width: parent.width;
+                height: parent.height - self.y;
+                content-width: self.visible-width;
+                content-height: 24 * root.hour-height;
+                horizontal-scrollbar-policy: always-off;
+                // Open on the morning, with the 08:00 label in full.
+                init => { self.content-y = -8 * root.hour-height + 12px; }
+                for hour[index] in root.hour-labels : Rectangle {
+                    y: index * root.hour-height;
+                    width: parent.width;
+                    height: 1px;
+                    background: root.subtle-border-color;
+                    // The day starts at the top edge, so midnight has no label.
+                    // The others center on their line.
+                    Text { visible: index > 0; x: 10px; y: -self.height / 2; width: root.time-gutter - 20px; height: max(16px, self.preferred-height); text: hour; color: root.muted-color; font-size: TypeScale.caption; horizontal-alignment: right; vertical-alignment: center; }
+                }
+                for marker in [0, 1, 2, 3, 4, 5, 6, 7] : Rectangle { x: root.time-gutter + marker * root.column-width; width: 1px; height: 24 * root.hour-height; background: root.subtle-border-color; }
+                for block in root.timed-blocks : CalendarEvent {
+                    private property <length> lane-width: (root.column-width - 10px) / block.lanes;
+                    // The box keeps a readable size, as the layout placed it.
+                    private property <int> drawn-end: max(block.end-minutes, min(block.start-minutes + 30, 1440));
+                    x: root.time-gutter + block.column * root.column-width + 5px + block.lane * self.lane-width;
+                    width: block.lane-span * self.lane-width - (block.lane + block.lane-span < block.lanes ? 2px : 0px);
+                    y: block.start-minutes / 60 * root.hour-height - (block.continues-before ? root.overhang : 0px);
+                    height: (self.drawn-end - block.start-minutes) / 60 * root.hour-height
+                        + (block.continues-before ? root.overhang : 0px)
+                        + (block.continues-after ? root.overhang : 0px);
+                    title: block.event.title;
+                    detail: block.event.detail;
+                    compact: self.height < 40px;
+                    inset-top: block.continues-before ? root.overhang : 0px;
+                    pending: root.pending(block.event);
+                    faded: root.faded(block.event);
+                    state: root.state(block.event);
+                    fill-color: root.event-fill(block.event);
+                    event-border-color: root.event-color(block.event);
+                    title-color: root.title-color;
+                    detail-color: root.secondary-color;
+                    clicked => { root.show-event(block.event); }
+                }
+            }
+        }
+
+        if root.view-mode == "month" : Rectangle {
+            x: 0px;
+            y: LayoutMetrics.desktop-mail-toolbar-height;
+            width: parent.width;
+            height: parent.height - LayoutMetrics.desktop-mail-toolbar-height;
+            background: root.surface-color;
+            // Bars that go on into another week run past the grid's sides.
+            clip: true;
+            for name[index] in [@tr("Mon"), @tr("Tue"), @tr("Wed"), @tr("Thu"), @tr("Fri"), @tr("Sat"), @tr("Sun")] : Text {
+                x: index * parent.width / 7;
+                y: 0px;
+                width: parent.width / 7;
+                height: 34px;
+                text: name;
+                color: root.muted-color;
+                font-size: TypeScale.caption;
+                font-weight: 700;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
+            for day[index] in root.month-days : Rectangle {
+                x: mod(index, 7) * parent.width / 7;
+                y: 34px + floor(index / 7) * root.month-cell-height;
+                width: parent.width / 7;
+                height: root.month-cell-height;
+                border-width: 1px;
+                border-color: root.subtle-border-color;
+                background: day.is-selected ? root.accent-background : root.surface-color;
+                Text { x: 9px; y: 6px; width: 28px; height: 24px; text: day.day; color: day.is-today ? root.accent-color : day.outside-month ? root.muted-color : root.body-color; font-size: TypeScale.secondary; font-weight: day.is-today ? 700 : 500; }
+                Rectangle { visible: day.is-today; x: 7px; y: 5px; width: 25px; height: 25px; border-radius: 13px; border-width: 1px; border-color: root.accent-color; background: transparent; }
+                TouchArea { accessible-role: button; accessible-label: @tr("Select {}", day.date-label); accessible-checked: day.is-selected; accessible-action-default => { root.select-date(day.iso-date); } clicked => { root.select-date(day.iso-date); } mouse-cursor: pointer; }
+            }
+            for bar in root.month-bars : Rectangle {
+                visible: bar.lane < root.month-lanes(bar.row);
+                x: bar.column * parent.width / 7 + (bar.continues-before ? -root.overhang : 4px);
+                width: (bar.column + bar.span) * parent.width / 7 + (bar.continues-after ? root.overhang : -4px) - self.x;
+                y: 34px + bar.row * root.month-cell-height + 34px + bar.lane * root.month-pitch;
+                height: root.month-bar-height;
+                border-radius: 4px;
+                border-width: root.pending(bar.event) ? 1px : 0px;
+                border-color: root.event-color(bar.event);
+                opacity: root.faded(bar.event) ? 0.55 : 1;
+                background: bar-hit.has-hover ? root.event-fill(bar.event).brighter(8%) : root.event-fill(bar.event);
+                chip-title := Text {
+                    x: 6px + (bar.continues-before ? root.overhang + 4px : 0px);
+                    width: parent.width - self.x - 4px - (bar.continues-after ? root.overhang : 0px);
+                    height: parent.height;
+                    text: bar.time-label == "" ? bar.event.title : bar.time-label + "  " + bar.event.title;
+                    color: root.body-color;
+                    font-size: TypeScale.caption;
+                    font-weight: 600;
+                    overflow: elide;
+                    vertical-alignment: center;
+                }
+                if root.faded(bar.event) : Rectangle { x: chip-title.x; y: parent.height / 2; width: min(chip-title.width, chip-title.preferred-width); height: 1px; background: root.body-color; }
+                bar-hit := TouchArea {
+                    accessible-role: button;
+                    accessible-label: @tr("View details for {}", bar.event.title);
+                    accessible-description: root.state(bar.event) != "" ? root.state(bar.event) + " · " + bar.event.detail : bar.event.detail;
+                    accessible-action-default => { root.show-event(bar.event); }
+                    clicked => { root.show-event(bar.event); }
+                    mouse-cursor: pointer;
+                }
+            }
+            for day[index] in root.month-days : DayMoreButton {
+                count: day.more-from[root.month-lanes(floor(index / 7))];
+                visible: self.count > 0;
+                x: mod(index, 7) * parent.width / 7 + 4px;
+                y: 34px + floor(index / 7) * root.month-cell-height + 34px + root.month-lanes(floor(index / 7)) * root.month-pitch;
+                width: parent.width / 7 - 8px;
+                height: root.month-bar-height;
+                date-label: day.date-label;
+                text-color: root.secondary-color;
+                hover-color: root.control-hover-color;
+                clicked => {
+                    root.show-day(day.date-label, day.events,
+                        root.main-x + mod(index, 7) * root.main-width / 7 - 40px,
+                        LayoutMetrics.desktop-mail-toolbar-height + 34px + floor(index / 7) * root.month-cell-height);
+                }
+            }
+        }
+    }
+
+    // Phone calendar: a tappable month strip above an agenda. A seven-column
+    // time grid is not legible at phone width, while this preserves every date
+    // and event action without horizontal scrolling.
+    Rectangle {
+        visible: root.compact;
+        x: 0px;
+        y: 0px;
+        width: parent.width;
+        height: parent.height;
+        background: root.surface-color;
+
+        CompactPageHeader {
+            x: 0px;
+            y: 0px;
+            width: parent.width;
+            title: root.month-title;
+            // Line the month up with the view switcher below. Narrow phones
+            // also fit the tab switcher by setting the month a size smaller.
+            leading-inset: 16px;
+            title-font-size: TabsUi.enabled && root.width < 390px ? TypeScale.heading : TypeScale.title-small;
+            background-color: root.surface-color;
+            IconButton { width: LayoutMetrics.touch-target; height: LayoutMetrics.touch-target; icon: @image-url("../icons/lucide/outline/chevron-left.svg"); icon-color: root.secondary-color; idle-background: root.control-color; hover-background: root.control-hover-color; tooltip-text: @tr("Previous month"); accessible-id: "calendar-previous-month"; clicked => { root.navigate(root.view-mode == "agenda" ? "period" : "month", -1); } }
+            IconButton { width: LayoutMetrics.touch-target; height: LayoutMetrics.touch-target; icon: @image-url("../icons/lucide/outline/chevron-right.svg"); icon-color: root.secondary-color; idle-background: root.control-color; hover-background: root.control-hover-color; tooltip-text: @tr("Next month"); accessible-id: "calendar-next-month"; clicked => { root.navigate(root.view-mode == "agenda" ? "period" : "month", 1); } }
+            IconButton { width: LayoutMetrics.touch-target; height: LayoutMetrics.touch-target; icon: @image-url("../icons/lucide/filled/calendar-add.svg"); primary: true; tooltip-text: @tr("New event"); accessible-id: "calendar-new-event"; clicked => { root.new-event(); } }
+            if TabsUi.enabled && TabsUi.compact : TabSwitcherButton {}
+        }
+
+        HorizontalBox {
+            x: 16px;
+            y: 64px;
+            width: parent.width - 32px;
+            height: LayoutMetrics.touch-target;
+            padding: 0px;
+            spacing: 8px;
+            cross-axis-alignment: center;
+            Button { text: @tr("Month"); height: LayoutMetrics.touch-target; selected: root.view-mode != "agenda"; clicked => { root.set-view("month"); } }
+            Button { text: @tr("Agenda"); height: LayoutMetrics.touch-target; selected: root.view-mode == "agenda"; clicked => { root.set-view("agenda"); } }
+            Rectangle { horizontal-stretch: 1; }
+            Button { text: @tr("Today"); height: LayoutMetrics.touch-target; clicked => { root.today(); } }
+        }
+        if root.view-mode == "agenda": HorizontalBox {
+            x: 16px;
+            y: 112px;
+            width: parent.width - 32px;
+            height: 48px;
+            padding: 0px;
+            spacing: 8px;
+            cross-axis-alignment: center;
+            Text { text: @tr("Local time · {}", root.timezone); color: root.muted-color; font-size: TypeScale.caption; overflow: elide; horizontal-stretch: 1; }
+            CalendarAgendaFilter {
+                compact: true;
+                filters: root.agenda-filters;
+                filter-count: root.agenda-filter-count;
+                toggled(id, checked) => { root.toggle-agenda-filter(id, checked); }
+                cleared => { root.clear-agenda-filters(); }
+            }
+        }
+        if root.view-mode != "agenda": Rectangle {
+            y: 116px;
+            width: parent.width;
+            height: max(0px, parent.height - 116px);
+        Rectangle {
+            x: 8px;
+            y: 0px;
+            width: parent.width - 16px;
+            height: 264px;
+            for name[index] in [@tr("Monday initial" => "M"), @tr("Tuesday initial" => "T"), @tr("Wednesday initial" => "W"), @tr("Thursday initial" => "T"), @tr("Friday initial" => "F"), @tr("Saturday initial" => "S"), @tr("Sunday initial" => "S")] : Text {
+                x: index * parent.width / 7;
+                y: 0px;
+                width: parent.width / 7;
+                height: 24px;
+                text: name;
+                color: root.muted-color;
+                font-size: TypeScale.caption;
+                font-weight: 700;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
+            for day[index] in root.month-days : Rectangle {
+                x: mod(index, 7) * parent.width / 7;
+                y: 24px + floor(index / 7) * 40px;
+                width: parent.width / 7;
+                height: 40px;
+                background: transparent;
+                Rectangle {
+                    x: (parent.width - 36px) / 2;
+                    y: 2px;
+                    width: 36px;
+                    height: 36px;
+                    border-radius: 18px;
+                    background: day.is-selected ? root.accent-color : day-hit.has-hover ? root.accent-background : transparent;
+                    Text { text: day.day; color: day.is-selected ? white : day.outside-month ? root.muted-color : day.is-today ? root.accent-color : root.body-color; font-size: TypeScale.body; font-weight: day.is-selected || day.is-today ? 700 : 500; horizontal-alignment: center; vertical-alignment: center; }
+                    Rectangle { visible: day.has-events && !day.is-selected; x: 16px; y: 31px; width: 4px; height: 4px; border-radius: 2px; background: root.accent-color; }
+                    day-hit := TouchArea {
+                        mouse-cursor: pointer;
+                        accessible-role: button;
+                        accessible-label: @tr("Select {}", day.date-label);
+                        accessible-checked: day.is-selected;
+                        accessible-action-default => { root.select-date(day.iso-date); }
+                        accessible-id: "calendar-day-" + day.iso-date;
+                        clicked => { root.select-date(day.iso-date); }
+                    }
+                }
+            }
+        }
+
+        Rectangle { x: 14px; y: 270px; width: parent.width - 28px; height: 1px; background: root.subtle-border-color; }
+        Text { x: 16px; y: 278px; width: parent.width - 32px; height: 28px; text: @tr("Agenda · {}", root.selected-date-label); color: root.secondary-color; font-size: TypeScale.secondary; font-weight: 700; vertical-alignment: center; }
+
+        agenda-scroll := ScrollView {
+            x: 8px;
+            y: 306px;
+            width: parent.width - 16px;
+            height: max(0px, parent.height - 314px);
+            content-width: self.visible-width;
+            horizontal-scrollbar-policy: always-off;
+            mouse-drag-pan-enabled: true;
+            VerticalBox {
+                width: agenda-scroll.visible-width;
+                padding-right: 4px;
+                spacing: 7px;
+                for event in root.selected-day-events : Rectangle {
+                    height: agenda-detail.y + agenda-detail.height + 10px;
+                    border-radius: 9px;
+                    border-width: root.pending(event) ? 1.5px : 1px;
+                    border-color: root.event-color(event);
+                    opacity: root.faded(event) ? 0.55 : 1;
+                    background: root.event-fill(event);
+                    Rectangle { x: 0px; width: 4px; height: parent.height; border-radius: 2px; background: parent.border-color; }
+                    agenda-title := Text { x: 14px; y: 8px; width: parent.width - 28px; height: max(24px, self.preferred-height); text: event.title; color: root.title-color; font-size: TypeScale.body-large; font-weight: 700; overflow: elide; vertical-alignment: center; }
+                    if root.faded(event) : Rectangle { x: agenda-title.x; y: agenda-title.y + agenda-title.height / 2; width: min(agenda-title.width, agenda-title.preferred-width); height: 1px; background: root.title-color; }
+                    agenda-detail := Text { x: 14px; y: agenda-title.y + agenda-title.height + 2px; width: parent.width - 28px; height: max(20px, self.preferred-height); text: root.state(event) != "" ? root.state(event) + " · " + event.detail : event.detail; color: root.secondary-color; font-size: TypeScale.secondary; overflow: elide; vertical-alignment: center; }
+                    TouchArea {
+                        accessible-role: button;
+                        accessible-label: @tr("View details for {}", event.title);
+                        accessible-description: root.state(event);
+                        accessible-action-default => { root.show-event(event); }
+                        clicked => { root.show-event(event); }
+                        mouse-cursor: pointer;
+                    }
+                }
+                Rectangle {
+                    visible: !root.selected-date-has-events;
+                    height: 110px;
+                    Text { x: 20px; width: parent.width - 40px; height: parent.height; text: @tr("No events for this date"); color: root.muted-color; font-size: TypeScale.body; horizontal-alignment: center; vertical-alignment: center; }
+                }
+            }
+        }
+        }
+    }
+
+    if root.view-mode == "agenda": CalendarAgenda {
+        x: root.main-x;
+        y: root.compact ? 160px : LayoutMetrics.desktop-mail-toolbar-height + 44px;
+        width: root.main-width;
+        height: max(0px, root.height - self.y);
+        compact: root.compact;
+        rows: root.agenda-rows;
+        event-count: root.agenda-event-count;
+        filter-count: root.agenda-filter-count;
+        anchor: root.agenda-anchor;
+        scroll-request: root.agenda-scroll-request;
+        selected-date: root.selected-date;
+        period-title: root.month-title;
+        event-clicked(event) => { root.show-event(event); }
+        new-event => { root.new-event(); }
+        clear-filters => { root.clear-agenda-filters(); }
+    }
+
+    day-list := PopupWindow {
+        x: root.day-list-x;
+        y: root.day-list-y;
+        width: root.day-list-width;
+        height: root.day-list-height;
+        close-policy: close-on-click-outside;
+        forward-focus: day-list-focus;
+        Rectangle {
+            background: root.surface-color;
+            border-radius: 10px;
+            border-width: 1px;
+            border-color: root.ui-border-color;
+            drop-shadow-blur: 18px;
+            drop-shadow-offset-y: 6px;
+            drop-shadow-color: #0003;
+            day-list-focus := FocusScope {
+                key-pressed(event) => {
+                    if event.text == Key.Escape { day-list.close(); return accept; }
+                    reject
+                }
+                Text { x: 14px; y: 10px; width: parent.width - 56px; height: 32px; text: root.day-list-title; color: root.title-color; font-size: TypeScale.body; font-weight: 700; overflow: elide; vertical-alignment: center; }
+                IconButton {
+                    x: parent.width - 42px;
+                    y: 10px;
+                    icon-size: 14px;
+                    icon: @image-url("../icons/lucide/outline/x.svg");
+                    icon-color: root.secondary-color;
+                    hover-background: root.control-hover-color;
+                    tooltip-text: @tr("Close");
+                    tooltip-in-popup: true;
+                    clicked => { day-list.close(); }
+                }
+                day-list-view := ListView {
+                    x: 6px;
+                    y: 48px;
+                    width: parent.width - 12px;
+                    height: parent.height - 54px;
+                    content-width: self.visible-width;
+                    horizontal-scrollbar-policy: always-off;
+                    for event in root.day-list-events : Rectangle {
+                        width: day-list-view.visible-width;
+                        height: max(56px, day-list-detail.y + day-list-detail.height + 8px);
+                        border-radius: 6px;
+                        background: day-list-hit.has-hover ? root.control-hover-color : transparent;
+                        opacity: root.faded(event) ? 0.55 : 1;
+                        Rectangle { x: 8px; y: 10px; width: 4px; height: parent.height - 20px; border-radius: 2px; background: root.event-color(event); }
+                        day-list-name := Text { x: 20px; y: 8px; width: parent.width - 28px; height: max(20px, self.preferred-height); text: event.title; color: root.title-color; font-size: TypeScale.secondary; font-weight: 700; overflow: elide; vertical-alignment: center; }
+                        if root.faded(event) : Rectangle { x: day-list-name.x; y: day-list-name.y + day-list-name.height / 2; width: min(day-list-name.width, day-list-name.preferred-width); height: 1px; background: root.title-color; }
+                        day-list-detail := Text { x: 20px; y: day-list-name.y + day-list-name.height + 2px; width: parent.width - 28px; height: max(16px, self.preferred-height); text: root.state(event) != "" ? root.state(event) + " · " + event.detail : event.detail; color: root.secondary-color; font-size: TypeScale.caption; overflow: elide; vertical-alignment: center; }
+                        day-list-hit := TouchArea {
+                            accessible-role: button;
+                            accessible-label: @tr("View details for {}", event.title);
+                            accessible-description: root.state(event);
+                            accessible-action-default => { day-list.close(); root.show-event(event); }
+                            clicked => { day-list.close(); root.show-event(event); }
+                            mouse-cursor: pointer;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    CalendarDetailsDialog {
+        x: 0px;
+        y: 0px;
+        width: parent.width;
+        height: parent.height;
+        open <=> root.detail-open;
+        compact: root.compact;
+        kind: root.detail-kind;
+        title: root.detail-title;
+        subtitle: root.detail-subtitle;
+        provider: root.detail-provider;
+        date-time: root.detail-date-time;
+        calendar: root.detail-calendar;
+        account: root.detail-account;
+        location: root.detail-location;
+        organizer: root.detail-organizer;
+        access: root.detail-access;
+        sync: root.detail-sync;
+        status: root.detail-status;
+        rsvp: root.detail-rsvp;
+        recurrence: root.detail-recurrence;
+        attendees: root.detail-attendees;
+        description: root.detail-description;
+        join-url: root.detail-join-url;
+        editable: root.detail-event-editable;
+        answerable: root.detail-answerable;
+        removable: root.detail-removable;
+        my-answer: root.detail-my-answer;
+        repeats: root.detail-repeats;
+        accent: root.accent-color;
+        accent-soft: root.accent-background;
+        border: root.ui-border-color;
+        border-subtle: root.subtle-border-color;
+        muted-text: root.muted-color;
+        surface: root.surface-color;
+        title-color: root.title-color;
+        open-link(url) => { root.open-link(url); }
+        edit-event => {
+            root.detail-open = false;
+            root.edit-event(root.detail-event-id);
+        }
+        delete-event => { root.delete-confirmation-open = true; }
+        answer(response, whole) => {
+            root.detail-my-answer = response == "accepted" ? "ACCEPTED" : response == "tentative" ? "TENTATIVE" : "DECLINED";
+            root.answer-event(root.detail-event-id, response, whole ? "" : root.detail-recurrence-id);
+        }
+        remove-event => {
+            root.detail-open = false;
+            root.delete-event(root.detail-event-id);
+        }
+    }
+
+    ConfirmationDialog {
+        width: parent.width;
+        height: parent.height;
+        open <=> root.delete-confirmation-open;
+        title: @tr("Delete this event?");
+        description: @tr("This event will be removed from your calendar.");
+        detail: @tr("This action cannot be undone.");
+        confirm-label: @tr("Delete event");
+        cancel-label: @tr("Keep event");
+        icon: @image-url("../icons/lucide/outline/trash.svg");
+        surface: root.surface-color;
+        dialog-border-color: root.subtle-border-color;
+        title-color: root.title-color;
+        body-color: root.body-color;
+        muted-color: root.secondary-color;
+        confirmed => {
+            root.detail-open = false;
+            root.delete-event(root.detail-event-id);
+        }
+    }
+}

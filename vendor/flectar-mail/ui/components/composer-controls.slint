@@ -1,0 +1,154 @@
+import { TypeScale } from "../typography.slint";
+
+export component RecipientRow inherits Rectangle {
+    in-out property <string> text;
+    in property <string> label;
+    in property <string> placeholder-text;
+    in property <length> right-padding: 12px;
+    in property <color> background-color;
+    in property <color> label-color;
+    in property <color> text-color;
+    in property <color> placeholder-color;
+    in property <color> focus-color;
+    in property <bool> suggestions-open: false;
+    out property <bool> has-focus: field.has-focus;
+    callback edited(string);
+    callback move-suggestion(int);
+    callback accept-suggestion();
+    callback dismiss-suggestions();
+
+    // The first line keeps the 40px row, centred with the label. Longer lists
+    // wrap and grow the row up to five lines, then scroll to the caret.
+    private property <length> line-height: line-probe.preferred-height;
+    private property <length> inset: max(0px, (40px - root.line-height) / 2);
+    private property <length> max-text-height: five-line-probe.preferred-height;
+
+    forward-focus: field;
+
+    height: max(40px, min(field.preferred-height, root.max-text-height) + 2 * root.inset);
+    background: root.background-color;
+
+    line-probe := Text {
+        visible: false;
+        text: "Ag";
+        font-size: TypeScale.body;
+    }
+
+    five-line-probe := Text {
+        visible: false;
+        text: "Ag\nAg\nAg\nAg\nAg";
+        font-size: TypeScale.body;
+    }
+
+    row-label := Text {
+        x: 12px;
+        y: 0px;
+        width: max(34px, self.preferred-width);
+        height: 40px;
+        text: root.label;
+        color: field.has-focus ? root.focus-color : root.label-color;
+        font-size: TypeScale.secondary;
+        font-weight: 600;
+        vertical-alignment: center;
+    }
+
+    Text {
+        x: scroller.x;
+        y: 0px;
+        width: scroller.width;
+        height: 40px;
+        visible: root.text == "";
+        text: root.placeholder-text;
+        color: root.placeholder-color;
+        font-size: TypeScale.body;
+        vertical-alignment: center;
+        overflow: elide;
+    }
+
+    scroller := Flickable {
+        x: row-label.x + row-label.width + 4px;
+        y: root.inset;
+        width: max(0px, parent.width - self.x - root.right-padding);
+        height: max(0px, parent.height - 2 * root.inset);
+        content-height: field.height;
+
+        field := TextInput {
+            width: scroller.width;
+            height: max(scroller.height, self.preferred-height);
+            text <=> root.text;
+            color: root.text-color;
+            selection-background-color: root.focus-color;
+            selection-foreground-color: white;
+            font-size: TypeScale.body;
+            single-line: false;
+            wrap: word-wrap;
+            edited => {
+                root.edited(self.text);
+            }
+            cursor-position-changed(position) => {
+                if (position.y + scroller.content-y < 0px) {
+                    scroller.content-y = -position.y;
+                } else if (position.y + root.line-height + scroller.content-y > scroller.height) {
+                    scroller.content-y = scroller.height - position.y - root.line-height;
+                }
+            }
+            key-pressed(event) => {
+                if (root.suggestions-open && event.text == Key.DownArrow) {
+                    root.move-suggestion(1);
+                    return accept;
+                }
+                if (root.suggestions-open && event.text == Key.UpArrow) {
+                    root.move-suggestion(-1);
+                    return accept;
+                }
+                if (root.suggestions-open && (event.text == Key.Return || event.text == Key.Tab)) {
+                    root.accept-suggestion();
+                    return accept;
+                }
+                if (root.suggestions-open && event.text == Key.Escape) {
+                    root.dismiss-suggestions();
+                    return accept;
+                }
+                // Commas separate recipients; Return never starts a new line.
+                if (event.text == Key.Return) {
+                    return accept;
+                }
+                reject
+            }
+        }
+    }
+}
+
+export component ModeButton inherits Rectangle {
+    in property <string> text;
+    in property <bool> selected;
+    in property <color> text-color;
+    in property <color> selected-text-color;
+    in property <color> hover-color;
+    in property <color> selected-background;
+    out property <length> label-width: mode-label.preferred-width;
+    callback clicked;
+
+    width: 58px;
+    height: 26px;
+    border-radius: 5px;
+    background: root.selected ? root.selected-background : hit.has-hover ? root.hover-color : transparent;
+
+    mode-label := Text {
+        text: root.text;
+        color: root.selected ? root.selected-text-color : root.text-color;
+        font-size: TypeScale.caption;
+        font-weight: root.selected ? 700 : 500;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+
+    hit := TouchArea {
+        accessible-role: button;
+        accessible-label: root.text;
+        accessible-checked: root.selected;
+        accessible-action-default => { root.clicked(); }
+        clicked => { root.clicked(); }
+        mouse-cursor: pointer;
+    }
+}

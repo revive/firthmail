@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "FirthMail 主窗口权限：core 默认集（含事件 listen/emit——此前缺失导致引擎事件被静默拒绝）",
+  "windows": ["main"],
+  "permissions": ["core:default"]
+}

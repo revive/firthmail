@@ -1,0 +1,94 @@
+//! Host integration layer. This is the only application module that names a
+//! mobile operating system; shared code selects behaviour with the `mobile`,
+//! `desktop` and `linux_desktop` aliases from build.rs and calls the items
+//! re-exported here. Every mobile module provides the same crate-internal
+//! items, so a new platform adds one module instead of editing call sites.
+//! See platform/README.md for the full host contract.
+
+#[cfg(target_os = "android")]
+mod android;
+#[cfg(target_os = "android")]
+pub use android::*;
+
+#[cfg(target_os = "ios")]
+mod ios;
+#[cfg(target_os = "ios")]
+pub use ios::*;
+
+/// The iOS Keychain credential store, whose rules every platform tests.
+#[cfg(any(test, target_os = "ios"))]
+mod keychain;
+/// The iOS sign-in session broker, whose rules every platform tests.
+#[cfg(any(test, target_os = "ios"))]
+mod web_authentication;
+
+/// Whether the system lets the app check for new mail in the background.
+#[cfg(background_checks)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BackgroundRefresh {
+    On,
+    /// Turned off for the app, or not allowed on the device.
+    Off,
+    /// Paused by Low Power Mode.
+    LowPower,
+}
+
+#[cfg(target_env = "ohos")]
+mod ohos;
+#[cfg(target_env = "ohos")]
+pub use ohos::*;
+
+/// Android and OpenHarmony memory levels, whose mapping every platform tests.
+#[cfg(any(test, target_os = "android", target_env = "ohos"))]
+mod memory_levels;
+
+/// How this copy is installed on Windows, whose command parsing every
+/// platform tests.
+#[cfg(any(test, target_os = "windows"))]
+pub(crate) mod windows_install;
+/// Pipes and other kernel objects only the current user can open.
+#[cfg(target_os = "windows")]
+pub(crate) mod windows_security;
+
+/// The operating system's proxy settings.
+mod system_proxy;
+pub(crate) use system_proxy::install as install_system_proxy;
+
+/// Fonts a host without Fontconfig hands to the email (Blitz/Parley) renderer
+/// and the composer: the platform font directory, and the fallback policy the
+/// host applies to its own UI, so mail content falls back the same way.
+pub struct EmailFonts {
+    /// The platform font directory.
+    pub dir: &'static std::path::Path,
+    /// Family-name fragments of the Han (CJK) faces, most preferred first.
+    pub han_families: &'static [&'static str],
+    /// Scripts, as ISO 15924 tags, that fall back to every system family.
+    pub fallback_scripts: &'static [[u8; 4]],
+}
+
+/// Desktop reach system fonts through the fontique system backend.
+#[cfg(desktop)]
+pub(crate) fn email_fonts() -> Option<&'static EmailFonts> {
+    None
+}
+
+/// Whether this build may send people to the web checkout for Flectar Mail Sync.
+/// Direct downloads, Flathub and the Microsoft Store allow it; a store that
+/// requires its own in-app purchases doesn't.
+#[cfg(desktop)]
+pub(crate) fn sells_sync() -> bool {
+    true
+}
+
+/// How this device appears in Flectar Mail Sync's device list: its host name and
+/// operating system.
+#[cfg(desktop)]
+pub(crate) fn device_description() -> flectar_mail_core::device_sync::DeviceDescription {
+    flectar_mail_core::device_sync::DeviceDescription::default()
+}
+
+/// Build the platform context for the process launcher in src/desktop.rs.
+#[cfg(desktop)]
+pub fn launch_context() -> Result<crate::PlatformContext, flectar_mail_core::error::CoreError> {
+    crate::PlatformContext::desktop()
+}

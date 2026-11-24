@@ -1,0 +1,31 @@
+[package]
+name = "firthmail-desktop"
+description = "FirthMail - a fast, keyboard-first mail client on the flectar-mail-core engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "firthmail_desktop"
+path = "src/lib.rs"
+
+[[bin]]
+name = "firthmail-desktop"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+dirs = "6"
+# The same rusqlite the engine links (same version, features unify): the
+# rename migration rewrites the absolute paths recorded before the move.
+rusqlite = { version = "0.41", features = ["bundled"] }
+# The mail engine: flectar-mail-core, vendored from the AGPL flectar/mail
+# repository (route B: personal use). No local-embeddings, keeping the
+# dependency tree lean.
+flectar-mail-core = { path = "../../../vendor/flectar-mail/crates/flectar-mail-core", default-features = false }

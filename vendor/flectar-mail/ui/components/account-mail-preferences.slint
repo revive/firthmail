@@ -1,0 +1,627 @@
+import { VerticalBox, HorizontalBox, ScrollView, TextEdit } from "std-widgets.slint";
+import { AccountRow } from "../models.slint";
+import { AppTheme, LayoutMetrics } from "../design-system.slint";
+import { TypeScale } from "../typography.slint";
+import { Button } from "button.slint";
+import { LineEdit } from "controls.slint";
+import { SettingsSelectRow, SettingsSwitchRow } from "settings-components.slint";
+import { SenderChoiceRow } from "sender-picker.slint";
+import { FocusVisibleScope } from "focus-visible-scope.slint";
+
+export struct SignatureChoice { id: string, name: string, text: string }
+export struct SenderIdentityChoice { email: string, label: string }
+export struct SenderIdentityRow {
+    email: string,
+    name: string,
+    reply-to: string,
+    primary: bool,
+    manual: bool,
+    pending: bool,
+    wildcard: bool,
+    // "unknown" | "confirmed" | "rejected"
+    delivery: string,
+    error: string,
+    // The copies mail from this address starts with besides the account's
+    // (#252): its own Cc and Bcc, and the Bcc its provider keeps.
+    cc: string,
+    bcc: string,
+    provider-bcc: string,
+}
+export global AccountMailPreferences {
+    in-out property <int> account-id: -1;
+    in-out property <string> account-label;
+    in-out property <[SignatureChoice]> signatures;
+    in-out property <[string]> signature-names;
+    in-out property <[string]> default-names;
+    in-out property <int> editing-index: -1;
+    in-out property <string> editing-id;
+    in-out property <string> signature-text;
+    in-out property <int> new-index: 0;
+    in-out property <int> reply-index: 0;
+    in-out property <string> fingerprint;
+    in-out property <bool> sign: false;
+    in-out property <bool> encrypt: false;
+    in-out property <string> recipient-keys;
+    in-out property <string> key-inventory;
+    in-out property <string> status;
+    in-out property <bool> busy: false;
+    in-out property <bool> desktop-supported: true;
+    in-out property <[SenderIdentityChoice]> sender-identities;
+    in-out property <[string]> sender-identity-names;
+    in-out property <int> default-sender-index: 0;
+    in-out property <string> sender-identity-status;
+    in-out property <[SenderIdentityRow]> sender-identity-rows;
+    // "any": the server judges at send time; "wildcard": only addresses inside
+    // a server *@domain identity; "never": the provider is authoritative.
+    in-out property <string> sender-identity-policy: "never";
+    in-out property <string> sender-form-email;
+    in-out property <string> sender-form-name;
+    in-out property <string> sender-form-reply-to;
+    in-out property <bool> sender-form-editing: false;
+    // The address's own copies (#252). An address the provider gives keeps
+    // its name and reply-to address, and only these change here.
+    in-out property <string> sender-form-cc;
+    in-out property <string> sender-form-bcc;
+    in-out property <bool> sender-form-provider: false;
+    // The copies every message written from the account starts with.
+    in-out property <string> copies-cc;
+    in-out property <string> copies-bcc;
+    callback save-copies;
+    // How the account's messages start: 0 formatted, 1 plain text, and whether replies and
+    // forwards to plain-text messages start in plain text. Each change saves at once.
+    in-out property <int> message-format-index: 0;
+    in-out property <bool> plain-text-replies: true;
+    callback save-message-format;
+    // New messages ask for a read receipt, which each message can change.
+    in-out property <bool> request-read-receipts: false;
+    callback save-read-receipt-requests;
+    callback load(int);
+    callback edit-signature(int);
+    // Opens the chosen signature, or a new one, in the composer to write.
+    callback open-signature(bool);
+    callback delete-signature;
+    callback save-defaults;
+    callback refresh-sender-identities;
+    callback save-default-sender;
+    callback save-sender-identity;
+    callback edit-sender-identity(string);
+    callback remove-sender-identity(string);
+    callback clear-sender-form;
+    callback save-security;
+    callback key-action(string);
+    callback composer-reset;
+    callback composer-account-changed(int);
+    callback composer-signature(int);
+    in-out property <[string]> composer-signature-names;
+    in-out property <int> composer-signature-index: 0;
+    in-out property <string> composer-security;
+    in-out property <bool> composer-preferences-ready: false;
+    in-out property <[SenderIdentityChoice]> composer-sender-identities;
+    in-out property <[string]> composer-sender-names;
+    in-out property <int> composer-sender-index: 0;
+    in-out property <string> composer-sender-email;
+    callback composer-sender(int);
+    // The composer's From among more addresses than a list shows (#252):
+    // whether the picker is open, its search, and the matches Rust lists.
+    in-out property <bool> composer-sender-picker-open: false;
+    in-out property <string> composer-sender-query;
+    in property <[SenderChoiceRow]> composer-sender-matches;
+    in property <int> composer-sender-match-count;
+    callback composer-sender-search(string);
+    // The same for Settings' default sender.
+    in-out property <bool> default-sender-picker-open: false;
+    in-out property <string> default-sender-query;
+    in property <[SenderChoiceRow]> default-sender-matches;
+    in property <int> default-sender-match-count;
+    callback default-sender-search(string);
+    // Settings lists the addresses matching this search, so many at most,
+    // of `sender-identity-count` in all and `sender-identity-match-count`
+    // matching.
+    in-out property <string> sender-identity-query;
+    in property <int> sender-identity-count;
+    in property <int> sender-identity-match-count;
+    callback sender-identity-search(string);
+    callback read-message;
+    callback export-message;
+    callback close-reader;
+
+    // Automatic replies (#239), as the account's server keeps them. Some
+    // servers can't send them, which the unsupported text explains.
+    in property <bool> auto-reply-supported: false;
+    in property <string> auto-reply-unsupported-text;
+    // How the server sends them, such as how often per sender.
+    in property <string> auto-reply-note;
+    // Outlook's replies have no subject of their own, and its days need an end.
+    in property <bool> auto-reply-subject-available: true;
+    in property <bool> auto-reply-needs-last-day: false;
+    // Who "only my contacts" leaves out: in a Microsoft work account, only
+    // senders outside the organization.
+    in property <string> auto-reply-contacts-note;
+    // JMAP's replies go to every sender.
+    in property <bool> auto-reply-contacts-available: true;
+    in-out property <bool> auto-reply-on: false;
+    // Days as YYYY-MM-DD, or empty for no limit.
+    in-out property <string> auto-reply-first-day;
+    in-out property <string> auto-reply-last-day;
+    in-out property <string> auto-reply-subject;
+    in-out property <string> auto-reply-text;
+    in-out property <bool> auto-reply-contacts-only: false;
+    // Workspace accounts can keep replies inside the organization.
+    in property <bool> auto-reply-domain-available: false;
+    in-out property <bool> auto-reply-domain-only: false;
+    in property <bool> auto-reply-saving: false;
+    in property <string> auto-reply-status;
+    callback save-auto-reply();
+    callback context-changed;
+    in-out property <bool> reader-open: false;
+    in-out property <string> reader-status;
+    in-out property <string> reader-text;
+}
+
+// The address chosen among many, which looks like a select and opens the
+// picker that searches them on a click, Return, Space or the down arrow.
+component PickerField inherits FocusVisibleScope {
+    in property <string> text;
+    in property <string> name;
+    callback clicked();
+
+    height: 36px;
+    accessible-role: combobox;
+    accessible-label: root.name;
+    accessible-value: root.text;
+    accessible-action-default => { root.clicked(); }
+    key-pressed(event) => {
+        if event.text == Key.Return || event.text == " " || event.text == Key.DownArrow {
+            root.clicked();
+            return accept;
+        }
+        reject
+    }
+
+    Rectangle {
+        border-radius: LayoutMetrics.corner-radius - 2px;
+        border-width: root.focus-visible ? 2px : 1px;
+        border-color: root.focus-visible ? AppTheme.accent : AppTheme.control-border;
+        background: area.has-hover ? AppTheme.control-bg : AppTheme.surface;
+
+        Text {
+            x: 11px;
+            width: parent.width - 44px;
+            text: root.text;
+            color: AppTheme.heading;
+            font-size: TypeScale.body;
+            vertical-alignment: center;
+            overflow: elide;
+            accessible-role: none;
+        }
+        Image {
+            x: parent.width - 28px;
+            width: 16px;
+            height: 16px;
+            source: @image-url("../icons/lucide/outline/chevron-down.svg");
+            colorize: AppTheme.secondary;
+            accessible-role: none;
+        }
+        area := TouchArea {
+            mouse-cursor: pointer;
+            clicked => {
+                root.focus();
+                root.pointer-activated();
+                root.clicked();
+            }
+        }
+    }
+}
+
+// A choice among more sender addresses than a list shows (#252): what it
+// is, and the address chosen, which opens a picker to search them.
+export component SenderPickerRow inherits Rectangle {
+    in property <bool> compact: false;
+    in property <string> title;
+    in property <string> description;
+    in property <string> value;
+    in property <color> title-color;
+    in property <color> description-color;
+    callback clicked();
+
+    height: root.compact ? 66px + compact-title.height + compact-description.height
+        : 23px + desktop-title.height + desktop-description.height;
+    vertical-stretch: 0;
+
+    HorizontalBox {
+        visible: !root.compact;
+        spacing: 20px;
+        VerticalBox {
+            horizontal-stretch: 1;
+            min-width: 0px;
+            spacing: 2px;
+            desktop-title := Text { height: max(18px, self.preferred-height); text: root.title; color: root.title-color; font-size: TypeScale.body; font-weight: 600; overflow: elide; }
+            desktop-description := Text { height: max(17px, self.preferred-height); text: root.description; color: root.description-color; font-size: TypeScale.caption; wrap: word-wrap; }
+        }
+        PickerField {
+            width: 210px;
+            text: root.value;
+            name: root.title;
+            clicked => { root.clicked(); }
+        }
+    }
+    VerticalBox {
+        visible: root.compact;
+        padding: 8px;
+        spacing: 7px;
+        compact-title := Text { height: max(20px, self.preferred-height); text: root.title; color: root.title-color; font-size: TypeScale.body; font-weight: 600; wrap: word-wrap; }
+        compact-description := Text { height: max(34px, self.preferred-height); text: root.description; color: root.description-color; font-size: TypeScale.caption; wrap: word-wrap; }
+        PickerField {
+            text: root.value;
+            name: root.title;
+            clicked => { root.clicked(); }
+        }
+    }
+}
+
+// Cc and Bcc addresses, each named beside its field (#252).
+component CopiesFields inherits GridLayout {
+    in property <bool> enabled: true;
+    in-out property <string> cc;
+    in-out property <string> bcc;
+    spacing: 8px;
+    Row {
+        Text { horizontal-stretch: 0; text: @tr("Cc"); color: AppTheme.secondary; vertical-alignment: center; }
+        LineEdit { text <=> root.cc; input-label: @tr("Cc"); placeholder-text: @tr("Addresses that get a copy (optional)"); enabled: root.enabled; }
+    }
+    Row {
+        Text { horizontal-stretch: 0; text: @tr("Bcc"); color: AppTheme.secondary; vertical-alignment: center; }
+        LineEdit { text <=> root.bcc; input-label: @tr("Bcc"); placeholder-text: @tr("Addresses that get a hidden copy (optional)"); enabled: root.enabled; }
+    }
+}
+
+export component AccountMailPreferencesPanel inherits Rectangle {
+    in property <[AccountRow]> accounts;
+    in property <bool> compact: false;
+    // "signatures", "openpgp" or "replies".
+    in-out property <string> tab: "signatures";
+    background: AppTheme.surface;
+    border-radius: 10px;
+    border-width: 1px;
+    border-color: AppTheme.input-border;
+    vertical-stretch: 0;
+    // The copies mail from an address starts with besides the account's.
+    pure function identity-copies(identity: SenderIdentityRow) -> string {
+        let cc = identity.cc != "" ? @tr("Cc {}", identity.cc) : "";
+        let bcc = identity.bcc != "" ? @tr("Bcc {}", identity.bcc) : "";
+        let provider = identity.provider-bcc != "" ? @tr("Bcc {} from your provider", identity.provider-bcc) : "";
+        let first = cc != "" && bcc != "" ? cc + " · " + bcc : cc + bcc;
+        return first != "" && provider != "" ? first + " · " + provider : first + provider;
+    }
+    pure function identity-detail(identity: SenderIdentityRow) -> string {
+        if identity.wildcard {
+            return @tr("Server allows any address at this domain");
+        }
+        if identity.pending {
+            return @tr("Awaiting verification by the provider; cannot be selected yet");
+        }
+        if identity.delivery == "rejected" {
+            return identity.error != "" ? @tr("The server refused the last message from this address: {}", identity.error) : @tr("The server refused the last message from this address");
+        }
+        if identity.primary {
+            return identity.reply-to != "" ? @tr("Sign-in address · replies go to {}", identity.reply-to) : @tr("Sign-in address");
+        }
+        if identity.manual {
+            if identity.delivery == "confirmed" {
+                return identity.reply-to != "" ? @tr("Added by you · accepted by the server · replies go to {}", identity.reply-to) : @tr("Added by you · accepted by the server");
+            }
+            return identity.reply-to != "" ? @tr("Added by you · not used yet · replies go to {}", identity.reply-to) : @tr("Added by you · not used yet");
+        }
+        return identity.reply-to != "" ? @tr("Provided by the server · replies go to {}", identity.reply-to) : @tr("Provided by the server");
+    }
+    content := VerticalBox {
+        padding: 20px; spacing: 12px; alignment: start;
+        Text { min-height: self.preferred-height; vertical-stretch: 0; text: @tr("Sender identities, signatures, OpenPGP & automatic replies"); color: AppTheme.heading; font-size: TypeScale.subtitle; font-weight: 700; wrap: word-wrap; }
+        Text { min-height: self.preferred-height; vertical-stretch: 0; text: @tr("Choose an account to manage its sender identity, signature, message protection and automatic replies."); color: AppTheme.secondary; wrap: word-wrap; }
+        for account in root.accounts : Button {
+            text: account.email;
+            primary: AccountMailPreferences.account-id == account.id;
+            enabled: !AccountMailPreferences.busy;
+            clicked => { AccountMailPreferences.load(account.id); }
+        }
+        if AccountMailPreferences.account-id > 0 : VerticalBox {
+            spacing: 12px;
+            Text { min-height: self.preferred-height; vertical-stretch: 0; text: AccountMailPreferences.account-label; color: AppTheme.heading; font-weight: 600; overflow: elide; }
+            HorizontalBox {
+                Button { text: @tr("Signatures"); primary: root.tab == "signatures"; clicked => { root.tab = "signatures"; } }
+                Button { text: @tr("OpenPGP"); primary: root.tab == "openpgp"; clicked => { root.tab = "openpgp"; } }
+                Button { text: @tr("Automatic replies"); primary: root.tab == "replies"; clicked => { root.tab = "replies"; } }
+            }
+            if root.tab == "signatures" : VerticalBox {
+                spacing: 10px;
+                if AccountMailPreferences.sender-identity-names.length <= 10 : SettingsSelectRow {
+                    compact: root.compact; title: @tr("Default sender identity"); description: @tr("Preselected for new messages. Your sign-in address is unchanged.");
+                    choices: AccountMailPreferences.sender-identity-names; selected-index <=> AccountMailPreferences.default-sender-index;
+                    title-color: AppTheme.heading; description-color: AppTheme.secondary;
+                    selected(index, value) => { AccountMailPreferences.default-sender-index = index; }
+                }
+                // Past ten addresses, one is found by searching (#252).
+                if AccountMailPreferences.sender-identity-names.length > 10 : SenderPickerRow {
+                    compact: root.compact;
+                    title: @tr("Default sender identity");
+                    description: @tr("Preselected for new messages. Your sign-in address is unchanged.");
+                    value: AccountMailPreferences.sender-identity-names[AccountMailPreferences.default-sender-index];
+                    title-color: AppTheme.heading; description-color: AppTheme.secondary;
+                    clicked => {
+                        AccountMailPreferences.default-sender-query = "";
+                        AccountMailPreferences.default-sender-search("");
+                        AccountMailPreferences.default-sender-picker-open = true;
+                    }
+                }
+                HorizontalBox {
+                    Button { text: @tr("Save sender default"); primary: true; enabled: !AccountMailPreferences.busy && AccountMailPreferences.sender-identities.length > 0; clicked => { AccountMailPreferences.save-default-sender(); } }
+                    Button { text: @tr("Refresh sender identities"); enabled: !AccountMailPreferences.busy; clicked => { AccountMailPreferences.refresh-sender-identities(); } }
+                }
+                if AccountMailPreferences.sender-identity-status != "" : Text { min-height: self.preferred-height; vertical-stretch: 0; text: AccountMailPreferences.sender-identity-status; color: AppTheme.secondary; wrap: word-wrap; }
+                if AccountMailPreferences.sender-identity-count > 10 : LineEdit {
+                    text <=> AccountMailPreferences.sender-identity-query;
+                    placeholder-text: @tr("Search sender addresses");
+                    input-label: @tr("Search sender addresses");
+                    show-leading-icon: true;
+                    leading-icon: @image-url("../icons/lucide/outline/search.svg");
+                    leading-icon-color: AppTheme.muted;
+                    edited(value) => { AccountMailPreferences.sender-identity-search(value); }
+                }
+                for identity in AccountMailPreferences.sender-identity-rows : VerticalBox {
+                    padding: 0px; spacing: 4px;
+                    Text { min-height: self.preferred-height; vertical-stretch: 0; text: identity.name != "" ? identity.name + "  <" + identity.email + ">" : identity.email; color: AppTheme.heading; overflow: elide; }
+                    Text { min-height: self.preferred-height; vertical-stretch: 0; text: root.identity-detail(identity); color: identity.delivery == "rejected" ? AppTheme.destructive : AppTheme.secondary; wrap: word-wrap; }
+                    if root.identity-copies(identity) != "" : Text { min-height: self.preferred-height; vertical-stretch: 0; text: root.identity-copies(identity); color: AppTheme.secondary; wrap: word-wrap; }
+                    if !identity.wildcard : HorizontalBox {
+                        padding: 0px;
+                        alignment: start;
+                        Button { min-width: max(64px, self.content-width); text: @tr("Edit"); enabled: !AccountMailPreferences.busy; clicked => { AccountMailPreferences.edit-sender-identity(identity.email); } }
+                        if identity.manual : Button { min-width: max(64px, self.content-width); text: @tr("Remove"); destructive: true; enabled: !AccountMailPreferences.busy; clicked => { AccountMailPreferences.remove-sender-identity(identity.email); } }
+                    }
+                }
+                if AccountMailPreferences.sender-identity-match-count > AccountMailPreferences.sender-identity-rows.length : Text {
+                    min-height: self.preferred-height; vertical-stretch: 0; color: AppTheme.secondary; wrap: word-wrap;
+                    text: @tr("Showing {} of {} addresses. Search to find the others.", AccountMailPreferences.sender-identity-rows.length, AccountMailPreferences.sender-identity-match-count);
+                }
+                if AccountMailPreferences.sender-identity-count > 10 && AccountMailPreferences.sender-identity-match-count == 0 : Text {
+                    min-height: self.preferred-height; vertical-stretch: 0; color: AppTheme.secondary; wrap: word-wrap;
+                    text: @tr("No matching addresses");
+                }
+                if AccountMailPreferences.sender-identity-policy == "never" && !AccountMailPreferences.sender-form-provider : Text { min-height: self.preferred-height; vertical-stretch: 0; text: @tr("Gmail decides which addresses you can send from. Add an address in Gmail settings under Accounts › Send mail as, then refresh sender identities."); color: AppTheme.secondary; wrap: word-wrap; }
+                if AccountMailPreferences.sender-identity-policy != "never" || AccountMailPreferences.sender-form-provider : VerticalBox {
+                    padding: 0px; spacing: 8px;
+                    Text {
+                        min-height: self.preferred-height; vertical-stretch: 0; color: AppTheme.heading; font-weight: 600; wrap: word-wrap;
+                        text: AccountMailPreferences.sender-form-provider ? @tr("Copies of mail from {}", AccountMailPreferences.sender-form-email)
+                            : AccountMailPreferences.sender-form-editing ? @tr("Edit sender address") : @tr("Add a sender address");
+                    }
+                    Text {
+                        min-height: self.preferred-height; vertical-stretch: 0; color: AppTheme.secondary; wrap: word-wrap;
+                        text: AccountMailPreferences.sender-form-provider
+                            ? @tr("Your provider sets this address's name and reply-to address. Mail you write from it starts with these copies too.")
+                            : AccountMailPreferences.sender-identity-policy == "wildcard"
+                            ? @tr("Your server lets you send from any address at the domains shown as wildcards. Add the addresses you want to choose from.")
+                            : @tr("Add an alias or another address your mail server lets you send from. The server decides when you send; Flectar Mail shows whether it accepted the last message.");
+                    }
+                    if !AccountMailPreferences.sender-form-provider : LineEdit { text <=> AccountMailPreferences.sender-form-email; input-label: @tr("Email address"); placeholder-text: @tr("alias@example.com"); read-only: AccountMailPreferences.sender-form-editing; enabled: !AccountMailPreferences.busy; }
+                    if !AccountMailPreferences.sender-form-provider : LineEdit { text <=> AccountMailPreferences.sender-form-name; input-label: @tr("Sender name"); placeholder-text: @tr("Name shown to recipients (optional)"); enabled: !AccountMailPreferences.busy; }
+                    if !AccountMailPreferences.sender-form-provider : LineEdit { text <=> AccountMailPreferences.sender-form-reply-to; input-label: @tr("Reply-to address"); placeholder-text: @tr("Where replies should go (optional)"); enabled: !AccountMailPreferences.busy; }
+                    CopiesFields { cc <=> AccountMailPreferences.sender-form-cc; bcc <=> AccountMailPreferences.sender-form-bcc; enabled: !AccountMailPreferences.busy; }
+                    HorizontalBox {
+                        padding: 0px;
+                        alignment: start;
+                        Button {
+                            min-width: max(64px, self.content-width);
+                            text: AccountMailPreferences.sender-form-provider ? @tr("Save copies")
+                                : AccountMailPreferences.sender-form-editing ? @tr("Save sender address") : @tr("Add sender address");
+                            primary: true;
+                            enabled: !AccountMailPreferences.busy && AccountMailPreferences.sender-form-email != "";
+                            clicked => { AccountMailPreferences.save-sender-identity(); }
+                        }
+                        if AccountMailPreferences.sender-form-editing : Button { min-width: max(64px, self.content-width); text: @tr("Cancel"); enabled: !AccountMailPreferences.busy; clicked => { AccountMailPreferences.clear-sender-form(); } }
+                    }
+                }
+                Rectangle { height: 1px; background: AppTheme.input-border; }
+                // Copies of every message written from the account (#252).
+                VerticalBox {
+                    padding: 0px; spacing: 8px;
+                    Text { min-height: self.preferred-height; vertical-stretch: 0; text: @tr("Automatic Cc and Bcc"); color: AppTheme.heading; font-weight: 600; }
+                    Text { min-height: self.preferred-height; vertical-stretch: 0; text: @tr("Every message you write from this account starts with these copies, and shows them so you can take them out. Each sender address can add its own."); color: AppTheme.secondary; wrap: word-wrap; }
+                    CopiesFields { cc <=> AccountMailPreferences.copies-cc; bcc <=> AccountMailPreferences.copies-bcc; enabled: !AccountMailPreferences.busy; }
+                    HorizontalBox {
+                        padding: 0px;
+                        alignment: start;
+                        Button { min-width: max(64px, self.content-width); text: @tr("Save copies"); primary: true; enabled: !AccountMailPreferences.busy; clicked => { AccountMailPreferences.save-copies(); } }
+                    }
+                }
+                Rectangle { height: 1px; background: AppTheme.input-border; }
+                SettingsSelectRow {
+                    compact: root.compact; title: @tr("Signature"); description: @tr("Saved separately for each account.");
+                    choices: AccountMailPreferences.signature-names; selected-index: AccountMailPreferences.editing-index;
+                    title-color: AppTheme.heading; description-color: AppTheme.secondary;
+                    selected(index, value) => { AccountMailPreferences.edit-signature(index); }
+                }
+                if AccountMailPreferences.editing-id != "" : Rectangle {
+                    min-height: signature-preview.preferred-height + 20px;
+                    border-radius: 8px;
+                    border-width: 1px;
+                    border-color: AppTheme.input-border;
+                    signature-preview := Text {
+                        x: 12px;
+                        width: parent.width - 24px;
+                        text: AccountMailPreferences.signature-text;
+                        color: AppTheme.body;
+                        wrap: word-wrap;
+                        accessible-label: @tr("Signature preview");
+                    }
+                }
+                Text { min-height: self.preferred-height; vertical-stretch: 0; text: @tr("Signatures can have formatting and pictures. They open in the composer to write."); color: AppTheme.secondary; wrap: word-wrap; }
+                HorizontalBox {
+                    Button { text: @tr("Edit signature"); primary: true; enabled: !AccountMailPreferences.busy && AccountMailPreferences.editing-id != ""; clicked => { AccountMailPreferences.open-signature(false); } }
+                    Button { text: @tr("New signature"); enabled: !AccountMailPreferences.busy; clicked => { AccountMailPreferences.open-signature(true); } }
+                    Button { text: @tr("Delete"); enabled: !AccountMailPreferences.busy && AccountMailPreferences.editing-id != ""; clicked => { AccountMailPreferences.delete-signature(); } }
+                }
+                SettingsSelectRow {
+                    compact: root.compact; title: @tr("New messages"); description: @tr("Signature inserted when you start a message.");
+                    choices: AccountMailPreferences.default-names; selected-index <=> AccountMailPreferences.new-index;
+                    title-color: AppTheme.heading; description-color: AppTheme.secondary;
+                    selected(index, value) => { AccountMailPreferences.new-index = index; }
+                }
+                SettingsSelectRow {
+                    compact: root.compact; title: @tr("Replies & forwards"); description: @tr("Placed above the quoted message.");
+                    choices: AccountMailPreferences.default-names; selected-index <=> AccountMailPreferences.reply-index;
+                    title-color: AppTheme.heading; description-color: AppTheme.secondary;
+                    selected(index, value) => { AccountMailPreferences.reply-index = index; }
+                }
+                Button { text: @tr("Save signature defaults"); enabled: !AccountMailPreferences.busy; clicked => { AccountMailPreferences.save-defaults(); } }
+                Rectangle { height: 1px; background: AppTheme.input-border; }
+                SettingsSelectRow {
+                    compact: root.compact; title: @tr("Message format"); description: @tr("How new messages start. Each message can change it.");
+                    choices: [@tr("message format" => "Formatted text"), @tr("message format" => "Plain text")];
+                    selected-index <=> AccountMailPreferences.message-format-index;
+                    title-color: AppTheme.heading; description-color: AppTheme.secondary;
+                    selected(index, value) => {
+                        AccountMailPreferences.message-format-index = index;
+                        AccountMailPreferences.save-message-format();
+                    }
+                }
+                if AccountMailPreferences.message-format-index == 0 : SettingsSwitchRow {
+                    compact: root.compact; title: @tr("Plain text in replies to plain text"); description: @tr("Replies and forwards to plain-text messages start as plain text.");
+                    checked <=> AccountMailPreferences.plain-text-replies;
+                    enabled: !AccountMailPreferences.busy;
+                    title-color: AppTheme.heading; description-color: AppTheme.secondary;
+                    toggled(on) => { AccountMailPreferences.save-message-format(); }
+                }
+                SettingsSwitchRow {
+                    compact: root.compact; title: @tr("Request read receipts"); description: @tr("New messages ask to be told when they're read. Each message can change it under More options.");
+                    checked <=> AccountMailPreferences.request-read-receipts;
+                    enabled: !AccountMailPreferences.busy;
+                    title-color: AppTheme.heading; description-color: AppTheme.secondary;
+                    toggled(on) => { AccountMailPreferences.save-read-receipt-requests(); }
+                }
+            }
+            if root.tab == "replies" && !AccountMailPreferences.auto-reply-supported : Text {
+                min-height: self.preferred-height; vertical-stretch: 0;
+                text: AccountMailPreferences.auto-reply-unsupported-text;
+                color: AppTheme.secondary; wrap: word-wrap;
+            }
+            if root.tab == "replies" && AccountMailPreferences.auto-reply-supported : VerticalBox {
+                spacing: 10px;
+                SettingsSwitchRow {
+                    compact: root.compact; title: @tr("Send automatic replies"); description: AccountMailPreferences.auto-reply-note;
+                    checked <=> AccountMailPreferences.auto-reply-on;
+                    enabled: !AccountMailPreferences.auto-reply-saving;
+                    title-color: AppTheme.heading; description-color: AppTheme.secondary;
+                }
+                HorizontalBox {
+                    padding: 0px; spacing: 10px;
+                    VerticalLayout {
+                        spacing: 4px;
+                        Text { text: @tr("FIRST DAY (OPTIONAL)"); color: AppTheme.secondary; font-size: TypeScale.caption; font-weight: 700; overflow: elide; }
+                        LineEdit { text <=> AccountMailPreferences.auto-reply-first-day; input-label: @tr("First day"); placeholder-text: @tr("YYYY-MM-DD"); enabled: !AccountMailPreferences.auto-reply-saving; }
+                    }
+                    VerticalLayout {
+                        spacing: 4px;
+                        Text { text: @tr("LAST DAY (OPTIONAL)"); color: AppTheme.secondary; font-size: TypeScale.caption; font-weight: 700; overflow: elide; }
+                        LineEdit { text <=> AccountMailPreferences.auto-reply-last-day; input-label: @tr("Last day"); placeholder-text: @tr("YYYY-MM-DD"); enabled: !AccountMailPreferences.auto-reply-saving; }
+                    }
+                }
+                if AccountMailPreferences.auto-reply-subject-available : VerticalLayout {
+                    spacing: 10px;
+                    Text { text: @tr("SUBJECT"); color: AppTheme.secondary; font-size: TypeScale.caption; font-weight: 700; overflow: elide; }
+                    LineEdit { text <=> AccountMailPreferences.auto-reply-subject; input-label: @tr("Subject"); placeholder-text: @tr("Such as Out of office"); enabled: !AccountMailPreferences.auto-reply-saving; }
+                }
+                Text { text: @tr("MESSAGE"); color: AppTheme.secondary; font-size: TypeScale.caption; font-weight: 700; overflow: elide; }
+                TextEdit {
+                    min-height: 120px; vertical-stretch: 0; wrap: word-wrap;
+                    text <=> AccountMailPreferences.auto-reply-text;
+                    placeholder-text: @tr("Message, such as I'm away until Monday and will answer when I'm back.");
+                    enabled: !AccountMailPreferences.auto-reply-saving;
+                }
+                if AccountMailPreferences.auto-reply-contacts-available : SettingsSwitchRow {
+                    compact: root.compact; title: @tr("Only reply to my contacts"); description: AccountMailPreferences.auto-reply-contacts-note;
+                    checked <=> AccountMailPreferences.auto-reply-contacts-only;
+                    enabled: !AccountMailPreferences.auto-reply-saving;
+                    title-color: AppTheme.heading; description-color: AppTheme.secondary;
+                }
+                if AccountMailPreferences.auto-reply-domain-available : SettingsSwitchRow {
+                    compact: root.compact; title: @tr("Only reply inside my organization"); description: @tr("Senders from other domains get no reply.");
+                    checked <=> AccountMailPreferences.auto-reply-domain-only;
+                    enabled: !AccountMailPreferences.auto-reply-saving;
+                    title-color: AppTheme.heading; description-color: AppTheme.secondary;
+                }
+                HorizontalBox {
+                    padding: 0px; spacing: 12px;
+                    Text {
+                        horizontal-stretch: 1; vertical-alignment: center; wrap: word-wrap;
+                        text: AccountMailPreferences.auto-reply-status;
+                        color: AppTheme.secondary;
+                    }
+                    Button {
+                        horizontal-stretch: 0;
+                        width: max(120px, self.content-width);
+                        text: AccountMailPreferences.auto-reply-saving ? @tr("Saving…") : @tr("Save");
+                        primary: true;
+                        enabled: !AccountMailPreferences.auto-reply-saving;
+                        clicked => { AccountMailPreferences.save-auto-reply(); }
+                    }
+                }
+            }
+            if root.tab == "openpgp" : VerticalBox {
+                spacing: 10px;
+                Text { min-height: self.preferred-height; vertical-stretch: 0; text: @tr("OpenPGP protects message bodies and attachments. Digital signatures let recipients check who signed a message."); color: AppTheme.secondary; wrap: word-wrap; }
+                Text { min-height: self.preferred-height; vertical-stretch: 0; text: AccountMailPreferences.desktop-supported ? @tr("Uses installed GnuPG 2.x and its secure key storage. Passphrases are entered in GnuPG's unlock dialog.") : @tr("OpenPGP is unavailable on this mobile build. Protected accounts cannot send without a supported encryption engine."); color: AppTheme.secondary; wrap: word-wrap; }
+                Button { text: @tr("Create a new key"); enabled: !AccountMailPreferences.busy && AccountMailPreferences.desktop-supported; clicked => { AccountMailPreferences.key-action("generate"); } }
+                Text { min-height: self.preferred-height; vertical-stretch: 0; text: @tr("New keys expire in two years. GnuPG asks you to protect the private key with a passphrase."); color: AppTheme.secondary; wrap: word-wrap; }
+                LineEdit { text <=> AccountMailPreferences.fingerprint; input-label: @tr("Your full OpenPGP fingerprint"); placeholder-text: @tr("Your full OpenPGP key fingerprint"); enabled: !AccountMailPreferences.busy && AccountMailPreferences.desktop-supported; }
+                SettingsSwitchRow {
+                    title: @tr("Digitally sign messages"); description: @tr("Proves possession of your private key; does not encrypt the message.");
+                    compact: root.compact; checked <=> AccountMailPreferences.sign; enabled: !AccountMailPreferences.busy && AccountMailPreferences.desktop-supported; toggled(value) => { AccountMailPreferences.sign = value; }
+                    title-color: AppTheme.heading; description-color: AppTheme.secondary;
+                }
+                SettingsSwitchRow {
+                    title: @tr("Require encryption"); description: @tr("Blocks sending unless every recipient has a verified, usable key.");
+                    compact: root.compact; checked <=> AccountMailPreferences.encrypt; enabled: !AccountMailPreferences.busy && AccountMailPreferences.desktop-supported; toggled(value) => { AccountMailPreferences.encrypt = value; }
+                    title-color: AppTheme.heading; description-color: AppTheme.secondary;
+                }
+                Text { min-height: self.preferred-height; vertical-stretch: 0; text: @tr("Verified recipient keys"); color: AppTheme.heading; font-weight: 600; }
+                Text { min-height: self.preferred-height; vertical-stretch: 0; text: @tr("Compare fingerprints with recipients through a separate trusted channel, then enter one email=fingerprint per line. Importing a key alone does not verify it."); color: AppTheme.secondary; wrap: word-wrap; }
+                TextEdit { wrap: word-wrap; height: 130px; text <=> AccountMailPreferences.recipient-keys; placeholder-text: @tr("person@example.org=FULL_FINGERPRINT"); enabled: !AccountMailPreferences.busy; }
+                Button { text: @tr("Save OpenPGP settings"); primary: true; enabled: !AccountMailPreferences.busy; clicked => { AccountMailPreferences.save-security(); } }
+                if !root.compact : HorizontalBox {
+                    Button { text: @tr("Import key"); enabled: !AccountMailPreferences.busy && AccountMailPreferences.desktop-supported; clicked => { AccountMailPreferences.key-action("import"); } }
+                    Button { text: @tr("Export public key"); enabled: !AccountMailPreferences.busy && AccountMailPreferences.desktop-supported; clicked => { AccountMailPreferences.key-action("export"); } }
+                    Button { text: @tr("Show keys"); enabled: !AccountMailPreferences.busy && AccountMailPreferences.desktop-supported; clicked => { AccountMailPreferences.key-action("list"); } }
+                }
+                if root.compact : VerticalBox {
+                    spacing: 8px;
+                    Button { text: @tr("Import key"); enabled: !AccountMailPreferences.busy && AccountMailPreferences.desktop-supported; clicked => { AccountMailPreferences.key-action("import"); } }
+                    Button { text: @tr("Export public key"); enabled: !AccountMailPreferences.busy && AccountMailPreferences.desktop-supported; clicked => { AccountMailPreferences.key-action("export"); } }
+                    Button { text: @tr("Show keys"); enabled: !AccountMailPreferences.busy && AccountMailPreferences.desktop-supported; clicked => { AccountMailPreferences.key-action("list"); } }
+                }
+                Button { text: @tr("Open message file (.eml)"); enabled: !AccountMailPreferences.busy && AccountMailPreferences.desktop-supported; clicked => { AccountMailPreferences.key-action("open"); } }
+                if AccountMailPreferences.key-inventory != "" : TextEdit { wrap: word-wrap; height: 150px; read-only: true; text: AccountMailPreferences.key-inventory; }
+                Text { min-height: self.preferred-height; vertical-stretch: 0; text: @tr("Manage expiry, revocation and private-key backups in GnuPG. Only public keys are exported here."); color: AppTheme.secondary; wrap: word-wrap; }
+                Text { min-height: self.preferred-height; vertical-stretch: 0; text: @tr("Subjects and addresses remain visible. Protected drafts stay on this device. Existing server drafts are not retroactively protected. S/MIME certificates are not supported."); color: AppTheme.secondary; wrap: word-wrap; }
+            }
+            if AccountMailPreferences.busy || AccountMailPreferences.status != "" : Text {
+                text: AccountMailPreferences.busy ? @tr("Working…") : AccountMailPreferences.status;
+                color: AppTheme.secondary; wrap: word-wrap;
+            }
+        }
+    }
+}
+
+export component OpenPgpReader inherits Rectangle {
+    visible: AccountMailPreferences.reader-open;
+    background: AppTheme.surface;
+    VerticalBox {
+        padding: 24px; spacing: 12px;
+        Text { min-height: self.preferred-height; vertical-stretch: 0; text: @tr("OpenPGP message"); color: AppTheme.heading; font-size: TypeScale.subtitle; font-weight: 700; }
+        Text { min-height: self.preferred-height; vertical-stretch: 0; text: AccountMailPreferences.reader-status; color: AppTheme.secondary; wrap: word-wrap; }
+        TextEdit { wrap: word-wrap; vertical-stretch: 1; read-only: true; text: AccountMailPreferences.reader-text; }
+        Text { min-height: self.preferred-height; vertical-stretch: 0; text: @tr("Decrypted content is shown as text, without remote content. It is not added to search or saved to the mail database."); color: AppTheme.secondary; wrap: word-wrap; }
+        Button { text: @tr("Export decrypted message"); enabled: AccountMailPreferences.reader-text != ""; clicked => { AccountMailPreferences.export-message(); } }
+        Button { text: @tr("Close"); clicked => { AccountMailPreferences.close-reader(); AccountMailPreferences.reader-open = false; AccountMailPreferences.reader-text = ""; AccountMailPreferences.reader-status = ""; } }
+    }
+}

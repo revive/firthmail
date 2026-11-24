@@ -1,0 +1,6 @@
+{
+  "version": "1.19.0",
+  "revision": "e436f546f71481d786cbc2a74316b1be1ef678c1",
+  "sha256": "ecb1104c0220c068772ff60912a3dac80b95e1d491d801836256c870245a2162",
+  "smithay_clipboard": "0.7.2"
+}

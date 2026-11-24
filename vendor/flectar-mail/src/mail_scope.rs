@@ -1,0 +1,625 @@
+//! Typed mail navigation scopes.
+//!
+//! Slint models, saved tabs and the warm-start cache carry a scope as an
+//! opaque string key. Rust parses that key once at the boundary and otherwise
+//! works with [`Scope`], so a selection never depends on display names and
+//! every consumer handles every kind of mailbox exhaustively.
+
+use crate::MailboxRole;
+use flectar_mail_core::autolabel::Category;
+use flectar_mail_core::models::{Account, Label};
+use std::{fmt, str::FromStr};
+
+/// Mailboxes every account presents, in sidebar order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum StandardMailbox {
+    Inbox,
+    Starred,
+    Sent,
+    Archive,
+    Spam,
+    Trash,
+    Drafts,
+}
+
+impl StandardMailbox {
+    pub(crate) const ALL: [Self; 7] = [
+        Self::Inbox,
+        Self::Starred,
+        Self::Sent,
+        Self::Archive,
+        Self::Spam,
+        Self::Trash,
+        Self::Drafts,
+    ];
+
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::Inbox => "Inbox",
+            Self::Starred => "Starred",
+            Self::Sent => "Sent",
+            Self::Archive => "Archive",
+            Self::Spam => "Spam",
+            Self::Trash => "Trash",
+            Self::Drafts => "Drafts",
+        }
+    }
+
+    pub(crate) fn from_label(label: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|mailbox| mailbox.label() == label)
+    }
+
+    /// The window names the mailbox by its role, in its own language.
+    pub(crate) const fn role(self) -> MailboxRole {
+        match self {
+            Self::Inbox => MailboxRole::Inbox,
+            Self::Starred => MailboxRole::Starred,
+            Self::Sent => MailboxRole::Sent,
+            Self::Archive => MailboxRole::Archive,
+            Self::Spam => MailboxRole::Spam,
+            Self::Trash => MailboxRole::Trash,
+            Self::Drafts => MailboxRole::Drafts,
+        }
+    }
+}
+
+/// Which sidebar section a label is listed in. The id alone selects the
+/// label; the kind keeps the key identical to the row that was clicked.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum LabelKind {
+    /// Automatic categories shared by every account.
+    Category,
+    /// Manual labels shared by every account.
+    Global,
+    /// Labels owned by one account.
+    Account,
+}
+
+impl LabelKind {
+    const fn prefix(self) -> &'static str {
+        match self {
+            Self::Category => "Category",
+            Self::Global => "GlobalLabel",
+            Self::Account => "AccountLabel",
+        }
+    }
+
+    /// The section a label with these properties belongs to.
+    pub(crate) const fn of(is_auto: bool, owner_account_id: Option<i64>) -> Self {
+        if is_auto {
+            Self::Category
+        } else if owner_account_id.is_some() {
+            Self::Account
+        } else {
+            Self::Global
+        }
+    }
+}
+
+/// The automatic category a label still is: one of the four the app seeds,
+/// found by the keyword it keeps, under the name the app gave it. The window
+/// names such a category in its own language; a label with a name of its own
+/// keeps that name.
+pub(crate) fn label_category(label: &Label) -> Option<Category> {
+    automatic_category(label.is_auto, &label.keyword, &label.name)
+}
+
+/// [`label_category`] for a label's own properties.
+pub(crate) fn automatic_category(is_auto: bool, keyword: &str, name: &str) -> Option<Category> {
+    Category::from_keyword(keyword).filter(|category| is_auto && name == category.default_name())
+}
+
+/// The automatic category with this built-in name, whichever label it is.
+pub(crate) fn category_named(name: &str) -> Option<Category> {
+    Category::ALL
+        .into_iter()
+        .find(|category| category.default_name() == name)
+}
+
+/// The window names an automatic category by its role, in its own language.
+pub(crate) const fn category_role(category: Category) -> MailboxRole {
+    match category {
+        Category::Marketing => MailboxRole::Marketing,
+        Category::News => MailboxRole::News,
+        Category::Social => MailboxRole::Social,
+        Category::Pitch => MailboxRole::Pitch,
+    }
+}
+
+/// The role the window names a label by: its automatic category's, or none.
+pub(crate) fn label_role(label: &Label) -> MailboxRole {
+    label_category(label).map_or(MailboxRole::None, category_role)
+}
+
+/// A selectable mail view.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum Scope {
+    /// One standard mailbox across every account.
+    Unified(StandardMailbox),
+    /// Gmail-style split inbox, primary half.
+    Important,
+    /// Gmail-style split inbox, remaining half.
+    Other,
+    /// Snoozed conversations of every account, until they come back.
+    Snoozed,
+    /// Drafts of every account waiting to be sent at a time the user chose.
+    Scheduled,
+    Label { kind: LabelKind, id: i64 },
+    /// A provider folder outside the standard mailboxes.
+    Folder(i64),
+    /// One standard mailbox of one account, whether or not the provider
+    /// reported a matching role folder.
+    Account {
+        account_id: i64,
+        mailbox: StandardMailbox,
+    },
+}
+
+impl Default for Scope {
+    fn default() -> Self {
+        Self::UNIFIED_INBOX
+    }
+}
+
+impl Scope {
+    pub(crate) const UNIFIED_INBOX: Self = Self::Unified(StandardMailbox::Inbox);
+
+    pub(crate) const fn label_id(self) -> Option<i64> {
+        match self {
+            Self::Label { id, .. } => Some(id),
+            _ => None,
+        }
+    }
+
+    /// The same place across every shown account: an account's standard
+    /// mailbox becomes the unified one, and its folders and labels the
+    /// unified inbox.
+    #[must_use]
+    pub(crate) const fn unified(self) -> Self {
+        match self {
+            Self::Account { mailbox, .. } => Self::Unified(mailbox),
+            Self::Folder(_)
+            | Self::Label {
+                kind: LabelKind::Account,
+                ..
+            } => Self::UNIFIED_INBOX,
+            Self::Unified(_)
+            | Self::Important
+            | Self::Other
+            | Self::Snoozed
+            | Self::Scheduled
+            | Self::Label { .. } => self,
+        }
+    }
+
+    /// Whether the mail this list shows is in `target` already: the list's
+    /// own mailbox, or the one a unified list or an inbox half shows it from.
+    /// Folders are told apart by scope, since several can have one name.
+    pub(crate) fn shows_mail_in(self, target: Self) -> bool {
+        self == target
+            || matches!(
+                (self, target),
+                (Self::Unified(shown), Self::Account { mailbox, .. }) if shown == mailbox
+            )
+            || matches!(
+                (self, target),
+                (
+                    Self::Important | Self::Other,
+                    Self::Account {
+                        mailbox: StandardMailbox::Inbox,
+                        ..
+                    }
+                )
+            )
+    }
+
+    /// The standard mailbox this scope shows, which the window names in its
+    /// language. Folders and labels have none: they keep their own names.
+    pub(crate) const fn mailbox_role(self) -> MailboxRole {
+        match self {
+            Self::Unified(mailbox) | Self::Account { mailbox, .. } => mailbox.role(),
+            Self::Important => MailboxRole::Important,
+            Self::Other => MailboxRole::Other,
+            Self::Snoozed => MailboxRole::Snoozed,
+            Self::Scheduled => MailboxRole::Scheduled,
+            Self::Label { .. } | Self::Folder(_) => MailboxRole::None,
+        }
+    }
+
+    /// The scope the sidebar can show for these accounts. Unified shortcuts
+    /// are absent with exactly one account, so they resolve to that account's
+    /// own mailbox; the message list is identical. Other scopes and the
+    /// zero/multiple-account cases keep their meaning.
+    #[must_use]
+    pub(crate) fn visible_for(self, accounts: &[Account]) -> Self {
+        match (self, accounts) {
+            (Self::Unified(mailbox), [account]) => Self::Account {
+                account_id: account.id,
+                mailbox,
+            },
+            _ => self,
+        }
+    }
+}
+
+const UNIFIED_PREFIX: &str = "Unified ";
+const FOLDER_PREFIX: &str = "Folder:";
+const ACCOUNT_PREFIX: &str = "Account:";
+
+impl fmt::Display for Scope {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Unified(mailbox) => write!(formatter, "{UNIFIED_PREFIX}{}", mailbox.label()),
+            Self::Important => formatter.write_str("Important"),
+            Self::Other => formatter.write_str("Other"),
+            Self::Snoozed => formatter.write_str("Snoozed"),
+            Self::Scheduled => formatter.write_str("Scheduled"),
+            Self::Label { kind, id } => write!(formatter, "{}:{id}", kind.prefix()),
+            Self::Folder(id) => write!(formatter, "{FOLDER_PREFIX}{id}"),
+            Self::Account {
+                account_id,
+                mailbox,
+            } => write!(formatter, "{ACCOUNT_PREFIX}{account_id}:{}", mailbox.label()),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ParseScopeError(String);
+
+impl fmt::Display for ParseScopeError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "unknown mail scope {:?}", self.0)
+    }
+}
+
+impl std::error::Error for ParseScopeError {}
+
+impl FromStr for Scope {
+    type Err = ParseScopeError;
+
+    fn from_str(key: &str) -> Result<Self, Self::Err> {
+        let error = || ParseScopeError(key.to_owned());
+        let id = |value: &str| value.parse::<i64>().map_err(|_| error());
+        if let Some(label) = key.strip_prefix(UNIFIED_PREFIX) {
+            return StandardMailbox::from_label(label)
+                .map(Self::Unified)
+                .ok_or_else(error);
+        }
+        if let Some(folder_id) = key.strip_prefix(FOLDER_PREFIX) {
+            return id(folder_id).map(Self::Folder);
+        }
+        if let Some(rest) = key.strip_prefix(ACCOUNT_PREFIX) {
+            let (account_id, label) = rest.split_once(':').ok_or_else(error)?;
+            return Ok(Self::Account {
+                account_id: id(account_id)?,
+                mailbox: StandardMailbox::from_label(label).ok_or_else(error)?,
+            });
+        }
+        if let Some((prefix, label_id)) = key.split_once(':')
+            && let Some(kind) = [LabelKind::Category, LabelKind::Global, LabelKind::Account]
+                .into_iter()
+                .find(|kind| kind.prefix() == prefix)
+        {
+            return Ok(Self::Label {
+                kind,
+                id: id(label_id)?,
+            });
+        }
+        match key {
+            "Important" => Ok(Self::Important),
+            "Other" => Ok(Self::Other),
+            "Snoozed" => Ok(Self::Snoozed),
+            "Scheduled" => Ok(Self::Scheduled),
+            _ => Err(error()),
+        }
+    }
+}
+
+/// The accounts a manual check for new mail covers in a view owned by
+/// `owner`: that account, or for views that span accounts the `shown` ones.
+/// `None` stands for every account. An owner that is not a connected account,
+/// such as mail kept on this device, has no server to check, so its view
+/// counts as spanning accounts.
+pub(crate) fn accounts_to_check(
+    owner: Option<i64>,
+    connected: &[i64],
+    shown: Option<&[i64]>,
+) -> Option<Vec<i64>> {
+    if let Some(account_id) = owner.filter(|id| connected.contains(id)) {
+        return Some(vec![account_id]);
+    }
+    shown.map(|accounts| {
+        accounts
+            .iter()
+            .copied()
+            .filter(|id| connected.contains(id))
+            .collect()
+    })
+}
+
+impl From<Scope> for String {
+    fn from(scope: Scope) -> Self {
+        scope.to_string()
+    }
+}
+
+impl From<Scope> for slint::SharedString {
+    fn from(scope: Scope) -> Self {
+        scope.to_string().into()
+    }
+}
+
+impl TryFrom<String> for Scope {
+    type Error = ParseScopeError;
+
+    fn try_from(key: String) -> Result<Self, Self::Error> {
+        key.parse()
+    }
+}
+
+impl serde::Serialize for Scope {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(self)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for Scope {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let key = String::deserialize(deserializer)?;
+        key.parse().map_err(serde::de::Error::custom)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mail_shown_is_in_its_own_mailbox_not_in_one_of_the_same_name() {
+        let inbox = |account_id| Scope::Account {
+            account_id,
+            mailbox: StandardMailbox::Inbox,
+        };
+        let archive = Scope::Account {
+            account_id: 1,
+            mailbox: StandardMailbox::Archive,
+        };
+        assert!(Scope::Folder(5).shows_mail_in(Scope::Folder(5)));
+        assert!(!Scope::Folder(5).shows_mail_in(Scope::Folder(6)));
+        assert!(!Scope::Folder(5).shows_mail_in(archive));
+        assert!(!archive.shows_mail_in(Scope::Folder(5)));
+        assert!(Scope::Unified(StandardMailbox::Archive).shows_mail_in(archive));
+        assert!(!Scope::Unified(StandardMailbox::Inbox).shows_mail_in(archive));
+        assert!(Scope::UNIFIED_INBOX.shows_mail_in(inbox(2)));
+        assert!(Scope::Important.shows_mail_in(inbox(1)));
+        assert!(Scope::Other.shows_mail_in(inbox(1)));
+        assert!(!Scope::Important.shows_mail_in(archive));
+        assert!(!inbox(1).shows_mail_in(inbox(2)));
+    }
+    use flectar_mail_core::models::{AuthKind, MailProtocol, Provider};
+
+    fn account(id: i64) -> Account {
+        Account {
+            id,
+            email: format!("{id}@example.test"),
+            display_name: Some("Work / Unified Folder:1".into()),
+            name: None,
+            avatar_url: None,
+            provider: Provider::Generic,
+            auth_kind: AuthKind::Password,
+            mail_protocol: MailProtocol::Imap,
+            sync_state: "idle".into(),
+            sync_error: None,
+            sync_retry_at: None,
+            can_create_top_level_mailbox: true,
+            server_keeps_mail_days: None,
+            caught_up_at: None,
+        }
+    }
+
+    fn every_scope() -> Vec<Scope> {
+        let mut scopes = vec![
+            Scope::Important,
+            Scope::Other,
+            Scope::Snoozed,
+            Scope::Scheduled,
+            Scope::Folder(-3),
+        ];
+        for mailbox in StandardMailbox::ALL {
+            scopes.push(Scope::Unified(mailbox));
+            scopes.push(Scope::Account {
+                account_id: 42,
+                mailbox,
+            });
+        }
+        for kind in [LabelKind::Category, LabelKind::Global, LabelKind::Account] {
+            scopes.push(Scope::Label { kind, id: 7 });
+        }
+        scopes
+    }
+
+    #[test]
+    fn keys_round_trip_and_stay_compatible_with_the_slint_sidebar() {
+        for scope in every_scope() {
+            assert_eq!(scope.to_string().parse::<Scope>(), Ok(scope));
+            let json = serde_json::to_string(&scope).unwrap();
+            assert_eq!(serde_json::from_str::<Scope>(&json).unwrap(), scope);
+        }
+        // ui/components/sidebar.slint builds and compares these keys itself.
+        assert_eq!(Scope::UNIFIED_INBOX.to_string(), "Unified Inbox");
+        assert_eq!(
+            Scope::Unified(StandardMailbox::Trash).to_string(),
+            "Unified Trash"
+        );
+        assert_eq!(
+            Scope::Label {
+                kind: LabelKind::Category,
+                id: 3
+            }
+            .to_string(),
+            "Category:3"
+        );
+        assert_eq!(
+            Scope::Label {
+                kind: LabelKind::Global,
+                id: 3
+            }
+            .to_string(),
+            "GlobalLabel:3"
+        );
+        assert_eq!(
+            Scope::Label {
+                kind: LabelKind::Account,
+                id: 3
+            }
+            .to_string(),
+            "AccountLabel:3"
+        );
+    }
+
+    #[test]
+    fn only_an_unrenamed_automatic_category_is_named_by_its_role() {
+        let label = |is_auto, keyword: &str, name: &str| Label {
+            id: 1,
+            name: name.into(),
+            color: String::new(),
+            keyword: keyword.into(),
+            position: 0,
+            owner_account_id: None,
+            is_auto,
+        };
+        for (category, role) in [
+            (Category::Marketing, MailboxRole::Marketing),
+            (Category::News, MailboxRole::News),
+            (Category::Social, MailboxRole::Social),
+            (Category::Pitch, MailboxRole::Pitch),
+        ] {
+            let seeded = label(true, category.keyword(), category.default_name());
+            assert_eq!(label_category(&seeded), Some(category));
+            assert_eq!(label_role(&seeded), role);
+            assert_eq!(category_role(category), role);
+            assert_eq!(category_named(category.default_name()), Some(category));
+            assert_eq!(Category::from_keyword(category.keyword()), Some(category));
+            // The user's own name, a manual label, and a name with no
+            // keyword behind it keep what they have.
+            for other in [
+                label(true, category.keyword(), "Mine"),
+                label(
+                    true,
+                    category.keyword(),
+                    &category.default_name().to_lowercase(),
+                ),
+                label(false, category.keyword(), category.default_name()),
+                label(true, "", category.default_name()),
+                label(true, "FlectarMailAutoOther", category.default_name()),
+            ] {
+                assert_eq!(label_category(&other), None, "{other:?}");
+                assert_eq!(label_role(&other), MailboxRole::None);
+            }
+        }
+        // A category is not told by its name for another's keyword.
+        assert_eq!(
+            label_category(&label(true, Category::News.keyword(), "Social")),
+            None
+        );
+        assert_eq!(category_named("Inbox"), None);
+        // Every category is a standard role of its own.
+        let roles = Category::ALL.map(category_role);
+        assert!(roles.iter().all(|role| *role != MailboxRole::None));
+        assert!(
+            roles
+                .iter()
+                .enumerate()
+                .all(|(index, role)| !roles[..index].contains(role))
+        );
+        // Scopes name mailboxes, not labels, so a label scope has no role.
+        assert_eq!(
+            Scope::Label {
+                kind: LabelKind::Category,
+                id: 1
+            }
+            .mailbox_role(),
+            MailboxRole::None
+        );
+    }
+
+    #[test]
+    fn malformed_and_display_name_keys_are_rejected() {
+        for key in [
+            "",
+            "Unified",
+            "Unified Unknown",
+            "Folder:",
+            "Folder:x",
+            "Account:1",
+            "Account:x:Inbox",
+            "Account:1:Custom",
+            "Label:4",
+            "Category:",
+            "Person / Inbox",
+            "Person",
+            "inbox",
+        ] {
+            assert!(key.parse::<Scope>().is_err(), "{key:?}");
+        }
+        assert!(serde_json::from_str::<Scope>("\"Person / Inbox\"").is_err());
+    }
+
+    #[test]
+    fn an_accounts_places_unify_to_the_same_mailbox_or_the_inbox() {
+        for scope in every_scope() {
+            let expected = match scope {
+                Scope::Account { mailbox, .. } => Scope::Unified(mailbox),
+                Scope::Folder(_)
+                | Scope::Label {
+                    kind: LabelKind::Account,
+                    ..
+                } => Scope::UNIFIED_INBOX,
+                other => other,
+            };
+            assert_eq!(scope.unified(), expected, "{scope}");
+        }
+    }
+
+    #[test]
+    fn unified_scopes_resolve_to_the_only_account() {
+        for scope in every_scope() {
+            let expected = match scope {
+                Scope::Unified(mailbox) => Scope::Account {
+                    account_id: 9,
+                    mailbox,
+                },
+                other => other,
+            };
+            assert_eq!(scope.visible_for(&[account(9)]), expected);
+            assert_eq!(scope.visible_for(&[]), scope);
+            assert_eq!(scope.visible_for(&[account(9), account(10)]), scope);
+            assert_eq!(expected.visible_for(&[account(9)]), expected);
+        }
+    }
+
+    #[test]
+    fn a_manual_check_covers_the_account_in_view_or_the_shown_ones() {
+        let connected = [1, 2, 3];
+        // An account's own folder, label or mailbox checks that account.
+        assert_eq!(accounts_to_check(Some(2), &connected, None), Some(vec![2]));
+        assert_eq!(
+            accounts_to_check(Some(2), &connected, Some(&[1, 3])),
+            Some(vec![2])
+        );
+        // Unified views check every account, or the active profile's.
+        assert_eq!(accounts_to_check(None, &connected, None), None);
+        assert_eq!(
+            accounts_to_check(None, &connected, Some(&[1, 3])),
+            Some(vec![1, 3])
+        );
+        // Mail on this device has no server: its folders check what the
+        // unified views would, and a profile never names a removed account.
+        assert_eq!(accounts_to_check(Some(9), &connected, None), None);
+        assert_eq!(
+            accounts_to_check(Some(9), &connected, Some(&[3, 4])),
+            Some(vec![3])
+        );
+    }
+}

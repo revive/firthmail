@@ -1,0 +1,18 @@
+# ---- 构建产物 ----
+/target/
+/apps/desktop/node_modules/
+/apps/desktop/dist/
+/apps/desktop/src-tauri/gen/schemas/
+
+# ---- 本机数据（含真实邮件，绝不入库）----
+/out/
+/test-out/
+/test-out-inbox/
+
+# ---- 零碎 ----
+*.log
+*.tmp
+*.partial
+.DS_Store
+Thumbs.db
+desktop.ini

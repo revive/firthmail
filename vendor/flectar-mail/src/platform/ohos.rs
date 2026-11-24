@@ -1,0 +1,141 @@
+//! OpenHarmony integration used by platform/ohos. The ArkTS shell and the
+//! XComponent Slint backend live in that host tree; this module only holds
+//! what the shared application needs at runtime.
+
+use flectar_mail_core::models::AppIcon;
+use std::{
+    path::PathBuf,
+    sync::{
+        OnceLock,
+        atomic::{AtomicBool, Ordering},
+    },
+};
+
+static PDFIUM_LIBRARY: OnceLock<PathBuf> = OnceLock::new();
+
+/// Names this platform to the settings that describe it.
+pub(crate) const NAME: &str = "ohos";
+
+/// The native window is the app while the page is showing; account changes
+/// that request notification permission come from that foreground session.
+pub(crate) fn app_is_active() -> bool {
+    true
+}
+
+/// OpenHarmony has no spell checker for apps.
+pub(crate) const CHECKS_SPELLING: bool = false;
+
+pub(crate) fn spell_checker() -> Option<std::sync::Arc<dyn crate::spelling::Checker>> {
+    None
+}
+
+/// Supply the application's native library directory (the hap's `libs/<abi>`,
+/// which the host derives from its own loaded module path). Never a
+/// document-controlled path.
+pub fn configure_pdfium(directory: PathBuf) -> Result<(), String> {
+    if !directory.is_absolute() {
+        return Err("OpenHarmony did not provide an absolute native library directory.".into());
+    }
+    let path = directory.join("libpdfium.so");
+    if let Some(existing) = PDFIUM_LIBRARY.get() {
+        return if existing == &path {
+            Ok(())
+        } else {
+            Err("PDF library directory changed.".into())
+        };
+    }
+    PDFIUM_LIBRARY
+        .set(path)
+        .map_err(|_| "PDF library already configured.".into())
+}
+
+/// `onMemoryLevel` from the ability, forwarded by the page.
+pub fn memory_level(level: i32) {
+    if let Some(pressure) = super::memory_levels::ohos_memory_level(level) {
+        crate::memory::memory_pressure(pressure);
+    }
+}
+
+/// The ability forwards memory levels as they arrive; there is nothing to
+/// subscribe to.
+pub(crate) fn watch_memory_pressure() {}
+
+/// OpenHarmony's C library stubs `mallopt` and has no `malloc_trim`, so only
+/// the app's own caches can be released.
+pub(crate) fn purge_allocator(_purge: crate::memory::Purge) {}
+
+pub(crate) fn pdfium_library() -> Result<PathBuf, String> {
+    PDFIUM_LIBRARY
+        .get()
+        .cloned()
+        .ok_or_else(|| "PDF preview is not configured.".into())
+}
+
+/// The slint-ohos backend installs the platform (and selects the renderer
+/// itself, with an automatic software fallback) before entering the shared
+/// application, so only the renderer name is reported here.
+pub(crate) fn select_renderer() -> Result<&'static str, slint::PlatformError> {
+    Ok("software")
+}
+
+pub(crate) fn lower_current_thread_priority() {
+    // SAFETY: nice only adjusts the calling thread's scheduling priority.
+    unsafe {
+        libc::nice(10);
+    }
+}
+
+/// Preview lifecycle is owned by the ArkTS shell.
+pub(crate) fn install_preview_lifecycle() {}
+
+/// Switching the home screen icon is a system API on OpenHarmony
+/// (`bundleManager.enableDynamicIcon`), so Settings does not offer the choice.
+pub(crate) const SWITCHES_APP_ICON: bool = false;
+
+/// Only the default icon reaches here; see [`SWITCHES_APP_ICON`].
+pub(crate) fn show_app_icon(_icon: AppIcon) {}
+
+static EMAIL_FONTS: OnceLock<super::EmailFonts> = OnceLock::new();
+
+/// Supply the platform fonts and the fallback policy the backend applies to
+/// the Slint UI, before the application starts. OpenHarmony ships no
+/// Fontconfig, so the email renderer and the composer load them explicitly.
+pub fn configure_email_fonts(fonts: super::EmailFonts) {
+    let _ = EMAIL_FONTS.set(fonts);
+}
+
+pub(crate) fn email_fonts() -> Option<&'static super::EmailFonts> {
+    EMAIL_FONTS.get()
+}
+
+/// Whether this build may send people to the web checkout for Flectar Mail Sync.
+/// HarmonyOS apps ship only through AppGallery, which requires Huawei's
+/// in-app purchases, so this build only shows what the group pays.
+pub(crate) fn sells_sync() -> bool {
+    false
+}
+
+/// How this device appears in Flectar Mail Sync's device list.
+pub(crate) fn device_description() -> flectar_mail_core::device_sync::DeviceDescription {
+    flectar_mail_core::device_sync::DeviceDescription {
+        platform: "harmonyos".to_owned(),
+        ..Default::default()
+    }
+}
+
+/// The animation reduction setting, as the page last reported it.
+static REDUCE_MOTION: AtomicBool = AtomicBool::new(false);
+
+/// The page reports animation reduction, from the accessibility settings of
+/// API 23 and later, when it shows and whenever the setting changes.
+pub fn set_reduce_motion(reduced: bool) {
+    REDUCE_MOTION.store(reduced, Ordering::Relaxed);
+    crate::motion::system_changed();
+}
+
+pub(crate) fn reduce_motion() -> bool {
+    REDUCE_MOTION.load(Ordering::Relaxed)
+}
+
+/// Changes arrive through `set_reduce_motion`.
+pub(crate) fn watch_reduce_motion() {}

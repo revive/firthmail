@@ -1,0 +1,894 @@
+//! Bounded database work for interactive mail navigation and mutations.
+use super::*;
+
+#[derive(Clone)]
+struct PageRequest {
+    core: CoreMailSource,
+    scope: Scope,
+    query: String,
+    limit: i64,
+    /// Where the rows start: the list's start, after a cursor, or at a row.
+    from: PageStart,
+}
+
+#[derive(Clone, Copy)]
+enum PageStart {
+    Cursor(Option<MailCursor>),
+    Row(i32),
+}
+
+/// Rows the mail store returns from one read of a mailbox, and of a search.
+/// Rows loaded beyond this keep the merge's retained tail.
+const MAX_REFRESH_ROWS: usize = 200;
+const MAX_SEARCH_REFRESH_ROWS: usize = 100;
+
+/// Rows a refresh of `loaded` rows re-reads: every loaded row up to what one
+/// read returns, so read state, stars and removals reach rows past the first
+/// page and a restored tab's cached rows come back current. Exactly the loaded
+/// count, so the list grows only by the mail that arrives.
+pub(super) fn refresh_limit(loaded: usize, query: &str) -> i64 {
+    let most = if query.trim().is_empty() {
+        MAX_REFRESH_ROWS
+    } else {
+        MAX_SEARCH_REFRESH_ROWS
+    };
+    i64::try_from(loaded.clamp(PAGE_SIZE, most)).unwrap_or(PAGE_SIZE as i64)
+}
+
+pub(super) struct MailWork {
+    pages: tokio::sync::watch::Sender<Option<(u64, PageRequest)>>,
+    actions: tokio::sync::mpsc::Sender<ActionRequest>,
+    pub generation: u64,
+    pub epoch: u64,
+    pub loading: bool,
+    replace: bool,
+    /// The list was opened at the row a pending selection is for, which
+    /// needs no second try while that selection waits.
+    opened_at_row: bool,
+    moved: HashSet<i32>,
+    pending: HashSet<i32>,
+}
+
+#[derive(Clone)]
+pub(super) enum Operation {
+    Action(String),
+    EmptyTrash(Option<i64>),
+    Drop(MailDropDestination),
+    Label(i64, bool),
+    /// Files mail in one more folder: another of its own account's, where
+    /// a message can be in several (JMAP), or a copy in another account's.
+    Copy {
+        folder_id: i64,
+        other_account: bool,
+    },
+    /// Snoozes the conversation until a time (ms since the epoch), or ends
+    /// its snooze.
+    Snooze(Option<i64>),
+}
+impl Operation {
+    /// Whether it starts moving (`true`) or copying mail to another
+    /// account, which goes on after it returns.
+    fn starts_transfer(&self) -> Option<bool> {
+        match self {
+            Self::Drop(MailDropDestination::Transfer(_)) => Some(true),
+            Self::Copy {
+                other_account: true,
+                ..
+            } => Some(false),
+            _ => None,
+        }
+    }
+
+    /// Whether it marks mail read or unread by hand.
+    fn sets_read_state(&self) -> bool {
+        matches!(self, Self::Action(action) if action == "mark_read" || action == "mark_unread")
+    }
+
+    fn queues_permanent_deletion(&self) -> bool {
+        match self {
+            Self::EmptyTrash(_) => true,
+            Self::Action(action) => action == "delete_permanently",
+            _ => false,
+        }
+    }
+
+    /// Said what it does when asked for, as a snooze with its time does.
+    fn reports_itself(&self) -> bool {
+        matches!(self, Self::Snooze(Some(_)))
+    }
+
+    fn moves(&self) -> bool {
+        match self {
+            Self::Action(a) => matches!(
+                a.as_str(),
+                "archive" | "spam" | "trash" | "not_spam" | "unarchive"
+            ),
+            Self::EmptyTrash(_) => false,
+            // Snoozed mail leaves the inbox; unsnoozed mail leaves Snoozed.
+            Self::Snooze(_) => true,
+            Self::Drop(MailDropDestination::Folder(_)) => true,
+            Self::Drop(MailDropDestination::Action(a)) => Self::Action((*a).into()).moves(),
+            _ => false,
+        }
+    }
+    /// What the notice that offers Undo calls it. Permanent deletion,
+    /// labels, copies and moves to another account have none.
+    fn undo_kind(&self) -> Option<&'static str> {
+        let action = match self {
+            Self::Action(action) => action.as_str(),
+            Self::Drop(MailDropDestination::Action(action)) => *action,
+            Self::Drop(MailDropDestination::Folder(_)) => return Some("move"),
+            _ => return None,
+        };
+        match action {
+            "archive" => Some("archive"),
+            "trash" => Some("trash"),
+            "spam" => Some("spam"),
+            "mark_read" => Some("read"),
+            "mark_unread" => Some("unread"),
+            "star" => Some("star"),
+            "unstar" => Some("unstar"),
+            _ => None,
+        }
+    }
+
+    /// Carry it out, returning the actions it queued that Undo can take back.
+    async fn perform(&self, core: &CoreMailSource, target: MailTarget) -> Result<Vec<i64>, String> {
+        let none = |result: Result<(), String>| result.map(|()| Vec::new());
+        match self {
+            Self::Action(a) => core.perform_message_action(target, a).await,
+            Self::EmptyTrash(account_id) => none(core.empty_trash(*account_id).await),
+            Self::Label(id, add) => none(core.perform_label_action(target, *id, *add).await),
+            Self::Drop(MailDropDestination::Action(a)) => {
+                core.perform_message_action(target, a).await
+            }
+            Self::Drop(MailDropDestination::Folder(id)) => core.move_to_folder(target, *id).await,
+            Self::Drop(MailDropDestination::Transfer(id)) => {
+                none(core.transfer_to_folder(target, *id, true).await)
+            }
+            Self::Copy {
+                folder_id,
+                other_account: true,
+            } => none(core.transfer_to_folder(target, *folder_id, false).await),
+            Self::Copy {
+                folder_id,
+                other_account: false,
+            } => none(core.copy_to_folder(target, *folder_id).await),
+            Self::Drop(MailDropDestination::Label(id)) => {
+                none(core.perform_label_action(target, *id, true).await)
+            }
+            Self::Drop(MailDropDestination::Route(tab)) => {
+                none(core.route_to_tab(target, tab.clone()).await)
+            }
+            Self::Snooze(wake_at) => none(core.snooze(target, *wake_at).await),
+        }
+    }
+}
+struct ActionRequest {
+    core: CoreMailSource,
+    epoch: u64,
+    operations: Vec<(i32, MailTarget, Operation)>,
+}
+/// A batch Undo can take back, as its notice tells of it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct UndoableBatch {
+    /// "archive", "trash", "spam", "move", "read", "unread", "star" or
+    /// "unstar".
+    pub kind: &'static str,
+    /// Whole conversations, rather than single messages.
+    pub conversations: bool,
+    pub count: usize,
+}
+
+struct ActionResult {
+    epoch: u64,
+    ids: Vec<i32>,
+    completed: Vec<i32>,
+    moved: Vec<i32>,
+    /// The actions the batch queued, which Undo takes back.
+    action_ids: Vec<i64>,
+    /// Set when every operation was the same undoable one, and all went.
+    undoable: Option<UndoableBatch>,
+    error: Option<String>,
+    deletion_queued: bool,
+    /// Mail started on its way to another account, moving (`true`) or
+    /// being copied.
+    transfer_started: Option<bool>,
+    /// Every action said what it does when it was asked for, as a snooze
+    /// says when its mail comes back: the status line keeps that.
+    reported: bool,
+}
+
+pub(super) fn register(
+    app: &AppWindow,
+    state: &Rc<RefCell<InboxState>>,
+    runtime: &tokio::runtime::Handle,
+) {
+    let (pages, page_rx) = tokio::sync::watch::channel(None);
+    let (page_tx, mut page_results) = bounded_ui_channel();
+    let updates = UiSender::new(
+        page_tx,
+        UiWake::new(app.as_weak(), |app| app.invoke_drain_navigation_updates()),
+    );
+    runtime.spawn(latest_load::run(
+        page_rx,
+        |request: PageRequest| async move {
+            match request.from {
+                PageStart::Cursor(start) => {
+                    request
+                        .core
+                        .load_page(request.scope, &request.query, start, request.limit, false)
+                        .await
+                }
+                PageStart::Row(row) => {
+                    request
+                        .core
+                        .load_page_from_row(request.scope, row, request.limit)
+                        .await
+                }
+            }
+        },
+        move |generation, result| {
+            let updates = updates.clone();
+            async move {
+                let _ = updates.send((generation, result)).await;
+            }
+        },
+    ));
+    let (actions, mut action_rx) = tokio::sync::mpsc::channel::<ActionRequest>(8);
+    let (action_tx, mut action_results) = bounded_ui_channel();
+    let updates = UiSender::new(
+        action_tx,
+        UiWake::new(app.as_weak(), |app| app.invoke_drain_action_updates()),
+    );
+    runtime.spawn(async move {
+        while let Some(request) = action_rx.recv().await {
+            let core = request.core;
+            let result = collect_results(
+                request.epoch,
+                request.operations,
+                move |target, operation| {
+                    let core = core.clone();
+                    async move { operation.perform(&core, target).await }
+                },
+            )
+            .await;
+            if updates.send(result).await.is_err() {
+                break;
+            }
+        }
+    });
+    state.borrow_mut().mail_work = Some(MailWork {
+        pages,
+        actions,
+        generation: 0,
+        epoch: 0,
+        loading: false,
+        replace: false,
+        opened_at_row: false,
+        moved: HashSet::new(),
+        pending: HashSet::new(),
+    });
+    let weak = app.as_weak();
+    let page_state = state.clone();
+    let page_runtime = runtime.clone();
+    app.on_drain_navigation_updates(move || {
+        let Some(app) = weak.upgrade() else {
+            return;
+        };
+        while let Ok((generation, result)) = page_results.try_recv() {
+            let projection = {
+                let mut state = page_state.borrow_mut();
+                let work = state.mail_work.as_mut().unwrap();
+                if generation != work.generation {
+                    continue;
+                }
+                work.loading = false;
+                // Keep move exclusions and replacement intent after an error so a retry
+                // cannot resurrect an archived message in the retained pagination tail.
+                result.is_ok().then(|| {
+                    (
+                        std::mem::take(&mut work.replace),
+                        std::mem::take(&mut work.moved)
+                            .into_iter()
+                            .collect::<Vec<_>>(),
+                    )
+                })
+            };
+            app.set_mail_page_loading(false);
+            let page = match result {
+                Ok(page) => page,
+                Err(error) => {
+                    app.set_render_status(UiMessage::detail("Mail refresh failed: {}", error));
+                    continue;
+                }
+            };
+            if !snapshot_is_current(&page_state, page.account_revision) {
+                continue;
+            }
+            let (replace, moved) = projection.unwrap();
+            if replace {
+                let mut state = page_state.borrow_mut();
+                state.messages = page.messages;
+                state.list_order = page.order;
+                state.window_start = page.start;
+                state.labels = page.labels;
+                state.next_cursor = page.next_cursor;
+                let unseen = state.pending_selection.filter(|id| {
+                    state.next_cursor.is_some() && !state.messages.iter().any(|row| row.id == *id)
+                });
+                // A restored tab whose conversation is not on the first page
+                // looks as far down as one read goes.
+                if unseen.is_some() && state.messages.len() <= PAGE_SIZE {
+                    drop(state);
+                    if let Err(error) = reload(&app, &page_state, &page_runtime, usize::MAX) {
+                        app.set_render_status(UiMessage::detail("Mail refresh failed: {}", error));
+                    }
+                    continue;
+                }
+                // New mail a notification opens is at the end of a list shown
+                // oldest first, further down than that in a long one. The list
+                // opens at it instead, with the rows before it on request.
+                let opened_at_row = state
+                    .mail_work
+                    .as_ref()
+                    .is_some_and(|work| work.opened_at_row);
+                if let Some(id) = unseen
+                    && state.pending_selection_opens
+                    && state.list_order == ListOrder::OldestFirst
+                    && !opened_at_row
+                {
+                    drop(state);
+                    if let Err(error) = open_at_row(&app, &page_state, &page_runtime, id) {
+                        app.set_render_status(UiMessage::detail("Mail refresh failed: {}", error));
+                    }
+                    continue;
+                }
+                // A restored tab reopens its conversation if it is still in
+                // the loaded rows, and otherwise shows an empty reader rather
+                // than an unrelated first row.
+                let opens = std::mem::take(&mut state.pending_selection_opens);
+                let mut open = None;
+                if let Some(work) = state.mail_work.as_mut() {
+                    work.opened_at_row = false;
+                }
+                if let Some(id) = state.pending_selection.take() {
+                    let found = state.messages.iter().any(|row| row.id == id);
+                    state.selected_id = found.then_some(id);
+                    state.preview_closed = !found;
+                    if !found {
+                        state.restore_thread_message = None;
+                    }
+                    open = (found && opens).then_some(id);
+                }
+                drop(state);
+                // A background tab's conversation is opened as it is shown.
+                if let Some(id) = open {
+                    app.invoke_select_email(id);
+                } else if let Err(error) = render_current(&app, &page_state, &page_runtime) {
+                    app.set_render_status(UiMessage::detail("Mail refresh failed: {}", error));
+                }
+            } else {
+                apply_background_mail_page(&app, &page_state, &page_runtime, page, &moved);
+            }
+            app.set_mail_list_revision(app.get_mail_list_revision().wrapping_add(1));
+        }
+        // A core-event refresh waits while a navigation load runs.
+        app.invoke_drain_core_updates();
+    });
+    let weak = app.as_weak();
+    let action_state = state.clone();
+    let action_runtime = runtime.clone();
+    app.on_drain_action_updates(move || {
+        let Some(app) = weak.upgrade() else {
+            return;
+        };
+        while let Ok(result) = action_results.try_recv() {
+            let same_view = {
+                let mut state = action_state.borrow_mut();
+                let work = state.mail_work.as_mut().unwrap();
+                for id in &result.ids {
+                    work.pending.remove(id);
+                }
+                let same_view = work.epoch == result.epoch;
+                if same_view {
+                    for id in &result.completed {
+                        state.checked_ids.remove(id);
+                    }
+                }
+                same_view
+            };
+            if same_view && !result.completed.is_empty() {
+                refresh_rows_only(&app, &action_state, &action_runtime);
+            }
+            if same_view
+                && !result.completed.is_empty()
+                && let Err(error) =
+                    refresh_from_source(&app, &action_state, &action_runtime, true, &result.moved)
+            {
+                app.set_render_status(UiMessage::detail("Mail refresh failed: {}", error));
+                continue;
+            }
+            match result.error {
+                Some(error) => {
+                    app.set_render_status(UiMessage::detail("Message action failed: {}", error))
+                }
+                // What became of it is told once the other account has it.
+                None if result.transfer_started == Some(true) => {
+                    app.set_render_status(UiMessage::plain("Moving mail to the other account…"))
+                }
+                None if result.transfer_started == Some(false) => {
+                    app.set_render_status(UiMessage::plain("Copying mail to the other account…"))
+                }
+                None if result.deletion_queued => app.set_render_status(UiMessage::plain(
+                    "Permanent deletion queued. Mail will disappear after the server confirms.",
+                )),
+                None if result.reported => {}
+                None => match result.undoable {
+                    // Something Undo can take back: its notice tells of it.
+                    Some(batch) => crate::undo::gesture(&app, result.action_ids, batch),
+                    None => app.set_render_status(UiMessage::plain("Message action completed.")),
+                },
+            }
+        }
+        // Core events accumulated during a batch need only one metadata/list refresh.
+        app.invoke_drain_core_updates();
+    });
+}
+
+pub(super) fn refresh(
+    app: &AppWindow,
+    state: &Rc<RefCell<InboxState>>,
+    runtime: &tokio::runtime::Handle,
+    preserve: bool,
+    moved: &[i32],
+) -> Result<(), String> {
+    // A replacement starts over at the first page.
+    let rows = (!preserve).then_some(PAGE_SIZE);
+    load(app, state, runtime, preserve, moved, rows)
+}
+
+/// Merge up to `rows` rows into the list like any refresh, when new mail
+/// filled one before it reached a loaded row.
+pub(super) fn refresh_rows(
+    app: &AppWindow,
+    state: &Rc<RefCell<InboxState>>,
+    runtime: &tokio::runtime::Handle,
+    rows: usize,
+    moved: &[i32],
+) -> Result<(), String> {
+    load(app, state, runtime, true, moved, Some(rows))
+}
+
+/// Replace the list with up to `rows` rows (at least a page, at most one
+/// read), for a tab that returns to a conversation further down.
+pub(super) fn reload(
+    app: &AppWindow,
+    state: &Rc<RefCell<InboxState>>,
+    runtime: &tokio::runtime::Handle,
+    rows: usize,
+) -> Result<(), String> {
+    load(app, state, runtime, false, &[], Some(rows))
+}
+
+/// Replace the list with its rows from row `id` on.
+fn open_at_row(
+    app: &AppWindow,
+    state: &Rc<RefCell<InboxState>>,
+    runtime: &tokio::runtime::Handle,
+    id: i32,
+) -> Result<(), String> {
+    load_from(app, state, runtime, false, &[], None, PageStart::Row(id))
+}
+
+fn load(
+    app: &AppWindow,
+    state: &Rc<RefCell<InboxState>>,
+    runtime: &tokio::runtime::Handle,
+    preserve: bool,
+    moved: &[i32],
+    rows: Option<usize>,
+) -> Result<(), String> {
+    // A refresh reads from where the rows start; anything else starts over
+    // at the list's start.
+    let start = preserve.then(|| state.borrow().window_start).flatten();
+    load_from(
+        app,
+        state,
+        runtime,
+        preserve,
+        moved,
+        rows,
+        PageStart::Cursor(start),
+    )
+}
+
+fn load_from(
+    app: &AppWindow,
+    state: &Rc<RefCell<InboxState>>,
+    runtime: &tokio::runtime::Handle,
+    preserve: bool,
+    moved: &[i32],
+    rows: Option<usize>,
+    from: PageStart,
+) -> Result<(), String> {
+    {
+        let mut state = state.borrow_mut();
+        let request = PageRequest {
+            core: state.core.clone().ok_or("mail core is unavailable")?,
+            scope: state.scope,
+            query: state.query.clone(),
+            limit: refresh_limit(rows.unwrap_or(state.messages.len()), &state.query),
+            from,
+        };
+        let selection_waits = state.pending_selection.is_some();
+        let work = state
+            .mail_work
+            .as_mut()
+            .ok_or("mail workers are unavailable")?;
+        work.generation = work.generation.wrapping_add(1);
+        if !preserve {
+            work.epoch = work.epoch.wrapping_add(1);
+            work.moved.clear();
+            work.replace = true;
+            if matches!(from, PageStart::Row(_)) {
+                work.opened_at_row = true;
+            } else if !selection_waits {
+                work.opened_at_row = false;
+            }
+        }
+        work.moved.extend(moved);
+        work.loading = true;
+        work.pages.send_replace(Some((work.generation, request)));
+        if !preserve {
+            state.messages.clear();
+            state.selected_id = None;
+            state.next_cursor = None;
+            state.window_start = None;
+        }
+    }
+    if !preserve {
+        app.set_mail_page_loading(true);
+        render_current(app, state, runtime)?;
+    }
+    Ok(())
+}
+
+pub(super) fn enqueue(
+    state: &Rc<RefCell<InboxState>>,
+    core: CoreMailSource,
+    operations: Vec<(i32, MailTarget, Operation)>,
+) -> Result<(), String> {
+    if operations.is_empty() {
+        return Err("no message is selected".into());
+    }
+    if operations.len() > 10_000 {
+        return Err("select at most 10000 messages per action".into());
+    }
+    // Marking by hand settles the read state: a wait for the open message
+    // mustn't change it afterwards.
+    if operations
+        .iter()
+        .any(|(_, _, operation)| operation.sets_read_state())
+    {
+        crate::read_marking::cancel();
+    }
+    let mut state = state.borrow_mut();
+    let work = state
+        .mail_work
+        .as_mut()
+        .ok_or("mail workers are unavailable")?;
+    let ids: Vec<_> = operations.iter().map(|(id, _, _)| *id).collect();
+    enqueue_batch(
+        &work.actions,
+        &mut work.pending,
+        &ids,
+        ActionRequest {
+            core,
+            epoch: work.epoch,
+            operations,
+        },
+    )
+}
+
+pub(super) fn accepts_background(state: &InboxState, generation: u64) -> bool {
+    state
+        .mail_work
+        .as_ref()
+        .is_none_or(|work| !work.loading && work.generation == generation)
+}
+pub(super) fn generation(state: &InboxState) -> u64 {
+    state.mail_work.as_ref().map_or(0, |work| work.generation)
+}
+
+/// A navigation load is in flight; its result supersedes a background one.
+pub(super) fn loading(state: &InboxState) -> bool {
+    state.mail_work.as_ref().is_some_and(|work| work.loading)
+}
+
+/// A load that replaces the list is in flight, so the list is empty until it
+/// lands.
+pub(super) fn replacing(state: &InboxState) -> bool {
+    state
+        .mail_work
+        .as_ref()
+        .is_some_and(|work| work.loading && work.replace)
+}
+
+pub(super) fn invalidate(state: &mut InboxState) {
+    if let Some(work) = state.mail_work.as_mut() {
+        work.generation = work.generation.wrapping_add(1);
+        work.epoch = work.epoch.wrapping_add(1);
+        work.loading = false;
+        work.replace = false;
+        work.moved.clear();
+        work.pages.send_replace(None);
+    }
+}
+
+async fn collect_results<F, Fut>(
+    epoch: u64,
+    operations: Vec<(i32, MailTarget, Operation)>,
+    perform: F,
+) -> ActionResult
+where
+    F: Fn(MailTarget, Operation) -> Fut,
+    Fut: std::future::Future<Output = Result<Vec<i64>, String>>,
+{
+    let undo_kind = operations
+        .first()
+        .and_then(|(_, _, operation)| operation.undo_kind())
+        .filter(|kind| {
+            operations
+                .iter()
+                .all(|(_, _, operation)| operation.undo_kind() == Some(*kind))
+        });
+    let conversations = operations
+        .iter()
+        .all(|(_, target, _)| matches!(target, MailTarget::Thread(_)));
+    let mut result = ActionResult {
+        epoch,
+        ids: vec![],
+        completed: vec![],
+        moved: vec![],
+        action_ids: vec![],
+        undoable: None,
+        error: None,
+        deletion_queued: false,
+        transfer_started: None,
+        reported: true,
+    };
+    for (id, target, operation) in operations {
+        result.reported &= operation.reports_itself();
+        let deletion = operation.queues_permanent_deletion();
+        let transfer = operation.starts_transfer();
+        result.ids.push(id);
+        let moves = operation.moves();
+        match perform(target, operation).await {
+            Ok(action_ids) => {
+                result.action_ids.extend(action_ids);
+                result.deletion_queued |= deletion;
+                result.transfer_started = result.transfer_started.or(transfer);
+                result.completed.push(id);
+                if moves {
+                    result.moved.push(id);
+                }
+            }
+            Err(error) => {
+                result.error.get_or_insert(error);
+            }
+        }
+    }
+    if result.error.is_none() && !result.action_ids.is_empty() {
+        result.undoable = undo_kind.map(|kind| UndoableBatch {
+            kind,
+            conversations,
+            count: result.completed.len(),
+        });
+    }
+    result
+}
+
+fn enqueue_batch<T>(
+    sender: &tokio::sync::mpsc::Sender<T>,
+    pending: &mut HashSet<i32>,
+    ids: &[i32],
+    request: T,
+) -> Result<(), String> {
+    if ids.iter().any(|id| pending.contains(id)) {
+        return Err("a message action is already pending".into());
+    }
+    sender
+        .try_send(request)
+        .map_err(|_| "mail action queue is busy; retry shortly".to_owned())?;
+    pending.extend(ids);
+    Ok(())
+}
+
+pub(super) fn actions_pending(state: &InboxState) -> bool {
+    state
+        .mail_work
+        .as_ref()
+        .is_some_and(|work| !work.pending.is_empty())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn full_queue_rejects_without_reserving_ids_and_duplicate_actions_are_rejected() {
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+        let mut pending = HashSet::new();
+        enqueue_batch(&sender, &mut pending, &[1, 2], "first").unwrap();
+        assert!(enqueue_batch(&sender, &mut pending, &[2], "duplicate").is_err());
+        assert!(enqueue_batch(&sender, &mut pending, &[3], "full").is_err());
+        assert_eq!(pending, HashSet::from([1, 2]));
+        assert_eq!(receiver.try_recv().unwrap(), "first");
+        enqueue_batch(&sender, &mut pending, &[3], "retry").unwrap();
+        assert_eq!(receiver.try_recv().unwrap(), "retry");
+    }
+
+    #[test]
+    fn refreshes_reread_every_loaded_row_up_to_one_read() {
+        assert_eq!(refresh_limit(0, ""), PAGE_SIZE as i64);
+        assert_eq!(refresh_limit(PAGE_SIZE + 1, ""), PAGE_SIZE as i64 + 1);
+        assert_eq!(refresh_limit(150, ""), 150);
+        assert_eq!(refresh_limit(100_000, ""), MAX_REFRESH_ROWS as i64);
+        assert_eq!(
+            refresh_limit(150, "invoice"),
+            MAX_SEARCH_REFRESH_ROWS as i64
+        );
+    }
+
+    #[tokio::test]
+    async fn partial_failure_keeps_failed_ids_and_only_removes_successful_moves() {
+        let calls = RefCell::new(Vec::new());
+        let result = collect_results(
+            7,
+            vec![
+                (
+                    1,
+                    MailTarget::Thread(101),
+                    Operation::Action("archive".into()),
+                ),
+                (
+                    2,
+                    MailTarget::Message {
+                        id: 202,
+                        thread_id: 102,
+                    },
+                    Operation::Action("trash".into()),
+                ),
+                (3, MailTarget::Thread(103), Operation::Action("star".into())),
+            ],
+            |target, _| {
+                calls.borrow_mut().push(target.thread_id());
+                async move {
+                    if target.thread_id() == 102 {
+                        Err("database busy".into())
+                    } else {
+                        Ok(vec![target.thread_id() * 10])
+                    }
+                }
+            },
+        )
+        .await;
+        assert_eq!(result.epoch, 7);
+        assert_eq!(result.ids, vec![1, 2, 3]);
+        assert_eq!(result.completed, vec![1, 3]);
+        assert_eq!(result.moved, vec![1]);
+        assert_eq!(result.action_ids, vec![1010, 1030]);
+        // A batch that partly failed offers no Undo.
+        assert_eq!(result.undoable, None);
+        assert_eq!(result.error.as_deref(), Some("database busy"));
+        assert_eq!(*calls.borrow(), vec![101, 102, 103]);
+    }
+
+    #[tokio::test]
+    async fn a_snooze_keeps_the_time_it_reported() {
+        let snooze = |at| vec![(1, MailTarget::Thread(101), Operation::Snooze(at))];
+        let result = collect_results(0, snooze(Some(5_000)), |_, _| async { Ok(Vec::new()) }).await;
+        assert!(result.reported);
+        // Unsnoozing says nothing of its own.
+        let result = collect_results(0, snooze(None), |_, _| async { Ok(Vec::new()) }).await;
+        assert!(!result.reported);
+        let mut mixed = snooze(Some(5_000));
+        mixed.push((
+            2,
+            MailTarget::Thread(102),
+            Operation::Action("archive".into()),
+        ));
+        let result = collect_results(0, mixed, |_, _| async { Ok(Vec::new()) }).await;
+        assert!(!result.reported);
+    }
+
+    #[tokio::test]
+    async fn a_batch_of_one_undoable_action_offers_undo() {
+        let archive = |id: i64| {
+            (
+                0,
+                MailTarget::Thread(id),
+                Operation::Action("archive".into()),
+            )
+        };
+        let queued = |target: MailTarget, _| async move { Ok(vec![target.thread_id()]) };
+        let result = collect_results(1, vec![archive(1), archive(2)], queued).await;
+        assert_eq!(result.action_ids, vec![1, 2]);
+        assert_eq!(
+            result.undoable,
+            Some(UndoableBatch {
+                kind: "archive",
+                conversations: true,
+                count: 2,
+            })
+        );
+
+        // Single messages moved to a folder.
+        let message = MailTarget::Message {
+            id: 5,
+            thread_id: 4,
+        };
+        let moved = collect_results(
+            1,
+            vec![(0, message, Operation::Drop(MailDropDestination::Folder(9)))],
+            queued,
+        )
+        .await;
+        assert_eq!(
+            moved.undoable,
+            Some(UndoableBatch {
+                kind: "move",
+                conversations: false,
+                count: 1,
+            })
+        );
+
+        // Mixed, or past Undo's reach: no notice.
+        let mixed = collect_results(
+            1,
+            vec![
+                archive(1),
+                (0, MailTarget::Thread(2), Operation::Action("star".into())),
+            ],
+            queued,
+        )
+        .await;
+        assert_eq!(mixed.undoable, None);
+        let deleted = collect_results(
+            1,
+            vec![(
+                0,
+                MailTarget::Thread(1),
+                Operation::Action("delete_permanently".into()),
+            )],
+            queued,
+        )
+        .await;
+        assert_eq!(deleted.undoable, None);
+    }
+
+    #[tokio::test]
+    async fn waiting_for_a_mutation_does_not_block_the_executor() {
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let worker_gate = gate.clone();
+        let worker = tokio::spawn(collect_results(
+            0,
+            vec![(
+                1,
+                MailTarget::Thread(101),
+                Operation::Action("archive".into()),
+            )],
+            move |_, _| {
+                let gate = worker_gate.clone();
+                async move {
+                    gate.acquire().await.unwrap().forget();
+                    Ok(Vec::new())
+                }
+            },
+        ));
+        tokio::task::yield_now().await;
+        assert!(!worker.is_finished());
+        gate.add_permits(1);
+        assert_eq!(worker.await.unwrap().completed, vec![1]);
+    }
+}

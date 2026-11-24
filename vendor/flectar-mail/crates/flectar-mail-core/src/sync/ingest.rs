@@ -1,0 +1,587 @@
+//! Importing newly delivered mail, shared by the protocols that download
+//! messages themselves: threading and the message row, contact suggestions,
+//! new-mail notifications, tab routing, and the parsed body. Each protocol
+//! keeps its own rules for recognizing a message it already has.
+
+use super::engine::SyncCtx;
+use crate::db::repo::{
+    self, calendar::NewEvents, messages::NewMessage, sender_identities::OwnAddresses,
+};
+use crate::error::Result;
+use crate::events::CoreEvent;
+use crate::mime::{ParsedBody, ParsedHeaders};
+use crate::models::{AddInvitations, Settings, now_ms, roles};
+use rusqlite::{Connection, OptionalExtension};
+
+/// A message older than this never triggers a new-mail notification, even if
+/// it lands unread, so old mail that a server replays as new stays silent.
+pub(crate) const CHIME_RECENT_MS: i64 = 24 * 60 * 60 * 1000;
+
+/// How long before an account's sync started mail may have reached the
+/// server and still count as arriving live, allowing for a server clock that
+/// runs behind this device's.
+const LIVE_SKEW_MS: i64 = 60_000;
+
+/// The server receipt time from which an account's new mail counts as
+/// arriving live, for a sync that started at `started_at`. Earlier mail came
+/// in while Flectar Mail wasn't following the account; catching up with it
+/// stays silent.
+pub(crate) fn live_since(started_at: i64) -> i64 {
+    started_at.saturating_sub(LIVE_SKEW_MS)
+}
+
+/// How a protocol delivered a message.
+pub(crate) struct Delivery<'a> {
+    pub folder_id: i64,
+    pub folder_role: Option<&'a str>,
+    pub uid: Option<i64>,
+    /// When the server received the message, if it records that.
+    pub received_ms: Option<i64>,
+    pub seen: bool,
+    pub flagged: bool,
+    pub draft: bool,
+    pub has_attachments: bool,
+    pub size: Option<i64>,
+    /// The server says a read receipt was already sent or declined
+    /// ($MDNSent), or the mail is imported and was answered long ago.
+    pub receipt_handled: bool,
+}
+
+/// A message row created by [`Importer::insert`].
+pub(crate) struct Imported {
+    pub message_id: i64,
+    pub thread_id: i64,
+    pub is_read: bool,
+    pub is_outgoing: bool,
+    is_automated: bool,
+    from_email: String,
+    folder_role: Option<String>,
+    /// The server's receipt time, else the message's own date.
+    arrival_ms: i64,
+}
+
+/// One write transaction's worth of imports into an account.
+pub(crate) struct Importer {
+    account_id: i64,
+    settings: Settings,
+    outgoing_learning_since: i64,
+    incoming_learning_since: i64,
+    own_addresses: OwnAddresses,
+    thread_ids: Vec<i64>,
+    /// Threads already queued for a notification, so a thread that gains
+    /// several messages at once notifies once.
+    notified_threads: Vec<i64>,
+}
+
+impl Importer {
+    pub(crate) fn new(conn: &Connection, account_id: i64) -> Result<Self> {
+        let own_addresses = repo::sender_identities::own_addresses(conn, account_id)?;
+        Self::with_own_addresses(conn, account_id, own_addresses)
+    }
+
+    /// For mail sent from addresses other than the account's own, such as
+    /// mail imported from another app.
+    pub(crate) fn with_own_addresses(
+        conn: &Connection,
+        account_id: i64,
+        own_addresses: OwnAddresses,
+    ) -> Result<Self> {
+        let settings = repo::settings::get(conn)?;
+        let (outgoing_learning_since, incoming_learning_since) =
+            repo::contacts::learning_boundaries(conn, account_id, now_ms())?;
+        Ok(Self {
+            account_id,
+            settings,
+            outgoing_learning_since,
+            incoming_learning_since,
+            own_addresses,
+            thread_ids: Vec::new(),
+            notified_threads: Vec::new(),
+        })
+    }
+
+    /// Insert a message the account didn't have, in its thread. Recompute
+    /// the thread and index the message once the protocol has stored the rest
+    /// of what it knows about it.
+    pub(crate) fn insert(
+        &mut self,
+        conn: &Connection,
+        headers: &ParsedHeaders,
+        delivery: &Delivery,
+    ) -> Result<Imported> {
+        let date_ms = headers
+            .date_ms
+            .or(delivery.received_ms)
+            .unwrap_or_else(now_ms);
+        let from_email = headers
+            .from
+            .as_ref()
+            .map(|address| address.email.to_lowercase())
+            .unwrap_or_default();
+        let is_outgoing =
+            self.own_addresses.contains(&from_email) || delivery.folder_role == Some(roles::SENT);
+        let thread_id = super::threading::resolve_thread(conn, self.account_id, headers, date_ms)?;
+        let message = NewMessage {
+            account_id: self.account_id,
+            folder_id: delivery.folder_id,
+            uid: delivery.uid,
+            message_id: headers.message_id.clone(),
+            gm_msgid: None,
+            gm_thrid: None,
+            subject: headers.subject.clone(),
+            from: headers.from.clone(),
+            to: headers.to.clone(),
+            cc: headers.cc.clone(),
+            bcc: headers.bcc.clone(),
+            date: date_ms,
+            internal_date: delivery.received_ms,
+            is_read: delivery.seen || is_outgoing,
+            is_starred: delivery.flagged,
+            is_draft: delivery.draft || delivery.folder_role == Some(roles::DRAFTS),
+            is_outgoing,
+            is_automated: headers.is_automated,
+            has_attachments: delivery.has_attachments,
+            size: delivery.size,
+            snippet: String::new(),
+            references: headers.references.clone(),
+            list_unsubscribe: headers.list_unsubscribe.clone(),
+            list_unsubscribe_post: headers.list_unsubscribe_post.clone(),
+            list_id: headers.list_id.clone(),
+            sender_addr: headers.via.clone(),
+            sender_verification: headers.sender_verification,
+            receipt_to: headers.receipt_to.clone(),
+            receipt_confirm: headers.receipt_confirm,
+            receipt_handled: delivery.receipt_handled,
+            importance: headers.importance,
+        };
+        let message_id = repo::messages::insert(conn, &message, thread_id)?;
+        if !self.thread_ids.contains(&thread_id) {
+            self.thread_ids.push(thread_id);
+        }
+        Ok(Imported {
+            message_id,
+            thread_id,
+            is_read: message.is_read,
+            is_outgoing,
+            is_automated: headers.is_automated,
+            from_email,
+            folder_role: delivery.folder_role.map(str::to_owned),
+            arrival_ms: delivery.received_ms.unwrap_or(date_ms),
+        })
+    }
+
+    /// Learn compose suggestions without polluting the real address book.
+    /// Outgoing recipients are the useful default; incoming senders require
+    /// opt-in and exclude automated and junk mail.
+    pub(crate) fn learn_contacts(
+        &self,
+        conn: &Connection,
+        headers: &ParsedHeaders,
+        imported: &Imported,
+    ) -> Result<()> {
+        let when = imported.arrival_ms;
+        if imported.is_outgoing
+            && self.settings.collect_outgoing_contacts
+            && when >= self.outgoing_learning_since
+        {
+            let mut harvested = std::collections::HashSet::new();
+            for address in headers
+                .to
+                .iter()
+                .chain(headers.cc.iter())
+                .chain(headers.bcc.iter())
+            {
+                let email = address.email.to_ascii_lowercase();
+                if !self.own_addresses.contains(&email) && harvested.insert(email) {
+                    repo::contacts::harvest(conn, self.account_id, address, true, when)?;
+                }
+            }
+        } else if self.settings.collect_incoming_contacts
+            && when >= self.incoming_learning_since
+            && !headers.is_automated
+            && !matches!(
+                imported.folder_role.as_deref(),
+                Some(roles::SPAM) | Some(roles::TRASH)
+            )
+            && let Some(from) = &headers.from
+            && !crate::mime::robot_sender(&from.email)
+        {
+            repo::contacts::harvest(conn, self.account_id, from, false, when)?;
+        }
+        Ok(())
+    }
+
+    /// Hold back the notification [`Self::announce`] would queue while a
+    /// rule waits for the message's body (see `crate::rules::hold`).
+    pub(crate) fn hold(&self, conn: &Connection, imported: &Imported, live: bool) -> Result<()> {
+        if !arrival_eligible(
+            live,
+            imported.is_read,
+            imported.is_outgoing,
+            imported.arrival_ms,
+            now_ms(),
+        ) {
+            return Ok(());
+        }
+        let audible = chime_worthy(imported.is_automated, &imported.from_email);
+        crate::rules::hold(conn, imported.message_id, audible)
+    }
+
+    /// Queue the notification for a live arrival: mail that reached the
+    /// mailbox while the account was being followed, rather than history
+    /// caught up on.
+    pub(crate) fn announce(
+        &mut self,
+        conn: &Connection,
+        imported: &Imported,
+        live: bool,
+    ) -> Result<()> {
+        if !arrival_eligible(
+            live,
+            imported.is_read,
+            imported.is_outgoing,
+            imported.arrival_ms,
+            now_ms(),
+        ) {
+            return Ok(());
+        }
+        let thread_id = imported.thread_id;
+        // A durable outbox row, once per thread in this batch. The native
+        // dispatcher consumes it after commit and applies the user's
+        // notification scope against the thread's resolved tab, so bulk mail
+        // is queued too and filtered there. Snapshotting sender and subject now
+        // keeps delivery independent of any later UI or hydration step.
+        if !self.notified_threads.contains(&thread_id) {
+            self.notified_threads.push(thread_id);
+            let audible = chime_worthy(imported.is_automated, &imported.from_email);
+            repo::notifications::enqueue(conn, imported.message_id, audible)?;
+            tracing::info!(
+                account_id = self.account_id,
+                thread_id,
+                audible,
+                "receive: queued a new-mail notification",
+            );
+        }
+        Ok(())
+    }
+
+    /// The touched threads, without sorting them into the inbox's tabs: mail
+    /// kept on this device never reaches an inbox.
+    pub(crate) fn finish_unrouted(self) -> Vec<i64> {
+        self.thread_ids
+    }
+
+    /// Resolve each touched thread to a tab now that all of its messages are
+    /// in place (see crate::route). Returns every touched thread and the
+    /// threads that queued a notification.
+    pub(crate) fn finish(self, conn: &Connection) -> Result<(Vec<i64>, Vec<i64>)> {
+        if self.settings.auto_labels_enabled {
+            for &thread_id in &self.thread_ids {
+                crate::route::route_thread_deterministic(
+                    conn,
+                    self.settings.ai_categorize,
+                    thread_id,
+                )?;
+            }
+        }
+        Ok((self.thread_ids, self.notified_threads))
+    }
+}
+
+/// Whether an arrival may surface as new mail: live, unread, incoming, and
+/// genuinely recent. The notification scope (Important, all, or specific
+/// tabs) is applied later by the dispatcher, which can see the thread's
+/// resolved tab; whether it may play a sound is [`chime_worthy`].
+pub(crate) fn arrival_eligible(
+    live: bool,
+    is_read: bool,
+    is_outgoing: bool,
+    arrival_ms: i64,
+    now: i64,
+) -> bool {
+    live && !is_read && !is_outgoing && now - arrival_ms < CHIME_RECENT_MS
+}
+
+/// Whether a fresh arrival's notification may play the new-mail sound. Sound
+/// stays human-only regardless of the notification scope, so a newsletter or
+/// monitoring flood never rings the bell every minute.
+pub(crate) fn chime_worthy(is_automated: bool, from_email: &str) -> bool {
+    !is_automated && !crate::mime::robot_sender(from_email)
+}
+
+/// Every message is kept: one that can't be parsed is stored whole and shown
+/// as text.
+pub(crate) fn parse_or_text(raw: &[u8]) -> ParsedBody {
+    crate::mime::parse_message(raw).unwrap_or_else(|error| {
+        tracing::warn!(%error, "storing an unparseable message as text");
+        let text = String::from_utf8_lossy(raw).into_owned();
+        ParsedBody {
+            snippet: crate::mime::make_body_snippet(Some(&text), None),
+            text: Some(text),
+            ..ParsedBody::default()
+        }
+    })
+}
+
+/// Store a parsed full message: its text and sanitized HTML, the raw file,
+/// attachments, sender verification, list fields, the search index, and what
+/// a read receipt reports. Returns the threads holding the message such a
+/// receipt is about, which now show it.
+pub(crate) fn store_body(
+    conn: &Connection,
+    message_id: i64,
+    raw_path: &str,
+    parsed: &ParsedBody,
+) -> Result<Vec<i64>> {
+    repo::messages::store_body(
+        conn,
+        message_id,
+        parsed.text.as_deref(),
+        parsed.html.as_deref(),
+        Some(raw_path),
+        // Real files only, mirroring BODYSTRUCTURE's disposition check and
+        // the message-card footer (both ignore inline images), so the list
+        // paperclip stays consistent before and after the body arrives.
+        parsed
+            .attachments
+            .iter()
+            .any(|attachment| !attachment.is_inline),
+        Some(&parsed.snippet),
+    )?;
+    repo::messages::set_sender_verification(conn, message_id, parsed.headers.sender_verification)?;
+    repo::messages::fill_list_headers(
+        conn,
+        message_id,
+        parsed.headers.list_unsubscribe.as_deref(),
+        parsed.headers.list_unsubscribe_post.as_deref(),
+        parsed.headers.list_id.as_deref(),
+    )?;
+    let attachments: Vec<_> = parsed
+        .attachments
+        .iter()
+        .map(|attachment| repo::messages::NewAttachment {
+            message_id,
+            part_id: Some(&attachment.part_id),
+            filename: attachment.filename.as_deref(),
+            mime_type: attachment.mime_type.as_deref(),
+            size: Some(attachment.size),
+            content_id: attachment.content_id.as_deref(),
+            is_inline: attachment.is_inline,
+        })
+        .collect();
+    repo::messages::replace_attachments(conn, message_id, &attachments)?;
+    repo::search::index_message(conn, message_id)?;
+    match &parsed.disposition_report {
+        Some(report) => record_returned_receipt(conn, message_id, report),
+        None => Ok(Vec::new()),
+    }
+}
+
+/// Keep what a read receipt that came back reports, and return the threads
+/// that show it. A receipt the account sent itself, such as the copy Gmail
+/// files in Sent, reports on someone else's message.
+pub(crate) fn record_returned_receipt(
+    conn: &Connection,
+    message_id: i64,
+    report: &crate::mime::DispositionReport,
+) -> Result<Vec<i64>> {
+    let receipt = conn
+        .query_row(
+            "SELECT account_id, date FROM messages WHERE id = ?1 AND is_outgoing = 0",
+            [message_id],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+        )
+        .optional()?;
+    match receipt {
+        Some((account_id, date)) => repo::returned_receipts::record(conn, account_id, report, date),
+        None => Ok(Vec::new()),
+    }
+}
+
+/// The calendars a message carries: its text/calendar parts, such as a
+/// meeting invitation or an answer to one.
+pub(crate) fn calendar_parts(parsed: &ParsedBody) -> Vec<String> {
+    parsed.calendar_parts.clone()
+}
+
+/// How the messages came to the account.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Arrival {
+    /// They arrived, or the user moved them back from Spam.
+    Received,
+    /// They were imported from saved mail: an archive's invitations join the
+    /// calendar only once answered.
+    Imported,
+}
+
+/// Apply the calendars of stored messages to the account's calendar, by the
+/// rules of [`repo::calendar::apply_invitation`]. Mail in Spam or Trash and
+/// mail from a blocked sender never changes the calendar: RFC 9671 §5 has
+/// calendar data in spam left alone, and invitations are how calendar spam
+/// arrives. Which new invitations join the calendar before an answer
+/// follows the user's setting ([`AddInvitations`]).
+pub(crate) async fn store_calendar_events(
+    ctx: &SyncCtx,
+    account_id: i64,
+    messages: Vec<(i64, Vec<String>)>,
+    arrival: Arrival,
+) -> Result<()> {
+    let mut messages: Vec<(i64, Vec<String>)> = messages
+        .into_iter()
+        .filter(|(_, calendars)| !calendars.is_empty())
+        .collect();
+    if messages.is_empty() {
+        return Ok(());
+    }
+    // Every message keeps its calendar for the card above it, also those
+    // whose calendar stays out of the user's.
+    let kept: Vec<(i64, String)> = messages
+        .iter()
+        .filter_map(|(id, calendars)| {
+            calendars
+                .iter()
+                .find(|calendar| !crate::calendar::parse_ics(calendar).is_empty())
+                .map(|calendar| (*id, calendar.clone()))
+        })
+        .collect();
+    if !kept.is_empty() {
+        ctx.calendar_db
+            .write(move |conn| {
+                for (message_id, calendar) in &kept {
+                    repo::calendar::keep_message_calendar(conn, account_id, *message_id, calendar)?;
+                }
+                Ok(())
+            })
+            .await?;
+    }
+    let ids: Vec<i64> = messages.iter().map(|(id, _)| *id).collect();
+    let (own, kept_out, adding, known) = ctx
+        .db
+        .read(move |conn| {
+            let adding = repo::settings::get(conn)?.add_invitations;
+            let known = match adding {
+                AddInvitations::Known => repo::messages::from_known_senders(conn, &ids)?,
+                _ => Default::default(),
+            };
+            Ok((
+                repo::sender_identities::own_addresses(conn, account_id)?,
+                repo::messages::kept_from_calendar(conn, &ids)?,
+                adding,
+                known,
+            ))
+        })
+        .await?;
+    messages.retain(|(id, _)| !kept_out.contains(id));
+    if messages.is_empty() {
+        return Ok(());
+    }
+    let new_events = move |message_id: i64| match (arrival, adding) {
+        (Arrival::Imported, _) | (_, AddInvitations::Answered) => NewEvents::Hold,
+        (_, AddInvitations::Everyone) => NewEvents::Invited,
+        (_, AddInvitations::Known) if known.contains(&message_id) => NewEvents::Invited,
+        (_, AddInvitations::Known) => NewEvents::Hold,
+    };
+    ctx.calendar_db
+        .write(move |conn| {
+            let tx = conn.transaction()?;
+            for (message_id, calendars) in &messages {
+                for calendar in calendars {
+                    repo::calendar::apply_invitation(
+                        &tx,
+                        account_id,
+                        *message_id,
+                        calendar,
+                        &own,
+                        new_events(*message_id),
+                    )?;
+                }
+            }
+            tx.commit()?;
+            Ok(())
+        })
+        .await?;
+    ctx.bus.emit(CoreEvent::CalendarUpdated { account_id });
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CHIME_RECENT_MS, arrival_eligible, chime_worthy};
+
+    fn eligible(live: bool, read: bool, outgoing: bool, age_ms: i64) -> bool {
+        let now = 2 * CHIME_RECENT_MS;
+        arrival_eligible(live, read, outgoing, now - age_ms, now)
+    }
+
+    #[test]
+    fn only_live_unread_incoming_mail_is_a_notification_candidate() {
+        // Automated and robot senders are still candidates here; scope
+        // filtering happens later in the host dispatcher.
+        assert!(eligible(true, false, false, 1_000));
+        // History being caught up on, read or outgoing mail, and mail that
+        // arrived outside the recency window all disqualify.
+        assert!(!eligible(false, false, false, 1_000));
+        assert!(!eligible(true, true, false, 1_000));
+        assert!(!eligible(true, false, true, 1_000));
+        assert!(!eligible(true, false, false, CHIME_RECENT_MS));
+    }
+
+    #[test]
+    fn chime_stays_human_only() {
+        assert!(chime_worthy(false, "alice@example.com"));
+        assert!(!chime_worthy(true, "digest@example.com"));
+        assert!(!chime_worthy(false, "notifications@example.com"));
+    }
+
+    #[test]
+    fn a_stored_receipt_is_kept_unless_the_account_sent_it() {
+        use crate::db::testutil;
+        let conn = testutil::conn();
+        testutil::seed_account(&conn);
+        let (_, received) = testutil::seed_message(&conn, "ana@example.com", "Read: Plan", true);
+        let (_, sent) = testutil::seed_message(&conn, "me@test.dev", "Read: Plan", true);
+        conn.execute("UPDATE messages SET is_outgoing = 1 WHERE id = ?1", [sent])
+            .unwrap();
+        conn.execute_batch(
+            "INSERT INTO threads (id, account_id, subject_norm, unread_count, last_message_at)
+                 VALUES (50, 1, 'plan', 0, 1000);
+             INSERT INTO messages (thread_id, account_id, folder_id, message_id, subject, date,
+                 is_outgoing)
+                 VALUES (50, 1, 1, 'plan@example.org', 'Plan', 1000, 1);",
+        )
+        .unwrap();
+        let receipt = crate::mime::parse_message(
+            b"From: Ana <ana@example.com>\r\n\
+              Date: Tue, 01 Sep 2026 12:30:00 +0000\r\n\
+              Content-Type: multipart/report; report-type=disposition-notification; boundary=b\r\n\
+              \r\n\
+              --b\r\n\
+              Content-Type: message/disposition-notification\r\n\
+              \r\n\
+              Final-Recipient: rfc822; ana@example.com\r\n\
+              Original-Message-ID: <plan@example.org>\r\n\
+              Disposition: manual-action/MDN-sent-manually; displayed\r\n\
+              --b--\r\n",
+        )
+        .unwrap();
+        assert!(receipt.disposition_report.is_some());
+        // One the account sent reports on someone else's message.
+        assert!(
+            super::store_body(&conn, sent, "/sent.eml", &receipt)
+                .unwrap()
+                .is_empty()
+        );
+        let count = |conn: &rusqlite::Connection| -> i64 {
+            conn.query_row("SELECT count(*) FROM returned_receipts", [], |row| {
+                row.get(0)
+            })
+            .unwrap()
+        };
+        assert_eq!(count(&conn), 0);
+        assert_eq!(
+            super::store_body(&conn, received, "/received.eml", &receipt).unwrap(),
+            vec![50]
+        );
+        assert_eq!(count(&conn), 1);
+    }
+}

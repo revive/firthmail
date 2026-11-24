@@ -1,0 +1,828 @@
+/* FirthMail shell: quiet grays, one blue, unread weight. */
+
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  overflow: hidden;
+}
+
+body {
+  font-family: 'Segoe UI', 'Microsoft YaHei UI', 'Microsoft YaHei', system-ui, sans-serif;
+  font-size: 13px;
+  color: #242424;
+  background: #f3f2f1;
+  user-select: none;
+}
+
+.app {
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+}
+
+/* ---- header ---- */
+
+.app-header {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  height: 48px;
+  padding: 0 12px;
+  background: #ffffff;
+  border-bottom: 1px solid #e1dfdd;
+}
+
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 16px;
+  font-weight: 600;
+  color: #0072c6;
+  min-width: 90px;
+}
+
+.brand-logo {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  border-radius: 5px;
+  background: #0072c6;
+  color: #fff;
+  font-size: 15px;
+  font-weight: 700;
+}
+
+.search {
+  flex: 1;
+  max-width: 480px;
+  height: 30px;
+  padding: 0 12px;
+  border: 1px solid #c8c6c4;
+  border-radius: 4px;
+  background: #ffffff;
+  font: inherit;
+  color: inherit;
+}
+
+.search:focus {
+  outline: 2px solid #0072c6;
+  outline-offset: -1px;
+}
+
+.header-actions .primary {
+  height: 30px;
+  padding: 0 14px;
+  border: none;
+  border-radius: 4px;
+  background: #0072c6;
+  color: #fff;
+  font: inherit;
+  cursor: pointer;
+}
+
+.header-actions .primary:hover {
+  background: #106ebe;
+}
+
+/* ---- three panes ---- */
+
+.app-body {
+  flex: 1;
+  display: flex;
+  min-height: 0;
+}
+
+/* folder tree */
+
+.folder-tree {
+  width: 220px;
+  padding: 8px 6px;
+  background: #faf9f8;
+  border-right: 1px solid #e1dfdd;
+  overflow-y: auto;
+}
+
+.folder-item {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  width: 100%;
+  height: 30px;
+  padding: 0 8px 0 8px;
+  border: none;
+  border-radius: 4px;
+  background: transparent;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.folder-item:hover {
+  background: #edebe9;
+}
+
+.folder-item.active {
+  background: #d0e4f5;
+  font-weight: 600;
+}
+
+/* 展开箭头 / 叶子占位 */
+.expander {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 14px;
+  flex: none;
+  color: #8a8886;
+  font-size: 10px;
+  cursor: pointer;
+  transition: transform 0.12s ease;
+}
+
+.expander.open {
+  transform: rotate(90deg);
+}
+
+.expander.leaf {
+  cursor: default;
+}
+
+.folder-icon {
+  width: 18px;
+  text-align: center;
+}
+
+.folder-name {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.folder-unread {
+  min-width: 18px;
+  height: 18px;
+  padding: 0 5px;
+  border-radius: 9px;
+  background: #0072c6;
+  color: #fff;
+  font-size: 11px;
+  line-height: 18px;
+  text-align: center;
+}
+
+/* message list */
+
+.list-column {
+  display: flex;
+  flex-direction: column;
+  width: 380px;
+  min-width: 300px;
+  background: #ffffff;
+  border-right: 1px solid #e1dfdd;
+}
+
+.search-banner {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 6px 12px;
+  background: #eef6fc;
+  color: #005a9e;
+  font-size: 12px;
+  border-bottom: 1px solid #c7e0f4;
+}
+
+.search-banner .link {
+  color: #005a9e;
+}
+
+.message-list {
+  flex: 1;
+  overflow-y: auto;
+  outline: none;
+}
+
+.message-list:focus {
+  box-shadow: inset 2px 0 0 #0072c6;
+}
+
+.list-empty {
+  padding: 32px 16px;
+  text-align: center;
+  color: #605e5c;
+}
+
+.message-row {
+  display: flex;
+  gap: 12px;
+  padding: 8px 12px;
+  cursor: default;
+  border-bottom: 1px solid #f3f2f1;
+}
+
+.message-row:hover {
+  background: #f3f9fd;
+}
+
+.message-row.selected {
+  background: #cfe4fa;
+}
+
+.row-main {
+  flex: 1;
+  min-width: 0;
+}
+
+.row-from {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.from-text {
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.row-side {
+  width: 96px;
+  flex: none;
+}
+
+.row-time {
+  color: #605e5c;
+  font-size: 12px;
+  text-align: right;
+}
+
+.row-preview {
+  margin-top: 2px;
+  color: #605e5c;
+  font-size: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.row-subject {
+  margin-top: 1px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.message-row:not(.unread) .from-text,
+.message-row:not(.unread) .row-subject {
+  font-weight: 400;
+  color: #3b3a39;
+}
+
+.unread-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #0072c6;
+  flex: none;
+}
+
+.flag,
+.attach {
+  font-size: 12px;
+}
+
+/* reading pane */
+
+.reading-pane {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  background: #ffffff;
+  overflow: hidden;
+}
+
+.reading-pane.empty {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  justify-content: center;
+}
+
+.reading-placeholder {
+  color: #a19f9d;
+  font-size: 15px;
+}
+
+.reading-toolbar {
+  display: flex;
+  gap: 8px;
+  padding: 12px 28px 0;
+}
+
+.reading-toolbar button {
+  height: 28px;
+  padding: 0 10px;
+  border: 1px solid #c8c6c4;
+  border-radius: 4px;
+  background: #ffffff;
+  font: inherit;
+  cursor: pointer;
+}
+
+.reading-toolbar button:hover {
+  background: #f3f2f1;
+  border-color: #0072c6;
+}
+
+.reading-subject {
+  font-size: 19px;
+  font-weight: 600;
+  margin-bottom: 12px;
+  user-select: text;
+}
+
+/* 新列式布局：头部固定高度，正文 iframe 占满余下空间。 */
+.reading-header {
+  padding: 4px 28px 12px;
+  flex: none;
+}
+
+.reading-meta {
+  display: flex;
+  gap: 12px;
+  align-items: flex-start;
+  padding-bottom: 12px;
+  border-bottom: 1px solid #edebe9;
+  margin-bottom: 0;
+}
+
+.avatar {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 36px;
+  height: 36px;
+  border-radius: 50%;
+  background: #0072c6;
+  color: #fff;
+  font-size: 16px;
+  font-weight: 600;
+  flex: none;
+}
+
+.meta-text {
+  flex: 1;
+  min-width: 0;
+}
+
+.meta-from {
+  font-weight: 600;
+}
+
+.meta-address {
+  font-weight: 400;
+  color: #605e5c;
+}
+
+.meta-to {
+  margin-top: 2px;
+  color: #605e5c;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.meta-date {
+  color: #605e5c;
+  flex: none;
+}
+
+/* 邮件正文：沙箱 iframe，内部 CSS 出不了框。 */
+.reading-body-frame {
+  flex: 1;
+  min-height: 0;
+  background: #ffffff;
+}
+
+.reading-body-frame iframe {
+  width: 100%;
+  height: 100%;
+  border: none;
+  display: block;
+  background: #ffffff;
+}
+
+/* ---- footer & toast ---- */
+
+.app-footer {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  height: 26px;
+  padding: 0 12px;
+  background: #f3f2f1;
+  border-top: 1px solid #e1dfdd;
+  color: #605e5c;
+  font-size: 12px;
+}
+
+.footer-right {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.footer-right em {
+  font-style: normal;
+}
+
+.footer-right .events-ok {
+  color: #107c10;
+}
+
+.footer-right .events-none {
+  color: #a19f9d;
+}
+
+.toast {
+  position: fixed;
+  left: 50%;
+  bottom: 44px;
+  transform: translateX(-50%);
+  padding: 8px 18px;
+  border-radius: 4px;
+  background: #242424;
+  color: #ffffff;
+  font-size: 13px;
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.28);
+  animation: toast-in 0.16s ease-out;
+}
+
+@keyframes toast-in {
+  from {
+    opacity: 0;
+    transform: translate(-50%, 6px);
+  }
+  to {
+    opacity: 1;
+    transform: translate(-50%, 0);
+  }
+}
+
+/* ---- folder groups ---- */
+
+.folder-group {
+  margin-bottom: 6px;
+}
+
+.group-title {
+  padding: 4px 8px 2px;
+  font-size: 11px;
+  color: #8a8886;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ---- account setup modal ---- */
+
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 20;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0.32);
+}
+
+.modal {
+  width: 480px;
+  max-width: calc(100vw - 48px);
+  padding: 24px 28px 20px;
+  border-radius: 8px;
+  background: #ffffff;
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.3);
+}
+
+.modal h1 {
+  font-size: 18px;
+  margin-bottom: 14px;
+}
+
+.form-row {
+  margin-bottom: 10px;
+}
+
+.link {
+  border: none;
+  background: none;
+  color: #0072c6;
+  cursor: pointer;
+  font: inherit;
+  padding: 0;
+  text-align: left;
+}
+
+.link:hover {
+  text-decoration: underline;
+}
+
+.form-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px 14px;
+}
+
+.form-grid label {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 12px;
+  color: #605e5c;
+}
+
+.form-grid .span-2 {
+  grid-column: span 2;
+}
+
+.form-grid input,
+.form-grid select {
+  height: 30px;
+  padding: 0 10px;
+  border: 1px solid #c8c6c4;
+  border-radius: 4px;
+  font: inherit;
+  color: #242424;
+}
+
+.form-grid input:focus,
+.form-grid select:focus {
+  outline: 2px solid #0072c6;
+  outline-offset: -1px;
+}
+
+.form-error {
+  margin-top: 12px;
+  padding: 8px 10px;
+  border-radius: 4px;
+  background: #fde7e9;
+  color: #a4262c;
+  font-size: 12px;
+}
+
+.modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+  margin-top: 16px;
+}
+
+.modal-actions button {
+  height: 32px;
+  padding: 0 16px;
+  border: 1px solid #c8c6c4;
+  border-radius: 4px;
+  background: #ffffff;
+  font: inherit;
+  cursor: pointer;
+}
+
+.modal-actions button.primary {
+  border: none;
+  background: #0072c6;
+  color: #fff;
+}
+
+.modal-actions button.primary:hover:not(:disabled) {
+  background: #106ebe;
+}
+
+.modal-actions button:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+
+.form-note {
+  margin-top: 12px;
+  font-size: 11px;
+  color: #8a8886;
+}
+
+/* ---- attachments ---- */
+
+.attachments {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 14px;
+}
+
+.attachment-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px;
+  border: 1px solid #c8c6c4;
+  border-radius: 4px;
+  background: #faf9f8;
+  font-size: 12px;
+}
+
+.attachment-chip em {
+  color: #8a8886;
+  font-style: normal;
+}
+
+/* ---- import modal ---- */
+
+.modal-wide {
+  width: 560px;
+}
+
+.root-path {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin: 10px 0;
+  font-size: 12px;
+  color: #605e5c;
+}
+
+.root-path .row {
+  display: flex;
+  gap: 8px;
+}
+
+.root-path input {
+  flex: 1;
+  height: 30px;
+  padding: 0 10px;
+  border: 1px solid #c8c6c4;
+  border-radius: 4px;
+  font: inherit;
+}
+
+.root-path .row button {
+  height: 30px;
+  padding: 0 14px;
+  border: 1px solid #c8c6c4;
+  border-radius: 4px;
+  background: #ffffff;
+  font: inherit;
+  cursor: pointer;
+}
+
+.root-path .row button:hover:not(:disabled) {
+  border-color: #0072c6;
+}
+
+.scan-list {
+  max-height: 260px;
+  overflow-y: auto;
+  margin: 10px 0;
+  border: 1px solid #edebe9;
+  border-radius: 4px;
+}
+
+.scan-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 10px;
+  font-size: 13px;
+  border-bottom: 1px solid #f3f2f1;
+}
+
+.scan-item:last-child {
+  border-bottom: none;
+}
+
+.scan-item.disabled {
+  color: #a19f9d;
+}
+
+.scan-name {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.scan-size {
+  color: #8a8886;
+  font-size: 12px;
+}
+
+.import-progress {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin: 10px 0;
+  padding: 8px 10px;
+  border-radius: 4px;
+  background: #eef6fc;
+  color: #0072c6;
+  font-size: 12px;
+}
+
+.import-progress button {
+  height: 26px;
+  padding: 0 10px;
+  border: 1px solid #c8c6c4;
+  border-radius: 4px;
+  background: #ffffff;
+  font: inherit;
+  cursor: pointer;
+}
+
+/* ---- composer ---- */
+
+.modal-compose {
+  width: 640px;
+  max-height: calc(100vh - 80px);
+  overflow-y: auto;
+}
+
+.modal-compose h1 {
+  font-size: 16px;
+  margin-bottom: 10px;
+}
+
+.modal-compose textarea {
+  resize: vertical;
+  min-height: 200px;
+  padding: 8px 10px;
+  border: 1px solid #c8c6c4;
+  border-radius: 4px;
+  font-family: 'Segoe UI', 'Microsoft YaHei UI', monospace;
+  font-size: 13px;
+  line-height: 1.6;
+  color: #242424;
+}
+
+.modal-compose textarea:focus,
+.modal-compose input:focus {
+  outline: 2px solid #0072c6;
+  outline-offset: -1px;
+}
+
+/* ---- crash screen ---- */
+
+.crash-screen {
+  height: 100%;
+  overflow: auto;
+  padding: 40px 48px;
+  background: #ffffff;
+}
+
+.crash-screen h1 {
+  color: #a4262c;
+  font-size: 22px;
+  margin-bottom: 8px;
+}
+
+.crash-screen p {
+  color: #605e5c;
+  margin-bottom: 16px;
+}
+
+.crash-screen pre {
+  max-width: 900px;
+  padding: 12px 16px;
+  border-radius: 4px;
+  background: #f3f2f1;
+  color: #242424;
+  font-size: 12px;
+  white-space: pre-wrap;
+  user-select: text;
+}
+
+.crash-screen button {
+  margin-top: 16px;
+  height: 32px;
+  padding: 0 20px;
+  border: none;
+  border-radius: 4px;
+  background: #0072c6;
+  color: #ffffff;
+  font: inherit;
+  cursor: pointer;
+}
+
+.crash-screen button:hover {
+  background: #106ebe;
+}

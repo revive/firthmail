@@ -1,0 +1,1414 @@
+import { AccountMailPreferences, SenderPickerRow } from "account-mail-preferences.slint";
+import { SenderPicker } from "sender-picker.slint";
+import { SettingsSelectRow } from "settings-components.slint";
+import { ScrollView, VerticalBox } from "std-widgets.slint";
+import { AccountRow, ComposeAttachment, ComposeLink, ComposeContact, ComposeEditorTile, EmailTemplateRow, SpellingLanguage } from "../models.slint";
+import { ComposerFromRow, ComposerHeader, ComposerRecipients, ComposerSubject } from "composer-fields.slint";
+import { ComposerAttachments, ComposerFooter, ComposerNotice, ComposerPhotos, ComposerToolbar, DiscardConfirmation, ImageAltEditor, ImageBar, ImageResizeFrame, LinkEditor, TranslateEditor } from "composer-actions.slint";
+import { EmailTemplates } from "email-templates.slint";
+import { TypeScale } from "../typography.slint";
+import { ConfirmationDialog } from "confirmation-dialog.slint";
+import { IconButton } from "controls.slint";
+
+
+// cosmic-text owns visible layout, selection, hit-testing, and caret geometry.
+// The transparent TextInput only preserves Slint's native IME and clipboard
+// integration; it never supplies coordinates for anything the user can see.
+export component EmailComposer inherits Rectangle {
+    in property <bool> compact: false;
+    // In its own window: no frame of its own, and the window's title bar
+    // replaces the heading and its close button.
+    in property <bool> windowed: false;
+    in property <bool> attachment-picker-supported: true;
+    in property <bool> open: false;
+    in property <string> mode: "new";
+    in-out property <string> to;
+    in-out property <string> cc;
+    in-out property <string> bcc;
+    in-out property <string> subject;
+    in-out property <string> body;
+    in property <bool> sending: false;
+    in property <bool> drop-hint: false;
+    // An AI agent asked to send this draft: the note says who, above the
+    // message the user checks before sending.
+    in property <string> review-note: "";
+    // For a signature: whether its text or formatting changed since it opened, and the name
+    // it was saved with.
+    in property <bool> signature-edited: false;
+    in property <string> signature-saved-name: "";
+    in property <[AccountRow]> accounts: [];
+    in-out property <int> selected-account-id: -1;
+    in property <[ComposeContact]> contact-suggestions: [];
+    in property <[ComposeAttachment]> attachments: [];
+    in property <[ComposeLink]> links: [];
+    in property <bool> link-sharing: false;
+    in property <[EmailTemplateRow]> templates: [];
+    in property <string> attachment-summary: "";
+    // JPEG photos large enough to go out shrunk, in the text and attached: how many, their
+    // size as they go out and at full size, whether they go out shrunk, and whether they're
+    // being shrunk.
+    in property <int> photo-count: 0;
+    in property <string> photo-size: "";
+    in property <string> photo-full-size: "";
+    in-out property <bool> shrink-photos: false;
+    in-out property <bool> request-receipt: false;
+    in-out property <int> importance: 0;
+    in property <bool> shrinking-photos: false;
+    // A forward's files are still on their way, which sending and saving wait for.
+    in property <bool> attaching-files: false;
+    // The message goes out as plain text only.
+    in property <bool> plain-text: false;
+    in-out property <string> from-label: @tr("No connected account");
+    in property <string> notice: "";
+    in property <bool> notice-is-error: false;
+    in property <int> selection-start: 0;
+    in property <int> selection-end: 0;
+    in property <[ComposeEditorTile]> editor-tiles: [];
+    in property <float> editor-content-height: 18;
+    in property <float> editor-caret-x: 0;
+    in property <float> editor-caret-y: 0;
+    in property <float> editor-caret-height: 18;
+    in property <bool> editor-image-shown: false;
+    in property <float> editor-image-x: 0;
+    in property <float> editor-image-y: 0;
+    in property <float> editor-image-width: 0;
+    in property <float> editor-image-height: 0;
+    in property <bool> bold-active: false;
+    in property <bool> italic-active: false;
+    in property <bool> underline-active: false;
+    in property <bool> strike-active: false;
+    in property <bool> code-active: false;
+    in property <string> active-link-url: "";
+    in property <string> active-color: "none";
+    in property <string> active-highlight: "none";
+    in property <string> active-size: "normal";
+    in property <string> active-family: "default";
+    in property <string> active-align: "left";
+    in property <string> active-image-size: "";
+    in property <string> active-image-alt: "";
+    in property <int> active-image-width: 0;
+    in property <int> active-image-shown-width: 0;
+    in property <bool> can-pop-out: false;
+    // When the message reminds the user unless someone replies, as shown,
+    // or empty.
+    in property <string> remind-time: "";
+    // "reply" or "forward" when the original goes below the editor.
+    in property <string> quote: "";
+    in property <string> quote-left-out: "";
+    in property <string> quote-text: "";
+    in-out property <bool> quote-expanded: false;
+    in property <[ComposeEditorTile]> quote-tiles: [];
+    in property <float> quote-height: 0;
+    in property <bool> spelling-available: false;
+    in property <bool> spelling-enabled: false;
+    in property <[SpellingLanguage]> spelling-languages: [];
+    in property <bool> spelling-languages-automatic: false;
+    in property <string> spelling-word: "";
+    in property <[string]> spelling-suggestions: [];
+    in property <int> editor-menu-serial: 0;
+    // The menu is for a tapped word: only spelling, below the word's line.
+    in property <bool> editor-menu-touch: false;
+    in property <length> editor-menu-word-bottom: 0px;
+
+    in property <color> background-color;
+    in property <color> raised-color;
+    in property <color> control-color;
+    in property <color> control-hover-color;
+    in property <color> frame-border-color;
+    in property <color> subtle-border-color;
+    in property <color> title-color;
+    in property <color> body-color;
+    in property <color> secondary-color;
+    in property <color> muted-color;
+    in property <color> accent-color;
+    in property <color> accent-background;
+
+    out property <length> editor-width: max(1px, body-scroll.visible-width - 36px);
+    out property <length> editor-viewport-height: max(1px, body-scroll.visible-height - 28px);
+    out property <length> editor-scroll-y: max(0px, -body-scroll.content-y);
+    out property <string> editor-preedit-text: body-input.preedit-text;
+    // Where the original starts below the editor, for the Rust layout.
+    out property <length> quote-top: 14px + root.editor-area-height + 48px;
+    // A message carrying the original, or able to put it back, keeps a few
+    // lines for the reply above it rather than the whole viewport.
+    private property <length> editor-area-height: root.quote == "" && root.quote-left-out == ""
+        ? max(root.editor-viewport-height, root.editor-content-height * 1px)
+        : max(96px, root.editor-content-height * 1px + 8px);
+
+    callback close;
+    callback pop-out;
+    callback back-requested;
+    callback submit(bool);
+    // What sending asks first: "subject", or "attachment" with the keyword
+    // the message mentions. Answered "send", "attach" or "cancel".
+    in-out property <bool> send-check-open: false;
+    in property <string> send-check;
+    in property <string> send-check-keyword;
+    callback answer-send-check(string);
+    callback save-signature();
+    callback pick-attachments;
+    // Pick when the message goes out, or reminds the user.
+    callback schedule-send;
+    callback remind;
+    callback insert-images;
+    callback remove-attachment(int);
+    callback remove-link(int);
+    callback share-by-link();
+    callback shrink-photos-toggled(bool);
+    callback plain-text-chosen(bool);
+    callback format-requested(string, string, int, int);
+    callback paste-requested(string, int, int) -> bool;
+    callback copy-requested(bool, string, int, int) -> bool;
+    callback link-requested(string, string, int, int);
+    // Translating the message (#240): a service is set up, the languages to
+    // translate into and the one chosen, and how the translation goes. The
+    // app closes the dialog once the translation is in.
+    in property <bool> translate-shown: false;
+    in property <[string]> translate-choices: [];
+    in-out property <int> translate-index: 0;
+    in-out property <bool> translate-open: false;
+    in property <bool> translating: false;
+    in property <string> translate-failure: "";
+    in property <string> translate-detail: "";
+    callback translate-opened();
+    // Improve writing (#241): Proofread (-1) or one of the user's prompts,
+    // with the body and the selection's offsets.
+    in property <bool> improve-shown: false;
+    in property <[string]> ai-prompts: [];
+    in property <bool> improving: false;
+    callback improve-requested(int, string, int, int);
+    callback edit-prompts();
+    // The language chosen, the body, and the selection's offsets.
+    callback translate-requested(int, string, int, int);
+    callback body-edited(string, int, int, string);
+    callback selection-changed(string, int, int);
+    callback history-requested(string);
+    callback editor-pointer-event(float, float, string, bool, bool, bool, bool);
+    callback editor-key-event(string, bool, bool, bool, bool) -> bool;
+    callback editor-layout-changed;
+    callback search-contacts(string, int);
+    callback select-contact(int, string) -> string;
+    callback refresh-templates;
+    callback use-template(int) -> bool;
+    callback save-template(int, string, string, string, string) -> bool;
+    callback delete-template(int) -> bool;
+    pure callback splice-text(string, int, int, string) -> string;
+    callback edit-quote();
+    callback remove-quote();
+    callback restore-quote();
+    callback editor-menu-requested(float, float);
+    callback editor-caret-menu-requested();
+    callback editor-tapped(float, float);
+    callback spelling-correct(int);
+    callback spelling-ignore();
+    callback spelling-learn();
+    callback spelling-toggle();
+    callback spelling-toggle-language(int);
+
+    private property <bool> confirm-discard: false;
+    private property <bool> link-editor-open: false;
+    private property <int> translate-selection-start: 0;
+    private property <int> translate-selection-end: 0;
+    private property <bool> templates-open: false;
+    private property <string> link-url: "";
+    private property <int> link-selection-start: 0;
+    private property <int> link-selection-end: 0;
+    private property <bool> image-alt-open: false;
+    private property <string> image-alt: "";
+    private property <int> image-selection-start: 0;
+    private property <int> image-selection-end: 0;
+    private property <bool> caret-visible: true;
+    private property <string> pending-key-text: "";
+    private property <bool> ime-edit-pending: false;
+    private property <length> input-caret-x: 0px;
+    private property <length> input-caret-y: 0px;
+    // Where the editor menu opens, and the state its spelling switch shows: a menu toggles
+    // its own copy, which would otherwise stop following the setting.
+    private property <Point> editor-menu-position;
+    private property <bool> spelling-switch-shown;
+    // Where a finger went down on the editor, and whether it has stayed there, so lifting
+    // it is a tap.
+    private property <Point> touch-down-position;
+    private property <bool> touch-still;
+
+    // The application answers a request for the editor menu once the corrections for the
+    // word under the pointer are ready. A tapped word's menu opens below its line, so the
+    // word stays in sight, as phones show corrections.
+    changed editor-menu-serial => {
+        root.spelling-switch-shown = root.spelling-enabled;
+        if (root.editor-menu-touch) {
+            root.editor-menu-position = {
+                x: root.editor-menu-position.x,
+                y: root.editor-menu-word-bottom,
+            };
+        }
+        editor-menu.show(root.editor-menu-position);
+        // A menu takes the focus, which puts a phone's keyboard away. Taps choose from it
+        // without focus, so the message keeps it and the keyboard stays, as phones keep it.
+        if (root.editor-menu-touch) {
+            body-input.focus();
+        }
+    }
+    // A signature being written, in place of a message: "signature" mode.
+    private property <bool> signature-mode: root.mode == "signature";
+    private property <bool> has-content: root.signature-mode
+        ? root.signature-edited || root.subject != root.signature-saved-name
+        : root.to != "" || root.cc != "" || root.bcc != ""
+            || root.subject != "" || root.body != "" || root.attachments.length > 0 || root.quote != "";
+    // Photos going out shrunk are sent once they are.
+    private property <bool> can-send: !root.sending && !root.shrinking-photos && !root.attaching-files && root.selected-account-id > 0 && root.to != "" && (root.body != "" || root.quote != "") && AccountMailPreferences.composer-preferences-ready;
+
+    // Pastes what the clipboard holds with its formatting, or as plain text in the message's
+    // style when it holds none.
+    function paste-formatted() {
+        if (root.paste-requested(root.body, body-input.anchor-position-byte-offset, body-input.cursor-position_byte_offset)) {
+            body-input.set-selection-offsets(root.selection-start, root.selection-end);
+        } else {
+            body-input.paste();
+        }
+    }
+
+    // Copies or cuts the selection with its formatting, or as plain text where the clipboard
+    // takes only that.
+    function copy-formatted(cut: bool) {
+        if (root.copy-requested(cut, root.body, body-input.anchor-position-byte-offset, body-input.cursor-position_byte_offset)) {
+            body-input.set-selection-offsets(root.selection-start, root.selection-end);
+        } else if (cut) {
+            body-input.cut();
+        } else {
+            body-input.copy();
+        }
+    }
+
+    function apply-format(kind: string) {
+        // Toolbar buttons and menus take the focus first, and a TextInput that loses it drops
+        // its selection, so they act on the selection the message last reported. Shortcuts
+        // come while the message still has the focus and read its selection there.
+        let anchor = body-input.has-focus ? body-input.anchor-position-byte-offset : root.selection-start;
+        let cursor = body-input.has-focus ? body-input.cursor-position-byte-offset : root.selection-end;
+        if (kind == "link") {
+            if (anchor == cursor) {
+                return;
+            }
+            root.link-selection-start = anchor;
+            root.link-selection-end = cursor;
+            root.link-url = root.active-link-url;
+            root.link-editor-open = true;
+            return;
+        }
+        root.format-requested(kind, root.body, anchor, cursor);
+        body-input.set-selection-offsets(root.selection-start, root.selection-end);
+        body-input.focus();
+    }
+
+    // Asks for the selected image's alt text.
+    function edit-image-alt() {
+        root.image-selection-start = root.selection-start;
+        root.image-selection-end = root.selection-end;
+        root.image-alt = root.active-image-alt;
+        root.image-alt-open = true;
+    }
+
+    function request-close() {
+        if (root.sending) {
+            return;
+        }
+        if (root.has-content) {
+            root.confirm-discard = true;
+        } else {
+            root.close();
+        }
+    }
+
+    back-requested => { root.request-close(); }
+
+    function reveal-editor-caret() {
+        if (root.editor-caret-y * 1px + body-scroll.content-y < 8px) {
+            body-scroll.content-y = min(
+                0px,
+                max(
+                    body-scroll.visible-height - body-input.height,
+                    8px - root.editor-caret-y * 1px,
+                ),
+            );
+        } else if ((root.editor-caret-y + root.editor-caret-height) * 1px + body-scroll.content-y > body-scroll.visible-height - 8px) {
+            body-scroll.content-y = min(
+                0px,
+                max(
+                    body-scroll.visible-height - body-input.height,
+                    body-scroll.visible-height
+                        - (root.editor-caret-y + root.editor-caret-height) * 1px - 8px,
+                ),
+            );
+        }
+    }
+
+    changed open => {
+        if (!root.open) {
+            root.confirm-discard = false;
+            root.templates-open = false;
+        } else {
+            // The typing proxy starts where the visible caret is.
+            body-input.set-selection-offsets(root.selection-start, root.selection-end);
+            root.editor-layout-changed();
+            // The recipients' row takes focus only while it is empty. A signature has none.
+            if root.to != "" || root.signature-mode {
+                body-input.focus();
+            }
+        }
+    }
+    changed editor-width => { root.editor-layout-changed(); }
+    changed editor-viewport-height => { root.editor-layout-changed(); }
+    // `restart` alone only re-arms a timer that has run before, so without
+    // `start` nothing drew the text scrolled into view.
+    changed editor-scroll-y => {
+        editor-scroll-layout-timer.start();
+        editor-scroll-layout-timer.restart();
+    }
+    changed quote-expanded => { root.editor-layout-changed(); }
+    changed quote-top => { root.editor-layout-changed(); }
+    changed quote => { root.editor-layout-changed(); }
+    changed editor-preedit-text => {
+        if (root.editor-preedit-text != "") {
+            root.ime-edit-pending = true;
+            root.pending-key-text = "";
+        }
+        root.editor-layout-changed();
+        // Re-submit the unchanged selection so Slint refreshes the native
+        // candidate rectangle after cosmic-text advances the preedit caret.
+        body-input.set-selection-offsets(
+            body-input.anchor-position-byte-offset,
+            body-input.cursor-position_byte-offset,
+        );
+    }
+    changed body-color => { root.editor-layout-changed(); }
+    changed accent-color => { root.editor-layout-changed(); }
+    changed editor-caret-y => { root.reveal-editor-caret(); }
+    changed editor-caret-height => { root.reveal-editor-caret(); }
+
+    editor-scroll-layout-timer := Timer {
+        interval: 1ms;
+        running: false;
+        triggered => {
+            self.stop();
+            root.editor-layout-changed();
+        }
+    }
+
+    caret-timer := Timer {
+        interval: 520ms;
+        running: root.open && body-input.has-focus;
+        triggered => { root.caret-visible = !root.caret-visible; }
+    }
+
+    private property <bool> framed: !root.compact && !root.windowed;
+
+    background: root.background-color;
+    border-radius: root.framed ? 12px : 0px;
+    border-width: root.framed ? 1px : 0px;
+    border-color: root.frame-border-color;
+    drop-shadow-blur: root.framed ? 24px : 0px;
+    drop-shadow-offset-y: root.framed ? 6px : 0px;
+    drop-shadow-color: root.framed ? #00000035 : transparent;
+    clip: true;
+
+    VerticalBox {
+        spacing: 0px;
+
+        if !root.windowed : ComposerHeader {
+            compact: root.compact;
+            mode: root.mode;
+            can-pop-out: root.can-pop-out && !root.sending;
+            pop-out => { root.pop-out(); }
+            control-hover-color: root.control-hover-color;
+            muted-color: root.muted-color;
+            raised-color: root.raised-color;
+            secondary-color: root.secondary-color;
+            subtle-border-color: root.subtle-border-color;
+            title-color: root.title-color;
+            request-close => { root.request-close(); }
+        }
+
+        if root.review-note != "" : Rectangle {
+            background: root.accent-background;
+            height: review-row.preferred-height;
+            accessible-role: text;
+            accessible-label: root.review-note;
+            review-row := HorizontalLayout {
+                padding-left: 16px;
+                padding-right: 16px;
+                padding-top: 10px;
+                padding-bottom: 10px;
+                spacing: 10px;
+                Image {
+                    y: (parent.height - self.height) / 2;
+                    width: 18px;
+                    height: 18px;
+                    source: @image-url("../icons/lucide/filled/bot.svg");
+                    colorize: root.accent-color;
+                }
+                Text {
+                    horizontal-stretch: 1;
+                    text: root.review-note;
+                    color: root.title-color;
+                    font-size: TypeScale.secondary;
+                    vertical-alignment: center;
+                    wrap: word-wrap;
+                }
+            }
+        }
+
+        if !root.signature-mode : ComposerFromRow {
+            accounts: root.accounts;
+            selected-account-id <=> root.selected-account-id;
+            from-label <=> root.from-label;
+            background-color: root.background-color;
+            frame-border-color: root.subtle-border-color;
+            hover-color: root.control-hover-color;
+            muted-color: root.muted-color;
+            secondary-color: root.secondary-color;
+            selected-background: root.accent-background;
+            title-color: root.title-color;
+            changed(account-id) => {
+                AccountMailPreferences.composer-sender-email = "";
+                root.search-contacts(root.to, account-id);
+                AccountMailPreferences.composer-account-changed(account-id);
+            }
+        }
+
+        if !root.signature-mode && AccountMailPreferences.composer-sender-names.length <= 10 : SettingsSelectRow {
+            compact: root.compact;
+            title: @tr("From");
+            description: @tr("Verified sender identity");
+            choices: AccountMailPreferences.composer-sender-names;
+            selected-index: AccountMailPreferences.composer-sender-index;
+            title-color: root.title-color; description-color: root.secondary-color;
+            selected(index, value) => {
+                if AccountMailPreferences.composer-preferences-ready {
+                    AccountMailPreferences.composer-sender(index);
+                }
+            }
+        }
+        // Past ten addresses, the sender is found by searching (#252).
+        if !root.signature-mode && AccountMailPreferences.composer-sender-names.length > 10 : SenderPickerRow {
+            compact: root.compact;
+            title: @tr("From");
+            description: @tr("Verified sender identity");
+            value: AccountMailPreferences.composer-sender-names[AccountMailPreferences.composer-sender-index];
+            title-color: root.title-color; description-color: root.secondary-color;
+            clicked => {
+                AccountMailPreferences.composer-sender-query = "";
+                AccountMailPreferences.composer-sender-search("");
+                AccountMailPreferences.composer-sender-picker-open = true;
+            }
+        }
+
+        if !root.signature-mode : SettingsSelectRow {
+            compact: root.compact;
+            title: @tr("Signature");
+            description: AccountMailPreferences.composer-security;
+            choices: AccountMailPreferences.composer-signature-names;
+            selected-index: AccountMailPreferences.composer-signature-index;
+            title-color: root.title-color; description-color: root.secondary-color;
+            selected(index, value) => { if AccountMailPreferences.composer-preferences-ready { AccountMailPreferences.composer-signature(index); } }
+        }
+        if !root.signature-mode : ComposerRecipients {
+            open: root.open;
+            to <=> root.to;
+            cc <=> root.cc;
+            bcc <=> root.bcc;
+            contacts: root.contact-suggestions;
+            accent-background: root.accent-background;
+            accent-color: root.accent-color;
+            background-color: root.background-color;
+            body-color: root.body-color;
+            control-hover-color: root.control-hover-color;
+            muted-color: root.muted-color;
+            raised-color: root.raised-color;
+            subtle-border-color: root.subtle-border-color;
+            title-color: root.title-color;
+            search-contacts(value) => {
+                root.search-contacts(value, root.selected-account-id);
+            }
+            contact-selected(index) => {
+                root.to = root.select-contact(index, root.to);
+            }
+        }
+
+        if !root.signature-mode : Rectangle {
+            height: 1px;
+            background: root.subtle-border-color;
+        }
+
+        subject-row := ComposerSubject {
+            subject <=> root.subject;
+            naming-signature: root.signature-mode;
+            accent-color: root.accent-color;
+            background-color: root.background-color;
+            muted-color: root.muted-color;
+            title-color: root.title-color;
+        }
+
+        ComposerToolbar {
+            compact: root.compact;
+            templates-shown: !root.signature-mode;
+            reminder-shown: !root.signature-mode;
+            plain-text: root.plain-text;
+            format-switch-shown: !root.signature-mode;
+            plain-text-chosen(plain) => { root.plain-text-chosen(plain); }
+            accent-background: root.accent-background;
+            accent-color: root.accent-color;
+            control-hover-color: root.control-hover-color;
+            muted-color: root.muted-color;
+            raised-color: root.raised-color;
+            secondary-color: root.secondary-color;
+            subtle-border-color: root.subtle-border-color;
+            body-color: root.body-color;
+            bold-active: root.bold-active;
+            italic-active: root.italic-active;
+            underline-active: root.underline-active;
+            strike-active: root.strike-active;
+            code-active: root.code-active;
+            active-color: root.active-color;
+            active-highlight: root.active-highlight;
+            active-size: root.active-size;
+            active-family: root.active-family;
+            active-align: root.active-align;
+            link-active: root.active-link-url != "";
+            can-link: root.selection-start != root.selection-end;
+            apply-format(kind) => { root.apply-format(kind); }
+            insert-image => { root.insert-images(); }
+            open-templates => { root.templates-open = true; }
+            remind-time: root.remind-time;
+            remind => { root.remind(); }
+            translate-shown: root.translate-shown && !root.signature-mode;
+            improve-shown: root.improve-shown && !root.signature-mode;
+            ai-prompts: root.ai-prompts;
+            improving: root.improving;
+            improve(index) => { root.improve-requested(index, root.body, root.selection-start, root.selection-end); }
+            edit-prompts => { root.edit-prompts(); }
+            open-translate => {
+                root.translate-selection-start = root.selection-start;
+                root.translate-selection-end = root.selection-end;
+                root.translate-open = true;
+                root.translate-opened();
+            }
+            undo => {
+                root.history-requested("undo");
+                body-input.set-selection-offsets(root.selection-start, root.selection-end);
+                body-input.focus();
+            }
+            redo => {
+                root.history-requested("redo");
+                body-input.set-selection-offsets(root.selection-start, root.selection-end);
+                body-input.focus();
+            }
+        }
+
+        editor-surface := Rectangle {
+            vertical-stretch: 1;
+            min-height: 110px;
+            background: root.background-color;
+            clip: true;
+
+            body-scroll := ScrollView {
+                x: 0px;
+                y: 0px;
+                width: parent.width;
+                height: parent.height;
+                content-width: self.visible-width;
+                content-height: root.quote == "" && root.quote-left-out == ""
+                    ? max(self.visible-height, root.editor-content-height * 1px + 32px)
+                    : max(self.visible-height, root.quote-top + (root.quote-expanded ? root.quote-height * 1px + 16px : 0px));
+                horizontal-scrollbar-policy: always-off;
+                mouse-drag-pan-enabled: root.compact;
+
+                Text {
+                    x: 18px;
+                    y: 16px;
+                    width: body-scroll.visible-width - 36px;
+                    visible: root.body == "" && root.editor-preedit-text == "";
+                    text: @tr("Write your message…");
+                    color: root.muted-color;
+                    font-size: TypeScale.body-large;
+                    wrap: word-wrap;
+                }
+
+                for tile in root.editor-tiles : Image {
+                    x: 18px;
+                    y: 14px + tile.y * 1px;
+                    width: root.editor-width;
+                    height: tile.height * 1px;
+                    source: tile.image;
+                    image-fit: fill;
+                    image-rendering: smooth;
+                    // The transparent TextInput below exposes the editable
+                    // body; these raster tiles are its visual presentation.
+                    accessible-role: none;
+                }
+
+                body-input := TextInput {
+                    // Keep Slint's native IME candidate rectangle aligned with
+                    // the caret from cosmic-text, despite the proxy's plain layout.
+                    x: 18px + root.editor-caret-x * 1px - root.input-caret-x;
+                    y: 14px + root.editor-caret-y * 1px - root.input-caret-y;
+                    width: root.editor-width;
+                    height: root.editor-area-height;
+                    text <=> root.body;
+                    color: transparent;
+                    selection-background-color: transparent;
+                    selection-foreground-color: transparent;
+                    font-size: TypeScale.body-large;
+                    text-cursor-width: 0px;
+                    single-line: false;
+                    enabled: !root.sending;
+                    wrap: word-wrap;
+                    page-height: body-scroll.visible-height;
+                    edited => {
+                        root.body = self.text;
+                        root.body-edited(
+                            self.text,
+                            self.anchor-position-byte-offset,
+                            self.cursor-position_byte_offset,
+                            root.ime-edit-pending ? "" : root.pending-key-text,
+                        );
+                        root.pending-key-text = "";
+                        root.ime-edit-pending = false;
+                        self.set-selection-offsets(root.selection-start, root.selection-end);
+                    }
+                    key-pressed(event) => {
+                        root.pending-key-text = "";
+                        // The menu key and Shift+F10 open the editor menu at the caret.
+                        if (event.text == Key.Menu || (event.modifiers.shift && event.text == Key.F10)) {
+                            root.editor-menu-position = {
+                                x: root.editor-caret-x * 1px,
+                                y: (root.editor-caret-y + root.editor-caret-height) * 1px,
+                            };
+                            root.editor-caret-menu-requested();
+                            return accept;
+                        }
+                        if ((event.modifiers.control || event.modifiers.meta) && event.text.to-lowercase() == "b") {
+                            root.apply-format("bold");
+                            return accept;
+                        }
+                        if ((event.modifiers.control || event.modifiers.meta) && event.text.to-lowercase() == "i") {
+                            root.apply-format("italic");
+                            return accept;
+                        }
+                        if ((event.modifiers.control || event.modifiers.meta) && event.text.to-lowercase() == "u") {
+                            root.apply-format("underline");
+                            return accept;
+                        }
+                        if ((event.modifiers.control || event.modifiers.meta) && event.modifiers.shift && event.text.to-lowercase() == "x") {
+                            root.apply-format("strike");
+                            return accept;
+                        }
+                        // Paragraph alignment and removing formatting, with the keys webmail uses.
+                        if ((event.modifiers.control || event.modifiers.meta) && event.modifiers.shift && event.text.to-lowercase() == "l") {
+                            root.apply-format("align:left");
+                            return accept;
+                        }
+                        if ((event.modifiers.control || event.modifiers.meta) && event.modifiers.shift && event.text.to-lowercase() == "e") {
+                            root.apply-format("align:center");
+                            return accept;
+                        }
+                        if ((event.modifiers.control || event.modifiers.meta) && event.modifiers.shift && event.text.to-lowercase() == "r") {
+                            root.apply-format("align:right");
+                            return accept;
+                        }
+                        if ((event.modifiers.control || event.modifiers.meta) && event.text == "\\") {
+                            root.apply-format("clear");
+                            return accept;
+                        }
+                        // Pasting keeps the clipboard's formatting, and with Shift as well pastes
+                        // plain text, as browsers and other mail apps do.
+                        if (((event.modifiers.control || event.modifiers.meta) && event.text.to-lowercase() == "v")
+                            || (event.modifiers.shift && event.text == Key.Insert)) {
+                            if (event.modifiers.shift && event.text != Key.Insert) {
+                                self.paste();
+                            } else {
+                                root.paste-formatted();
+                            }
+                            return accept;
+                        }
+                        if ((event.modifiers.control || event.modifiers.meta) && !event.modifiers.shift
+                            && (event.text.to-lowercase() == "c" || event.text.to-lowercase() == "x")) {
+                            root.copy-formatted(event.text.to-lowercase() == "x");
+                            return accept;
+                        }
+                        if ((event.modifiers.control || event.modifiers.meta) && event.text.to-lowercase() == "z") {
+                            root.history-requested(event.modifiers.shift ? "redo" : "undo");
+                            self.set-selection-offsets(root.selection-start, root.selection-end);
+                            return accept;
+                        }
+                        if ((event.modifiers.control || event.modifiers.meta) && event.text == Key.Return && root.signature-mode) {
+                            root.save-signature();
+                            return accept;
+                        }
+                        if ((event.modifiers.control || event.modifiers.meta) && event.text == Key.Return && root.can-send) {
+                            root.submit(true);
+                            return accept;
+                        }
+                        if (root.editor-key-event(
+                            event.text,
+                            event.modifiers.control,
+                            event.modifiers.shift,
+                            event.modifiers.alt,
+                            event.modifiers.meta,
+                        )) {
+                            self.set-selection-offsets(root.selection-start, root.selection-end);
+                            return accept;
+                        }
+                        if (!event.modifiers.control && !event.modifiers.alt && !event.modifiers.meta
+                            && root.editor-preedit-text == "" && !root.ime-edit-pending) {
+                            root.pending-key-text = event.text;
+                        }
+                        reject
+                    }
+                    cursor-position-changed(position) => {
+                        root.input-caret-x = position.x;
+                        root.input-caret-y = position.y;
+                        root.caret-visible = true;
+                        // Only a focused proxy moves the caret for the user.
+                        // Unfocused it follows the document, and a new window's
+                        // would report the start as where the user is typing.
+                        if (self.has-focus) {
+                            root.selection-changed(
+                                self.text,
+                                self.anchor-position-byte-offset,
+                                self.cursor-position_byte_offset,
+                            );
+                        }
+                        root.reveal-editor-caret();
+                    }
+                }
+
+                // Corrections for a misspelled word, editing, and spelling languages. The
+                // editor's pointer area sits inside it and asks for it on a right press, so
+                // presses reach the editor first, as on Android, where Slint holds every
+                // press on a menu's own area to time a long press.
+                editor-menu := ContextMenuArea {
+                    x: 18px;
+                    y: 14px;
+                    width: root.editor-width;
+                    height: root.editor-area-height;
+
+                    Menu {
+                        for suggestion[index] in root.spelling-suggestions : MenuItem {
+                            title: suggestion;
+                            activated => {
+                                root.spelling-correct(index);
+                                body-input.set-selection-offsets(root.selection-start, root.selection-end);
+                            }
+                        }
+                        if root.spelling-word != "" && root.spelling-suggestions.length == 0 : MenuItem {
+                            title: @tr("No suggestions");
+                            enabled: false;
+                        }
+                        if root.spelling-word != "" : MenuItem {
+                            title: @tr("Add to dictionary");
+                            activated => { root.spelling-learn(); }
+                        }
+                        if root.spelling-word != "" : MenuItem {
+                            title: @tr("Ignore");
+                            activated => { root.spelling-ignore(); }
+                        }
+                        // A selected image's size and alt text, as its bar offers them.
+                        if root.active-image-size != "" && !root.editor-menu-touch : Menu {
+                            title: @tr("Image size");
+                            MenuItem { title: @tr("image size" => "Small"); checkable: true; checked: root.active-image-size == "small"; enabled: root.active-image-width > 160; activated => { root.apply-format("image-size:small"); } }
+                            MenuItem { title: @tr("image size" => "Medium"); checkable: true; checked: root.active-image-size == "medium"; enabled: root.active-image-width > 320; activated => { root.apply-format("image-size:medium"); } }
+                            MenuItem { title: @tr("image size" => "Large"); checkable: true; checked: root.active-image-size == "large"; enabled: root.active-image-width > 640; activated => { root.apply-format("image-size:large"); } }
+                            MenuItem { title: @tr("image size" => "Original size"); checkable: true; checked: root.active-image-size == "original"; activated => { root.apply-format("image-size:original"); } }
+                        }
+                        if root.active-image-size != "" && !root.editor-menu-touch : MenuItem {
+                            title: @tr("Alt text…");
+                            enabled: !root.sending;
+                            activated => { root.edit-image-alt(); }
+                        }
+                        if root.active-image-size != "" && !root.editor-menu-touch : MenuSeparator {}
+                        // A tapped word's menu holds only spelling, as phones offer.
+                        if root.spelling-word != "" && !root.editor-menu-touch : MenuSeparator {}
+                        if !root.editor-menu-touch : MenuItem {
+                            title: @tr("Cut");
+                            enabled: !root.sending && root.selection-start != root.selection-end;
+                            activated => { root.copy-formatted(true); }
+                        }
+                        if !root.editor-menu-touch : MenuItem {
+                            title: @tr("Copy");
+                            enabled: root.selection-start != root.selection-end;
+                            activated => { root.copy-formatted(false); }
+                        }
+                        if !root.editor-menu-touch : MenuItem {
+                            title: @tr("Paste");
+                            enabled: !root.sending;
+                            activated => { root.paste-formatted(); }
+                        }
+                        if !root.editor-menu-touch : MenuItem {
+                            title: @tr("Paste as plain text");
+                            enabled: !root.sending;
+                            activated => { body-input.paste(); }
+                        }
+                        if !root.editor-menu-touch : MenuItem {
+                            title: @tr("Select all");
+                            enabled: root.body != "";
+                            activated => { body-input.select-all(); }
+                        }
+                        if root.spelling-available : MenuSeparator {}
+                        if root.spelling-available : Menu {
+                            title: @tr("Spelling");
+                            MenuItem {
+                                title: @tr("Check spelling");
+                                checkable: true;
+                                checked <=> root.spelling-switch-shown;
+                                activated => { root.spelling-toggle(); }
+                            }
+                            if !root.spelling-languages-automatic : MenuSeparator {}
+                            for language[index] in root.spelling-languages : MenuItem {
+                                title: language.name;
+                                checkable: true;
+                                checked: language.checked;
+                                enabled: root.spelling-enabled;
+                                activated => { root.spelling-toggle-language(index); }
+                            }
+                            if !root.spelling-languages-automatic && root.spelling-languages.length == 0 : MenuItem {
+                                title: @tr("No dictionaries installed");
+                                enabled: false;
+                            }
+                        }
+                    }
+
+                    editor-hit := TouchArea {
+                        width: parent.width;
+                        height: parent.height;
+                        mouse-cursor: text;
+
+                        pointer-event(event) => {
+                            if (event.button == PointerEventButton.right && event.kind == PointerEventKind.down) {
+                                body-input.focus();
+                                root.editor-menu-position = { x: self.mouse-x, y: self.mouse-y };
+                                root.editor-menu-requested(self.mouse-x / 1px, self.mouse-y / 1px);
+                                // A right click on an image selects it.
+                                body-input.set-selection-offsets(root.selection-start, root.selection-end);
+                            }
+                            if (event.button == PointerEventButton.left || event.kind == PointerEventKind.move || event.kind == PointerEventKind.cancel) {
+                                if (event.button == PointerEventButton.left && event.kind == PointerEventKind.down) {
+                                    body-input.focus();
+                                }
+                                root.editor-pointer-event(
+                                    editor-hit.mouse-x / 1px,
+                                    editor-hit.mouse-y / 1px,
+                                    event.kind == PointerEventKind.down ? "down" : event.kind == PointerEventKind.move ? "move" : event.kind == PointerEventKind.up ? "up" : "cancel",
+                                    event.modifiers.control,
+                                    event.modifiers.shift,
+                                    event.modifiers.alt,
+                                    event.modifiers.meta,
+                                );
+                                body-input.set-selection-offsets(root.selection-start, root.selection-end);
+                            }
+                            // A finger lifted where it went down: a tap, which may be on a
+                            // misspelled word. A drag, or a scroll that takes the touch, isn't.
+                            if (event.touch-finger-id != 0) {
+                                if (event.kind == PointerEventKind.down) {
+                                    root.touch-down-position = { x: self.mouse-x, y: self.mouse-y };
+                                    root.touch-still = true;
+                                } else if (event.kind == PointerEventKind.move) {
+                                    if (abs(self.mouse-x - root.touch-down-position.x) > 8px || abs(self.mouse-y - root.touch-down-position.y) > 8px) {
+                                        root.touch-still = false;
+                                    }
+                                } else if (event.kind == PointerEventKind.up && root.touch-still) {
+                                    root.touch-still = false;
+                                    root.editor-menu-position = { x: self.mouse-x, y: self.mouse-y };
+                                    root.editor-tapped(self.mouse-x / 1px, self.mouse-y / 1px);
+                                } else {
+                                    root.touch-still = false;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if root.quote != "" : Rectangle {
+                    x: 18px;
+                    y: root.quote-top - 40px;
+                    width: root.editor-width;
+                    height: 32px;
+
+                    quote-toggle := TouchArea {
+                        width: parent.width - 80px;
+                        mouse-cursor: pointer;
+                        clicked => { root.quote-expanded = !root.quote-expanded; }
+                    }
+
+                    Image {
+                        x: 0px;
+                        y: (parent.height - 16px) / 2;
+                        width: 16px;
+                        height: 16px;
+                        source: root.quote-expanded
+                            ? @image-url("../icons/lucide/outline/chevron-down.svg")
+                            : @image-url("../icons/lucide/outline/chevron-right.svg");
+                        colorize: root.secondary-color;
+                    }
+
+                    Text {
+                        x: 22px;
+                        width: parent.width - 102px;
+                        height: parent.height;
+                        text: root.quote == "forward" ? @tr("Forwarded message") : @tr("Quoted text");
+                        color: quote-toggle.has-hover ? root.body-color : root.secondary-color;
+                        font-size: TypeScale.body;
+                        vertical-alignment: center;
+                        overflow: elide;
+                        accessible-role: button;
+                        accessible-label: root.quote-expanded ? @tr("Hide the quoted message") : @tr("Show the quoted message");
+                        accessible-action-default => { root.quote-expanded = !root.quote-expanded; }
+                    }
+
+                    IconButton {
+                        x: parent.width - 72px;
+                        width: 32px;
+                        height: 32px;
+                        icon: @image-url("../icons/lucide/outline/pencil.svg");
+                        icon-color: root.secondary-color;
+                        hover-background: root.control-hover-color;
+                        tooltip-text: @tr("Edit the quoted message as text");
+                        clicked => { root.edit-quote(); }
+                    }
+
+                    IconButton {
+                        x: parent.width - 36px;
+                        width: 32px;
+                        height: 32px;
+                        icon: @image-url("../icons/lucide/outline/x.svg");
+                        icon-color: root.secondary-color;
+                        hover-background: root.control-hover-color;
+                        tooltip-text: root.quote == "forward" ? @tr("Remove the forwarded message") : @tr("Remove the quoted message");
+                        clicked => { root.remove-quote(); }
+                    }
+                }
+
+                // A left-out original can come back until the message closes.
+                if root.quote == "" && root.quote-left-out != "" : Rectangle {
+                    x: 18px;
+                    y: root.quote-top - 40px;
+                    width: root.editor-width;
+                    height: 32px;
+
+                    restore-touch := TouchArea {
+                        width: parent.width;
+                        mouse-cursor: pointer;
+                        clicked => { root.restore-quote(); }
+                    }
+
+                    Image {
+                        x: 0px;
+                        y: (parent.height - 16px) / 2;
+                        width: 16px;
+                        height: 16px;
+                        source: @image-url("../icons/lucide/outline/undo.svg");
+                        colorize: restore-touch.has-hover ? root.body-color : root.secondary-color;
+                    }
+
+                    Text {
+                        x: 22px;
+                        width: parent.width - 22px;
+                        height: parent.height;
+                        text: root.quote-left-out == "forward" ? @tr("Add the forwarded message back") : @tr("Add the quoted text back");
+                        color: restore-touch.has-hover ? root.body-color : root.secondary-color;
+                        font-size: TypeScale.body;
+                        vertical-alignment: center;
+                        overflow: elide;
+                        accessible-role: button;
+                        accessible-label: self.text;
+                        accessible-action-default => { root.restore-quote(); }
+                    }
+                }
+
+                for tile in root.quote-tiles : Image {
+                    x: 18px;
+                    y: root.quote-top + tile.y * 1px;
+                    width: root.editor-width;
+                    height: tile.height * 1px;
+                    source: tile.image;
+                    image-fit: fill;
+                    image-rendering: smooth;
+                    visible: root.quote-expanded;
+                    accessible-role: none;
+                }
+
+                // The drawn original reads out as its text, as the reader's
+                // message does.
+                if root.quote != "" && root.quote-expanded : Rectangle {
+                    x: 18px;
+                    y: root.quote-top;
+                    width: root.editor-width;
+                    height: root.quote-height * 1px;
+                    accessible-role: text;
+                    accessible-label: root.quote-text;
+                }
+
+                Rectangle {
+                    x: 18px + root.editor-caret-x * 1px;
+                    y: 14px + root.editor-caret-y * 1px;
+                    width: 1px;
+                    height: root.editor-caret-height * 1px;
+                    visible: body-input.has-focus
+                        && body-input.anchor-position-byte-offset == body-input.cursor-position_byte_offset
+                        && root.caret-visible;
+                    background: root.body-color;
+                }
+
+                // Corner handles where a pointer drags them. Phones scroll the message by
+                // dragging, so there a selected image's size menu sizes it.
+                if root.editor-image-shown && root.active-image-size != "" && !root.sending && !root.compact : ImageResizeFrame {
+                    x: 18px + root.editor-image-x * 1px;
+                    y: 14px + root.editor-image-y * 1px;
+                    image-width: root.editor-image-width * 1px;
+                    image-height: root.editor-image-height * 1px;
+                    shown-css-width: root.active-image-shown-width;
+                    natural-width: root.active-image-width;
+                    room: root.editor-width - root.editor-image-x * 1px;
+                    accent-color: root.accent-color;
+                    handle-color: root.background-color;
+                    resized(width) => { root.apply-format("image-width:" + width); }
+                }
+
+                // Over a selected image's lower left corner, or under an image too small to
+                // hold it, and moved up to stay in view.
+                if root.editor-image-shown && root.active-image-size != "" && !root.sending : ImageBar {
+                    private property <bool> inside: root.editor-image-width * 1px >= self.width + 16px
+                        && root.editor-image-height * 1px >= self.height + 16px;
+                    x: self.inside ? 18px + root.editor-image-x * 1px + 8px
+                        : max(18px, min(18px + root.editor-image-x * 1px, 18px + root.editor-width - self.width));
+                    y: max(
+                        14px + root.editor-image-y * 1px + (self.inside ? 8px : 0px),
+                        min(
+                            14px + (root.editor-image-y + root.editor-image-height) * 1px
+                                + (self.inside ? -self.height - 8px : 6px),
+                            body-scroll.visible-height - body-scroll.content-y - self.height - 8px,
+                            body-scroll.content-height - self.height - 4px,
+                        ),
+                    );
+                    active-size: root.active-image-size;
+                    image-width: root.active-image-width;
+                    body-color: root.body-color;
+                    control-hover-color: root.control-hover-color;
+                    raised-color: root.raised-color;
+                    secondary-color: root.secondary-color;
+                    subtle-border-color: root.subtle-border-color;
+                    apply-format(kind) => { root.apply-format(kind); }
+                    edit-alt => { root.edit-image-alt(); }
+                }
+            }
+        }
+
+        if !root.signature-mode : ComposerAttachments {
+            compact: root.compact;
+            attachments: root.attachments;
+            links: root.links;
+            accent-color: root.accent-color;
+            background-color: root.background-color;
+            body-color: root.body-color;
+            control-hover-color: root.control-hover-color;
+            muted-color: root.muted-color;
+            raised-color: root.raised-color;
+            subtle-border-color: root.subtle-border-color;
+            remove-attachment(index) => { root.remove-attachment(index); }
+            remove-link(index) => { root.remove-link(index); }
+        }
+
+        if !root.signature-mode : ComposerPhotos {
+            compact: root.compact;
+            count: root.photo-count;
+            size: root.photo-size;
+            full-size: root.photo-full-size;
+            shrink <=> root.shrink-photos;
+            working: root.shrinking-photos;
+            body-color: root.body-color;
+            muted-color: root.muted-color;
+            raised-color: root.raised-color;
+            subtle-border-color: root.subtle-border-color;
+            toggled(on) => { root.shrink-photos-toggled(on); }
+        }
+
+        ComposerNotice {
+            notice: root.notice;
+            notice-is-error: root.notice-is-error;
+            accent-background: root.accent-background;
+            accent-color: root.accent-color;
+        }
+
+        ComposerFooter {
+            compact: root.compact;
+            attachment-picker-supported: root.attachment-picker-supported;
+            attachment-summary: root.attachment-summary;
+            can-send: root.can-send;
+            has-content: root.has-content;
+            sending: root.sending;
+            shrinking-photos: root.shrinking-photos;
+            attaching-files: root.attaching-files;
+            control-hover-color: root.control-hover-color;
+            muted-color: root.muted-color;
+            raised-color: root.raised-color;
+            secondary-color: root.secondary-color;
+            subtle-border-color: root.subtle-border-color;
+            signature: root.signature-mode;
+            submit(send-now) => { root.submit(send-now); }
+            schedule-send => { root.schedule-send(); }
+            save-signature => { root.save-signature(); }
+            pick-attachments => { root.pick-attachments(); }
+            link-sharing: root.link-sharing;
+            share-by-link => { root.share-by-link(); }
+            request-receipt <=> root.request-receipt;
+            importance <=> root.importance;
+            request-close => { root.request-close(); }
+        }
+    }
+
+    // What sending asks first (#236): to send without a subject, or without
+    // the file the message mentions.
+    ConfirmationDialog {
+        x: 0px;
+        y: 0px;
+        width: parent.width;
+        height: parent.height;
+        open <=> root.send-check-open;
+        title: root.send-check == "subject" ? @tr("Send without a subject?") : @tr("Did you mean to attach a file?");
+        description: root.send-check == "subject"
+            ? @tr("People see the subject first, in their list of mail.")
+            : @tr("The message mentions “{}”, but has no file attached.", root.send-check-keyword);
+        detail: "";
+        confirm-label: root.send-check == "subject" ? @tr("Send without subject") : @tr("Send anyway");
+        cancel-label: root.send-check == "subject" ? @tr("Add a subject") : @tr("Cancel");
+        action-label: root.send-check == "attachment" ? @tr("Attach files…") : "";
+        destructive: false;
+        icon: root.send-check == "subject"
+            ? @image-url("../icons/lucide/outline/alert-circle.svg")
+            : @image-url("../icons/lucide/outline/paperclip.svg");
+        surface: root.background-color;
+        dialog-border-color: root.frame-border-color;
+        title-color: root.title-color;
+        body-color: root.body-color;
+        muted-color: root.muted-color;
+        confirmed => { root.answer-send-check("send"); }
+        cancelled => {
+            if root.send-check == "subject" {
+                subject-row.focus-subject();
+            }
+            root.answer-send-check("cancel");
+        }
+        action => {
+            root.send-check-open = false;
+            root.answer-send-check("attach");
+        }
+    }
+
+    DiscardConfirmation {
+        compact: root.compact;
+        x: 0px;
+        y: 0px;
+        width: parent.width;
+        height: parent.height;
+        open: root.confirm-discard;
+        signature: root.signature-mode;
+        background-color: root.background-color;
+        frame-border-color: root.frame-border-color;
+        secondary-color: root.secondary-color;
+        title-color: root.title-color;
+        keep => { root.confirm-discard = false; }
+        discard => {
+            root.confirm-discard = false;
+            root.close();
+        }
+    }
+
+    if AccountMailPreferences.composer-sender-picker-open : SenderPicker {
+        x: 0px;
+        y: 0px;
+        width: parent.width;
+        height: parent.height;
+        z: 4000;
+        compact: root.compact;
+        title: @tr("Send from");
+        rows: AccountMailPreferences.composer-sender-matches;
+        matches: AccountMailPreferences.composer-sender-match-count;
+        query <=> AccountMailPreferences.composer-sender-query;
+        search(value) => { AccountMailPreferences.composer-sender-search(value); }
+        choose(index) => {
+            AccountMailPreferences.composer-sender-picker-open = false;
+            if AccountMailPreferences.composer-preferences-ready {
+                AccountMailPreferences.composer-sender(index);
+            }
+        }
+        close => { AccountMailPreferences.composer-sender-picker-open = false; }
+    }
+
+    // Where files dragged from elsewhere go: pictures in the text, other files attached.
+    if root.drop-hint : Rectangle {
+        x: 8px;
+        y: 8px;
+        width: parent.width - 16px;
+        height: parent.height - 16px;
+        z: 5000;
+        border-radius: 12px;
+        border-width: 2px;
+        border-color: root.accent-color;
+        background: root.background-color.with-alpha(0.92);
+
+        VerticalLayout {
+            alignment: center;
+            spacing: 8px;
+            padding: 24px;
+
+            Image {
+                height: 32px;
+                source: @image-url("../icons/lucide/outline/paperclip.svg");
+                colorize: root.accent-color;
+                image-fit: contain;
+                accessible-role: none;
+            }
+            Text {
+                text: @tr("Drop to add to your message");
+                color: root.title-color;
+                font-size: TypeScale.heading-small;
+                font-weight: 700;
+                horizontal-alignment: center;
+                wrap: word-wrap;
+            }
+            Text {
+                text: @tr("Pictures go in the text, and other files are attached.");
+                color: root.muted-color;
+                font-size: TypeScale.secondary;
+                horizontal-alignment: center;
+                wrap: word-wrap;
+            }
+        }
+    }
+
+    ImageAltEditor {
+        x: 0px;
+        y: 0px;
+        width: parent.width;
+        height: parent.height;
+        compact: root.compact;
+        open: root.image-alt-open;
+        alt <=> root.image-alt;
+        background-color: root.background-color;
+        body-color: root.body-color;
+        frame-border-color: root.frame-border-color;
+        muted-color: root.muted-color;
+        title-color: root.title-color;
+        accent-color: root.accent-color;
+        cancel => {
+            root.image-alt-open = false;
+            body-input.set-selection-offsets(root.image-selection-start, root.image-selection-end);
+            body-input.focus();
+        }
+        apply(alt) => {
+            root.image-alt-open = false;
+            root.format-requested("image-alt:" + alt, root.body, root.image-selection-start, root.image-selection-end);
+            body-input.set-selection-offsets(root.selection-start, root.selection-end);
+            body-input.focus();
+        }
+    }
+
+    TranslateEditor {
+        x: 0px;
+        y: 0px;
+        width: parent.width;
+        height: parent.height;
+        compact: root.compact;
+        open: root.translate-open;
+        selection: root.translate-selection-start != root.translate-selection-end;
+        choices: root.translate-choices;
+        choice-index <=> root.translate-index;
+        busy: root.translating;
+        failure: root.translate-failure;
+        detail: root.translate-detail;
+        background-color: root.background-color;
+        body-color: root.body-color;
+        frame-border-color: root.frame-border-color;
+        muted-color: root.muted-color;
+        title-color: root.title-color;
+        cancel => {
+            root.translate-open = false;
+            body-input.set-selection-offsets(root.translate-selection-start, root.translate-selection-end);
+            body-input.focus();
+        }
+        apply(index) => {
+            root.translate-requested(index, root.body, root.translate-selection-start, root.translate-selection-end);
+        }
+    }
+
+    LinkEditor {
+        x: 0px;
+        y: 0px;
+        width: parent.width;
+        height: parent.height;
+        compact: root.compact;
+        open: root.link-editor-open;
+        url <=> root.link-url;
+        has-existing-link: root.active-link-url != "";
+        background-color: root.background-color;
+        body-color: root.body-color;
+        frame-border-color: root.frame-border-color;
+        muted-color: root.muted-color;
+        title-color: root.title-color;
+        accent-color: root.accent-color;
+        cancel => {
+            root.link-editor-open = false;
+            body-input.set-selection-offsets(root.link-selection-start, root.link-selection-end);
+            body-input.focus();
+        }
+        apply(url) => {
+            root.link-editor-open = false;
+            root.link-requested(url, root.body, root.link-selection-start, root.link-selection-end);
+            body-input.set-selection-offsets(root.selection-start, root.selection-end);
+            body-input.focus();
+        }
+        remove => {
+            root.link-editor-open = false;
+            root.link-requested("", root.body, root.link-selection-start, root.link-selection-end);
+            body-input.set-selection-offsets(root.selection-start, root.selection-end);
+            body-input.focus();
+        }
+    }
+
+    EmailTemplates {
+        x: 0px;
+        y: 0px;
+        width: parent.width;
+        height: parent.height;
+        open <=> root.templates-open;
+        compact: root.compact;
+        templates: root.templates;
+        draft-subject: root.subject;
+        draft-body: root.body;
+        notice: root.notice;
+        notice-is-error: root.notice-is-error;
+        surface-color: root.background-color;
+        raised-color: root.raised-color;
+        ui-border-color: root.frame-border-color;
+        hover-color: root.control-hover-color;
+        title-color: root.title-color;
+        body-color: root.body-color;
+        muted-color: root.muted-color;
+        accent-color: root.accent-color;
+        refresh => { root.refresh-templates(); }
+        use-template(id) => root.use-template(id);
+        save-template(id, name, shortcut, subject, body) => root.save-template(id, name, shortcut, subject, body);
+        delete-template(id) => root.delete-template(id);
+        splice-text(text, start, end, insert) => root.splice-text(text, start, end, insert);
+    }
+
+    // Freeze the exact draft snapshot being submitted. If delivery fails the
+    // overlay disappears and the same fields become editable again.
+    if root.sending : TouchArea {
+        x: 0px;
+        y: 0px;
+        width: parent.width;
+        height: parent.height;
+        mouse-cursor: wait;
+    }
+}

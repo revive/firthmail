@@ -1,0 +1,66 @@
+import { MailboxRole, MailboxTitle, MailLabelRow } from "models.slint";
+
+// Standard mailboxes are named in the interface's language, and so are the
+// automatic categories (Marketing, News, Social and Pitch), which have roles
+// of their own while they keep the names the app gave them. Folders, saved
+// searches and the other labels keep the names their accounts and users gave
+// them.
+export global MailboxWords {
+    public pure function name(role: MailboxRole) -> string {
+        if role == MailboxRole.inbox { return @tr("Inbox"); }
+        if role == MailboxRole.starred { return @tr("Starred"); }
+        if role == MailboxRole.sent { return @tr("mailbox" => "Sent"); }
+        if role == MailboxRole.archive { return @tr("mailbox" => "Archive"); }
+        if role == MailboxRole.spam { return @tr("Spam"); }
+        if role == MailboxRole.trash { return @tr("Trash"); }
+        if role == MailboxRole.drafts { return @tr("Drafts"); }
+        if role == MailboxRole.important { return @tr("Important"); }
+        if role == MailboxRole.other { return @tr("Other"); }
+        if role == MailboxRole.snoozed { return @tr("Snoozed"); }
+        if role == MailboxRole.scheduled { return @tr("Scheduled"); }
+        if role == MailboxRole.marketing { return @tr("category" => "Marketing"); }
+        if role == MailboxRole.news { return @tr("category" => "News"); }
+        if role == MailboxRole.social { return @tr("category" => "Social"); }
+        if role == MailboxRole.pitch {
+            // Partnership, sponsorship and similar offers from unknown senders.
+            return @tr("category" => "Pitch");
+        }
+        return "";
+    }
+
+    // What a label is called: an automatic category by its role's name, as
+    // the window names it, and every other label by the name it was given.
+    public pure function label-name(label: MailLabelRow) -> string {
+        return label.role == MailboxRole.none ? label.name : MailboxWords.name(label.role);
+    }
+
+    // The labels of a conversation, for a screen reader, after a comma, or
+    // nothing when it has none, in the order the chips show them: the
+    // automatic categories first, which at most four can be, then the other
+    // labels, whose names `text` has.
+    public pure function label-note(categories: [MailboxRole], text: string) -> string {
+        let names = (categories.length > 0 ? MailboxWords.name(categories[0]) : "")
+            + (categories.length > 1 ? " · " + MailboxWords.name(categories[1]) : "")
+            + (categories.length > 2 ? " · " + MailboxWords.name(categories[2]) : "")
+            + (categories.length > 3 ? " · " + MailboxWords.name(categories[3]) : "");
+        if names == "" { return text == "" ? "" : ", " + text; }
+        return ", " + names + (text == "" ? "" : " · " + text);
+    }
+
+    // What a list or tab is called: the standard mailbox `mailbox` names, or
+    // else `text`.
+    public pure function title(mailbox: MailboxTitle, text: string) -> string {
+        if mailbox.role == MailboxRole.none { return text; }
+        if mailbox.unified {
+            if mailbox.role == MailboxRole.inbox { return @tr("Unified Inbox"); }
+            if mailbox.role == MailboxRole.starred { return @tr("Unified Starred"); }
+            if mailbox.role == MailboxRole.sent { return @tr("Unified Sent"); }
+            if mailbox.role == MailboxRole.archive { return @tr("Unified Archive"); }
+            if mailbox.role == MailboxRole.spam { return @tr("Unified Spam"); }
+            if mailbox.role == MailboxRole.trash { return @tr("Unified Trash"); }
+            if mailbox.role == MailboxRole.drafts { return @tr("Unified Drafts"); }
+        }
+        let name = MailboxWords.name(mailbox.role);
+        return mailbox.account == "" ? name : mailbox.account + " / " + name;
+    }
+}

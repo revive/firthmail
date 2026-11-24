@@ -1,0 +1,140 @@
+//! Structured, reactive UI messages shared by Rust controllers and Slint.
+//!
+//! Rust supplies only a stable source key and substitution arguments. Slint
+//! owns the wording and keeps the rendered text reactive when the bundled
+//! language changes. This also prevents background workers from formatting
+//! user-facing English before an update reaches the UI thread.
+
+use crate::{AppWindow, ComposerUi, I18n, LocalizedMessage, Notice};
+use slint::{ComponentHandle, SharedString};
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct UiMessage {
+    key: &'static str,
+    argument: String,
+    second_argument: String,
+    third_argument: String,
+}
+
+impl UiMessage {
+    pub(crate) const EMPTY: Self = Self {
+        key: "",
+        argument: String::new(),
+        second_argument: String::new(),
+        third_argument: String::new(),
+    };
+
+    /// Says nothing: the status line keeps what it shows.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.key.is_empty()
+    }
+
+    pub(crate) fn plain(key: &'static str) -> Self {
+        Self { key, ..Self::EMPTY }
+    }
+
+    pub(crate) fn detail(key: &'static str, argument: impl ToString) -> Self {
+        Self {
+            key,
+            argument: argument.to_string(),
+            second_argument: String::new(),
+            third_argument: String::new(),
+        }
+    }
+
+    pub(crate) fn arguments(
+        key: &'static str,
+        argument: impl ToString,
+        second_argument: impl ToString,
+    ) -> Self {
+        Self {
+            key,
+            argument: argument.to_string(),
+            second_argument: second_argument.to_string(),
+            third_argument: String::new(),
+        }
+    }
+
+    /// The source text, before any arguments go in.
+    pub(crate) fn key(&self) -> &'static str {
+        self.key
+    }
+
+    /// The source text with its arguments, as shown without a translation.
+    #[cfg(test)]
+    pub(crate) fn english(&self) -> String {
+        let mut arguments =
+            [&self.argument, &self.second_argument, &self.third_argument].into_iter();
+        let mut parts = self.key.split("{}");
+        let mut text = parts.next().unwrap_or_default().to_owned();
+        for part in parts {
+            text.push_str(arguments.next().map_or("", String::as_str));
+            text.push_str(part);
+        }
+        text
+    }
+
+    fn as_slint(&self) -> LocalizedMessage {
+        LocalizedMessage {
+            key: self.key.into(),
+            argument: self.argument.as_str().into(),
+            second_argument: self.second_argument.as_str().into(),
+            third_argument: self.third_argument.as_str().into(),
+        }
+    }
+}
+
+pub(crate) fn translated(app: &AppWindow, message: &UiMessage) -> SharedString {
+    let message = message.as_slint();
+    app.global::<I18n>().invoke_ui_message(
+        message.key,
+        message.argument,
+        message.second_argument,
+        message.third_argument,
+    )
+}
+
+pub(crate) trait AppWindowMessages {
+    fn set_startup_error(&self, message: UiMessage);
+    fn set_contact_save_status(&self, message: UiMessage);
+    fn set_render_status(&self, message: UiMessage);
+    fn set_sync_status(&self, message: UiMessage);
+    fn set_mail_export_status(&self, message: UiMessage);
+}
+
+impl ComposerUi<'_> {
+    /// The line under a composer's fields; an error shows as one.
+    pub(crate) fn set_notice(&self, message: UiMessage, error: bool) {
+        self.set_message(message.as_slint());
+        self.set_notice_is_error(error);
+    }
+}
+
+impl Notice<'_> {
+    /// What the notice at the foot of the main window says.
+    pub(crate) fn set_text(&self, message: UiMessage) {
+        self.set_message(message.as_slint());
+    }
+}
+
+impl AppWindowMessages for AppWindow {
+    fn set_startup_error(&self, message: UiMessage) {
+        self.set_startup_message(message.as_slint());
+    }
+
+    fn set_contact_save_status(&self, message: UiMessage) {
+        self.set_contact_save_message(message.as_slint());
+    }
+
+    fn set_render_status(&self, message: UiMessage) {
+        self.set_render_message(message.as_slint());
+    }
+
+    fn set_sync_status(&self, message: UiMessage) {
+        self.set_sync_message(message.as_slint());
+    }
+
+    fn set_mail_export_status(&self, message: UiMessage) {
+        self.set_mail_export_message(message.as_slint());
+    }
+}

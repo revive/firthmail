@@ -1,0 +1,6225 @@
+//! Native Gmail REST provider.
+//!
+//! Gmail accounts never open IMAP or SMTP connections. Metadata backfill uses
+//! messages.list plus 50-call multipart batches, live reconciliation uses the
+//! History API, reads hydrate complete Gmail threads, mutations use native
+//! labels, and drafts/sending use the Gmail API. The existing SQLite cache and
+//! pending-action queue remain provider-neutral and fully offline-first.
+
+use super::engine::{
+    PauseEnd, PriorityFetchCmd, SERVER_SEARCH_PAGES, ServerHits, SyncCmd, SyncCtx, caught_up,
+    check_interval, emit_sync_status, note_limit, set_state, set_state_error, wait_for_turn,
+    wait_out_pause,
+};
+use super::pacing;
+use crate::db::repo::{self, messages::NewMessage};
+use crate::error::{CoreError, LimitKind, Result};
+use crate::events::{CoreEvent, SyncProgress};
+use crate::http_body;
+use crate::models::{
+    AccountConfig, AccountSettings, Address, AuthKind, AutoReply, MailHistory, Provider,
+    ServerSearchCursor, now_ms, roles,
+};
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use futures::{StreamExt, stream};
+use reqwest::{Client, StatusCode, header::CONTENT_TYPE};
+use rusqlite::{OptionalExtension, params};
+use serde_json::{Value, json};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::time::Duration;
+use tokio::sync::{mpsc, oneshot, watch};
+
+const GMAIL_API: &str = "https://gmail.googleapis.com/gmail/v1/users/me";
+const GMAIL_BATCH_API: &str = "https://gmail.googleapis.com/batch/gmail/v1";
+const SYNC_PAGE_SIZE: usize = 100;
+// Gmail expands every multipart batch into concurrent inner requests. Keep
+// this comfortably below the per-user concurrency ceiling, leaving room for
+// one interactive reader request and other Gmail clients using the account.
+const BATCH_SIZE: usize = 10;
+// batchDelete is one Gmail API method call for many IDs, unlike a multipart
+// batch of individual requests. Keep request bodies bounded on mobile too.
+const TRASH_DELETE_BATCH_SIZE: usize = 500;
+const HISTORY_FETCH_CONCURRENCY: usize = 2;
+const HISTORY_PAGE_SIZE: usize = 500;
+// A full metadata page costs 5 units for messages.list plus 100 * 20 for
+// messages.get. At Google's 6,000 units/user/minute, 22 seconds keeps a large
+// backfill under quota with headroom for labels, actions, and interactive body
+// reads. Batching reduces HTTP overhead; it does not reduce quota-unit cost.
+// https://developers.google.com/workspace/gmail/api/reference/quota
+const BACKFILL_INTERVAL: Duration = Duration::from_secs(22);
+const HTTP_TIMEOUT: Duration = Duration::from_secs(45);
+const MAX_GMAIL_JSON_BODY_BYTES: usize = 64 * 1024 * 1024;
+const MAX_GMAIL_BATCH_BODY_BYTES: usize = 16 * 1024 * 1024;
+const MAX_GMAIL_PAGE_TOKEN_BYTES: usize = 16 * 1024;
+const MAX_GMAIL_LABELS: usize = 10_000;
+const MAX_GMAIL_HEADERS_BYTES: usize = 256 * 1024;
+const MAX_GMAIL_MIME_PARTS: usize = 2_000;
+const MAX_HISTORY_THREADS_PER_PAGE: usize = 10_000;
+const HISTORY_THREAD_BATCH: usize = 4;
+const MAX_HISTORY_MESSAGES_PER_BATCH: usize = 10_000;
+const MAX_MESSAGES_PER_THREAD: usize = 10_000;
+const MAX_DRAFT_PAGES: usize = 100;
+const MAX_DRAFTS: usize = 50_000;
+const MAX_GMAIL_ATTACHMENT_BYTES: usize = 25 * 1024 * 1024;
+/// messages.batchModify takes at most 1000 ids a call.
+const MARK_READ_BATCH_SIZE: usize = 1000;
+/// A call costs 50 quota units, and a project made since May 2026 has 6000
+/// a minute per user: at most 100 calls a minute leaves room for the rest.
+const MARK_READ_PACE: Duration = Duration::from_millis(600);
+const METADATA_HEADERS: &[&str] = &[
+    "Authentication-Results",
+    "Bcc",
+    "Cc",
+    "Content-Type",
+    "Date",
+    "Disposition-Notification-Options",
+    "Disposition-Notification-To",
+    "From",
+    "Importance",
+    "In-Reply-To",
+    "List-Id",
+    "List-Unsubscribe",
+    "List-Unsubscribe-Post",
+    "Message-ID",
+    "Precedence",
+    "Priority",
+    "References",
+    "Reply-To",
+    "Return-Path",
+    "Sender",
+    "Subject",
+    "To",
+    "X-MSMail-Priority",
+    "X-Priority",
+];
+
+type RemoteDraftAttachment = (Option<String>, Option<String>, String, Option<String>);
+
+#[derive(Clone)]
+struct GmailApi {
+    http: Client,
+    ctx: SyncCtx,
+    account: AccountConfig,
+    /// Headers the account's rules test (#238), fetched with new mail's
+    /// metadata besides [`METADATA_HEADERS`].
+    rule_headers: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+#[derive(Debug, Clone)]
+struct GmailLabel {
+    id: String,
+    name: String,
+    kind: String,
+    background_color: Option<String>,
+    text_color: Option<String>,
+}
+
+#[derive(Debug)]
+struct HistoryPage {
+    affected_threads: BTreeSet<String>,
+    /// The messages the history added, which are new mail (or sent, or
+    /// drafts) where its other records only change what is there.
+    added_messages: HashSet<String>,
+    next_page_token: Option<String>,
+    completed_history_id: Option<String>,
+}
+
+impl GmailApi {
+    fn new(ctx: SyncCtx, account: AccountConfig) -> Result<Self> {
+        let http = crate::net::proxy::http_builder(account.proxy_owner())
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .timeout(HTTP_TIMEOUT)
+            .redirect(reqwest::redirect::Policy::none())
+            .user_agent(concat!("Flectar-Mail/", env!("CARGO_PKG_VERSION")))
+            .build()
+            .map_err(|error| CoreError::Network(error.to_string()))?;
+        Ok(Self {
+            http,
+            ctx,
+            account,
+            rule_headers: Default::default(),
+        })
+    }
+
+    /// Fetch the headers `names` with metadata too, as rules test them.
+    fn set_rule_headers(&self, names: Vec<String>) {
+        if let Ok(mut rule_headers) = self.rule_headers.lock() {
+            *rule_headers = names;
+        }
+    }
+
+    /// The headers a metadata fetch asks for.
+    fn metadata_headers(&self) -> Vec<String> {
+        let mut headers = METADATA_HEADERS
+            .iter()
+            .map(|header| (*header).to_owned())
+            .collect::<Vec<_>>();
+        if let Ok(rule_headers) = self.rule_headers.lock() {
+            for name in rule_headers.iter() {
+                if !headers.iter().any(|known| known.eq_ignore_ascii_case(name)) {
+                    headers.push(name.clone());
+                }
+            }
+        }
+        headers
+    }
+
+    async fn token(&self) -> Result<String> {
+        self.ctx
+            .tokens
+            .access_token(self.account.id, Provider::Gmail)
+            .await
+    }
+
+    async fn get_json(&self, url: &str) -> Result<Value> {
+        for attempt in 0..2 {
+            let token = self.token().await?;
+            let response = self
+                .http
+                .get(url)
+                .bearer_auth(token)
+                .send()
+                .await
+                .map_err(network_error)?;
+            let result = google_json(response).await;
+            if attempt == 0 && matches!(&result, Err(CoreError::NeedsReauth)) {
+                self.ctx.tokens.invalidate(self.account.id).await;
+                continue;
+            }
+            return result;
+        }
+        Err(CoreError::NeedsReauth)
+    }
+
+    async fn post_json(&self, url: &str, body: &Value) -> Result<Value> {
+        for attempt in 0..2 {
+            let token = self.token().await?;
+            let response = self
+                .http
+                .post(url)
+                .bearer_auth(token)
+                .json(body)
+                .send()
+                .await
+                .map_err(network_error)?;
+            let result = google_json(response).await;
+            if attempt == 0 && matches!(&result, Err(CoreError::NeedsReauth)) {
+                self.ctx.tokens.invalidate(self.account.id).await;
+                continue;
+            }
+            return result;
+        }
+        Err(CoreError::NeedsReauth)
+    }
+
+    async fn put_json(&self, url: &str, body: &Value) -> Result<Value> {
+        for attempt in 0..2 {
+            let token = self.token().await?;
+            let response = self
+                .http
+                .put(url)
+                .bearer_auth(token)
+                .json(body)
+                .send()
+                .await
+                .map_err(network_error)?;
+            let result = google_json(response).await;
+            if attempt == 0 && matches!(&result, Err(CoreError::NeedsReauth)) {
+                self.ctx.tokens.invalidate(self.account.id).await;
+                continue;
+            }
+            return result;
+        }
+        Err(CoreError::NeedsReauth)
+    }
+
+    async fn delete_json(&self, url: &str) -> Result<Value> {
+        for attempt in 0..2 {
+            let token = self.token().await?;
+            let response = self
+                .http
+                .delete(url)
+                .bearer_auth(token)
+                .send()
+                .await
+                .map_err(network_error)?;
+            let result = google_json(response).await;
+            if attempt == 0 && matches!(&result, Err(CoreError::NeedsReauth)) {
+                self.ctx.tokens.invalidate(self.account.id).await;
+                continue;
+            }
+            return result;
+        }
+        Err(CoreError::NeedsReauth)
+    }
+
+    async fn profile_history_id(&self) -> Result<String> {
+        let history_id = self
+            .get_json(&format!("{GMAIL_API}/profile"))
+            .await?
+            .get("historyId")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .ok_or_else(|| CoreError::Other("Gmail profile omitted historyId".into()))?;
+        if history_id.len() > MAX_GMAIL_PAGE_TOKEN_BYTES {
+            return Err(CoreError::Network(
+                "Gmail returned an oversized history cursor".into(),
+            ));
+        }
+        Ok(history_id)
+    }
+
+    async fn labels(&self) -> Result<Vec<GmailLabel>> {
+        let value = self.get_json(&format!("{GMAIL_API}/labels")).await?;
+        let labels = value
+            .get("labels")
+            .and_then(Value::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        if labels.len() > MAX_GMAIL_LABELS {
+            return Err(CoreError::Network(format!(
+                "Gmail returned more than {MAX_GMAIL_LABELS} labels"
+            )));
+        }
+        Ok(labels
+            .iter()
+            .filter_map(|label| {
+                Some(GmailLabel {
+                    id: label.get("id")?.as_str()?.to_owned(),
+                    name: label.get("name")?.as_str()?.to_owned(),
+                    kind: label
+                        .get("type")
+                        .and_then(Value::as_str)
+                        .unwrap_or("system")
+                        .to_ascii_lowercase(),
+                    background_color: label
+                        .pointer("/color/backgroundColor")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
+                    text_color: label
+                        .pointer("/color/textColor")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
+                })
+            })
+            .collect())
+    }
+
+    /// How many unread messages carry a label: only labels.get counts them.
+    async fn unread_in_label(&self, label_id: &str) -> Result<i64> {
+        let label = self
+            .get_json(&format!(
+                "{GMAIL_API}/labels/{}?fields=messagesUnread",
+                urlencode(label_id)
+            ))
+            .await?;
+        Ok(label
+            .get("messagesUnread")
+            .and_then(Value::as_i64)
+            .unwrap_or(0))
+    }
+
+    async fn sender_identities(&self) -> Result<Vec<crate::models::SenderIdentity>> {
+        let value = self
+            .get_json(&format!("{GMAIL_API}/settings/sendAs"))
+            .await?;
+        crate::sender_identities::parse_gmail_identities_value(&self.account, value)
+    }
+
+    async fn list_messages_page(
+        &self,
+        page_token: Option<&str>,
+        cutoff: Option<chrono::NaiveDate>,
+    ) -> Result<(Vec<Value>, Option<String>)> {
+        let url = messages_list_url(page_token, cutoff);
+        let response = self.get_json(&url).await?;
+        let remote_messages = response
+            .get("messages")
+            .and_then(Value::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        if remote_messages.len() > SYNC_PAGE_SIZE {
+            return Err(CoreError::Network(format!(
+                "Gmail returned more than {SYNC_PAGE_SIZE} messages in one sync page"
+            )));
+        }
+        let ids = remote_messages
+            .iter()
+            .filter_map(|message| message.get("id").and_then(Value::as_str))
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        let mut messages = Vec::with_capacity(ids.len());
+        for chunk in ids.chunks(BATCH_SIZE) {
+            messages.extend(self.batch_metadata(chunk).await?);
+        }
+        let next = gmail_page_token(&response)?;
+        Ok((messages, next))
+    }
+
+    /// Find a previously accepted send by its stable RFC 5322 Message-ID. This
+    /// closes the ambiguous timeout window around drafts.send: on retry we can
+    /// prove Gmail already placed the message in Sent instead of sending a
+    /// duplicate.
+    async fn find_sent_by_message_id(&self, message_id: &str) -> Result<Option<Value>> {
+        let message_id = message_id.trim().trim_matches(['<', '>']);
+        if message_id.is_empty() {
+            return Ok(None);
+        }
+        let query = format!("rfc822msgid:<{message_id}>");
+        let value = self
+            .get_json(&format!(
+                "{GMAIL_API}/messages?maxResults=10&includeSpamTrash=true&q={}",
+                urlencode(&query)
+            ))
+            .await?;
+        for id in value
+            .get("messages")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|message| message.get("id").and_then(Value::as_str))
+        {
+            let resource = self
+                .get_json(&format!(
+                    "{GMAIL_API}/messages/{}?format=metadata",
+                    urlencode(id)
+                ))
+                .await?;
+            let sent = resource
+                .get("labelIds")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .any(|label| label.as_str() == Some("SENT"));
+            if sent {
+                return Ok(Some(resource));
+            }
+        }
+        Ok(None)
+    }
+
+    async fn batch_metadata(&self, ids: &[String]) -> Result<Vec<Value>> {
+        self.batch_metadata_at(GMAIL_BATCH_API, ids).await
+    }
+
+    /// [`Self::batch_metadata`] through the batch endpoint at `url`.
+    async fn batch_metadata_at(&self, url: &str, ids: &[String]) -> Result<Vec<Value>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let boundary = format!("flectar_{:016x}_{}", rand::random::<u64>(), now_ms());
+        let body = build_batch_body(ids, &boundary, &self.metadata_headers());
+        for attempt in 0..2 {
+            let token = self.token().await?;
+            let response = self
+                .http
+                .post(url)
+                .bearer_auth(token)
+                .header(
+                    CONTENT_TYPE,
+                    format!("multipart/mixed; boundary={boundary}"),
+                )
+                .body(body.clone())
+                .send()
+                .await
+                .map_err(network_error)?;
+            let result = if !response.status().is_success() {
+                google_json(response).await.map(|_| Vec::new())
+            } else {
+                let response_boundary = response
+                    .headers()
+                    .get(CONTENT_TYPE)
+                    .and_then(|value| value.to_str().ok())
+                    .and_then(multipart_boundary)
+                    .map(str::to_owned)
+                    .ok_or_else(|| {
+                        CoreError::Network("Gmail batch response omitted boundary".into())
+                    })?;
+                let text =
+                    http_body::text(response, MAX_GMAIL_BATCH_BODY_BYTES, "Gmail batch response")
+                        .await?;
+                parse_batch_response(&text, &response_boundary, ids.len())
+            };
+            if attempt == 0 && matches!(&result, Err(CoreError::NeedsReauth)) {
+                self.ctx.tokens.invalidate(self.account.id).await;
+                continue;
+            }
+            return result;
+        }
+        Err(CoreError::NeedsReauth)
+    }
+
+    /// A message's original bytes from the mailbox API at `base`. `size` is
+    /// about how many there are.
+    async fn raw_message_at(
+        &self,
+        base: &str,
+        provider_message_id: &str,
+        size: u64,
+    ) -> Result<Vec<u8>> {
+        let url = format!(
+            "{base}/messages/{}?format=raw",
+            urlencode(provider_message_id)
+        );
+        for attempt in 0..2 {
+            let token = self.token().await?;
+            let response = self
+                .http
+                .get(&url)
+                .bearer_auth(token)
+                // A large message gets time to arrive, as base64, at 64 KiB/s.
+                .timeout(HTTP_TIMEOUT.max(Duration::from_secs(size * 4 / 3 / (64 * 1024))))
+                .send()
+                .await
+                .map_err(network_error)?;
+            let result = google_json(response).await;
+            if attempt == 0 && matches!(&result, Err(CoreError::NeedsReauth)) {
+                self.ctx.tokens.invalidate(self.account.id).await;
+                continue;
+            }
+            let value = result?;
+            let raw = value
+                .get("raw")
+                .and_then(Value::as_str)
+                .ok_or_else(|| CoreError::NotFound("the Gmail message's original".into()))?;
+            return decode_gmail_data(raw);
+        }
+        Err(CoreError::NeedsReauth)
+    }
+
+    async fn message_full(&self, message_id: &str) -> Result<Value> {
+        self.get_json(&format!(
+            "{GMAIL_API}/messages/{}?format=full",
+            urlencode(message_id)
+        ))
+        .await
+    }
+
+    async fn thread(&self, thread_id: &str, full: bool) -> Result<Value> {
+        let mut url = format!(
+            "{GMAIL_API}/threads/{}?format={}",
+            urlencode(thread_id),
+            if full { "full" } else { "metadata" }
+        );
+        if !full {
+            for header in self.metadata_headers() {
+                url.push_str("&metadataHeaders=");
+                url.push_str(&urlencode(&header));
+            }
+        }
+        self.get_json(&url).await
+    }
+
+    async fn history(&self, history_id: &str, page_token: Option<&str>) -> Result<HistoryPage> {
+        let mut url = format!(
+            "{GMAIL_API}/history?startHistoryId={}&maxResults={HISTORY_PAGE_SIZE}",
+            urlencode(history_id)
+        );
+        if let Some(token) = page_token {
+            url.push_str("&pageToken=");
+            url.push_str(&urlencode(token));
+        }
+        let value = self.get_json(&url).await?;
+        parse_history_page(&value, history_id)
+    }
+
+    async fn modify_message(
+        &self,
+        message_id: &str,
+        add: &[String],
+        remove: &[String],
+    ) -> Result<()> {
+        ignore_not_found(
+            self.post_json(
+                &format!("{GMAIL_API}/messages/{}/modify", urlencode(message_id)),
+                &json!({ "addLabelIds": add, "removeLabelIds": remove }),
+            )
+            .await,
+        )
+    }
+
+    async fn modify_thread(
+        &self,
+        thread_id: &str,
+        add: &[String],
+        remove: &[String],
+    ) -> Result<()> {
+        ignore_not_found(
+            self.post_json(
+                &format!("{GMAIL_API}/threads/{}/modify", urlencode(thread_id)),
+                &json!({ "addLabelIds": add, "removeLabelIds": remove }),
+            )
+            .await,
+        )
+    }
+
+    async fn trash_message(&self, message_id: &str) -> Result<()> {
+        ignore_not_found(
+            self.post_json(
+                &format!("{GMAIL_API}/messages/{}/trash", urlencode(message_id)),
+                &json!({}),
+            )
+            .await,
+        )
+    }
+
+    async fn delete_message_permanently(&self, message_id: &str) -> Result<()> {
+        ignore_not_found(
+            self.delete_json(&format!("{GMAIL_API}/messages/{}", urlencode(message_id)))
+                .await,
+        )
+    }
+
+    /// Mark read every unread message with `label` that arrived before
+    /// `before`, in seconds (#234). The ids come first, so taking UNREAD off
+    /// doesn't move the pages; then a thousand at a time, paced so a big
+    /// label stays inside a minute's quota. A retry finds only what is
+    /// still unread.
+    async fn mark_label_read(&self, label: &str, before: i64) -> Result<()> {
+        let query = format!("is:unread before:{before}");
+        let mut ids = Vec::new();
+        let mut page_token: Option<String> = None;
+        let mut seen_page_tokens = HashSet::new();
+        loop {
+            let mut url = format!(
+                "{GMAIL_API}/messages?labelIds={}&q={}&includeSpamTrash=true&maxResults=500",
+                urlencode(label),
+                urlencode(&query)
+            );
+            if let Some(token) = page_token.as_deref() {
+                url.push_str("&pageToken=");
+                url.push_str(&urlencode(token));
+            }
+            let page = self.get_json(&url).await?;
+            ids.extend(
+                page.get("messages")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|message| message.get("id").and_then(Value::as_str))
+                    .map(str::to_owned),
+            );
+            page_token = page
+                .get("nextPageToken")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            match page_token.as_deref() {
+                None => break,
+                Some(token)
+                    if token.len() > MAX_GMAIL_PAGE_TOKEN_BYTES
+                        || !seen_page_tokens.insert(token.to_owned()) =>
+                {
+                    return Err(CoreError::Network(
+                        "Gmail returned an invalid page cursor".into(),
+                    ));
+                }
+                Some(_) => {}
+            }
+        }
+        for (index, batch) in ids.chunks(MARK_READ_BATCH_SIZE).enumerate() {
+            if index > 0 {
+                tokio::time::sleep(MARK_READ_PACE).await;
+            }
+            self.post_json(
+                &format!("{GMAIL_API}/messages/batchModify"),
+                &json!({ "ids": batch, "removeLabelIds": ["UNREAD"] }),
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
+    async fn empty_trash(&self) -> Result<()> {
+        let mut ids = std::collections::HashSet::new();
+        let mut page_token: Option<String> = None;
+        let mut seen_page_tokens = std::collections::HashSet::new();
+        loop {
+            let mut url =
+                format!("{GMAIL_API}/messages?labelIds=TRASH&includeSpamTrash=true&maxResults=500");
+            if let Some(token) = page_token.as_deref() {
+                url.push_str("&pageToken=");
+                url.push_str(&urlencode(token));
+            }
+            let page = self.get_json(&url).await?;
+            if let Some(messages) = page.get("messages").and_then(Value::as_array) {
+                for message in messages {
+                    if let Some(id) = message.get("id").and_then(Value::as_str) {
+                        ids.insert(id.to_owned());
+                    }
+                }
+            }
+            page_token = page
+                .get("nextPageToken")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            match page_token.as_deref() {
+                None => break,
+                Some(token)
+                    if token.len() > MAX_GMAIL_PAGE_TOKEN_BYTES
+                        || !seen_page_tokens.insert(token.to_owned()) =>
+                {
+                    return Err(CoreError::Network(
+                        "Gmail returned an invalid Trash page cursor".into(),
+                    ));
+                }
+                Some(_) => {}
+            }
+        }
+        let ids = ids.into_iter().collect::<Vec<_>>();
+        for batch in ids.chunks(TRASH_DELETE_BATCH_SIZE) {
+            self.post_json(
+                &format!("{GMAIL_API}/messages/batchDelete"),
+                &json!({ "ids": batch }),
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
+    async fn trash_thread(&self, thread_id: &str) -> Result<()> {
+        ignore_not_found(
+            self.post_json(
+                &format!("{GMAIL_API}/threads/{}/trash", urlencode(thread_id)),
+                &json!({}),
+            )
+            .await,
+        )
+    }
+
+    async fn attachment(&self, message_id: &str, attachment_id: &str) -> Result<Vec<u8>> {
+        let value = self
+            .get_json(&format!(
+                "{GMAIL_API}/messages/{}/attachments/{}",
+                urlencode(message_id),
+                urlencode(attachment_id)
+            ))
+            .await?;
+        let encoded = value
+            .get("data")
+            .and_then(Value::as_str)
+            .ok_or_else(|| CoreError::Other("Gmail attachment omitted data".into()))?;
+        if encoded.len() > MAX_GMAIL_ATTACHMENT_BYTES.saturating_mul(4).div_ceil(3) + 4 {
+            return Err(CoreError::Other(format!(
+                "Gmail attachment exceeds the {} MiB safety limit",
+                MAX_GMAIL_ATTACHMENT_BYTES / (1024 * 1024)
+            )));
+        }
+        let bytes = decode_gmail_data(encoded)?;
+        if bytes.len() > MAX_GMAIL_ATTACHMENT_BYTES {
+            return Err(CoreError::Other(format!(
+                "Gmail attachment exceeds the {} MiB safety limit",
+                MAX_GMAIL_ATTACHMENT_BYTES / (1024 * 1024)
+            )));
+        }
+        Ok(bytes)
+    }
+
+    async fn create_label(&self, name: &str, color: Option<&str>) -> Result<GmailLabel> {
+        let mut body = json!({
+            "name": name,
+            "labelListVisibility": "labelShow",
+            "messageListVisibility": "show"
+        });
+        if let Some(background) = color.and_then(gmail_palette_color) {
+            body["color"] = json!({
+                "backgroundColor": background,
+                "textColor": contrasting_text(background),
+            });
+        }
+        let value = self
+            .post_json(&format!("{GMAIL_API}/labels"), &body)
+            .await?;
+        Ok(GmailLabel {
+            id: required_string(&value, "id")?.to_owned(),
+            name: value
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or(name)
+                .to_owned(),
+            kind: "user".into(),
+            background_color: value
+                .pointer("/color/backgroundColor")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            text_color: value
+                .pointer("/color/textColor")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+        })
+    }
+
+    async fn update_label(&self, provider_id: &str, name: &str, color: Option<&str>) -> Result<()> {
+        let mut body = json!({ "name": name });
+        if let Some(background) = color.and_then(gmail_palette_color) {
+            body["color"] = json!({
+                "backgroundColor": background,
+                "textColor": contrasting_text(background),
+            });
+        }
+        self.put_json(
+            &format!("{GMAIL_API}/labels/{}", urlencode(provider_id)),
+            &body,
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn delete_label(&self, provider_id: &str) -> Result<()> {
+        ignore_not_found(
+            self.delete_json(&format!("{GMAIL_API}/labels/{}", urlencode(provider_id)))
+                .await,
+        )
+    }
+
+    async fn list_drafts(&self) -> Result<Vec<(String, String)>> {
+        let mut output = Vec::new();
+        let mut page: Option<String> = None;
+        let mut seen_page_tokens = HashSet::new();
+        for _ in 0..MAX_DRAFT_PAGES {
+            let mut url = format!("{GMAIL_API}/drafts?maxResults=500");
+            if let Some(token) = page.as_deref() {
+                url.push_str("&pageToken=");
+                url.push_str(&urlencode(token));
+            }
+            let value = self.get_json(&url).await?;
+            for draft in value
+                .get("drafts")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                if output.len() == MAX_DRAFTS {
+                    return Err(CoreError::Network(format!(
+                        "Gmail returned more than {MAX_DRAFTS} drafts"
+                    )));
+                }
+                let (Some(draft_id), Some(message_id)) = (
+                    draft.get("id").and_then(Value::as_str),
+                    draft.pointer("/message/id").and_then(Value::as_str),
+                ) else {
+                    continue;
+                };
+                output.push((draft_id.to_owned(), message_id.to_owned()));
+            }
+            page = gmail_page_token(&value)?;
+            match page.as_ref() {
+                Some(token) if !seen_page_tokens.insert(token.clone()) => {
+                    return Err(CoreError::Network(
+                        "Gmail repeated a draft page token".into(),
+                    ));
+                }
+                Some(_) => {}
+                None => return Ok(output),
+            }
+        }
+        Err(CoreError::Network(format!(
+            "Gmail exceeded the {MAX_DRAFT_PAGES}-page draft safety limit"
+        )))
+    }
+
+    async fn upsert_draft(
+        &self,
+        draft_id: Option<&str>,
+        raw: &[u8],
+        thread_id: Option<&str>,
+    ) -> Result<Value> {
+        let body = json!({
+            "message": {
+                "raw": URL_SAFE_NO_PAD.encode(raw),
+                "threadId": thread_id,
+            }
+        });
+        match draft_id.filter(|value| !value.is_empty()) {
+            Some(id) => {
+                self.put_json(&format!("{GMAIL_API}/drafts/{}", urlencode(id)), &body)
+                    .await
+            }
+            None => self.post_json(&format!("{GMAIL_API}/drafts"), &body).await,
+        }
+    }
+
+    async fn delete_draft(&self, draft_id: &str) -> Result<()> {
+        ignore_not_found(
+            self.delete_json(&format!("{GMAIL_API}/drafts/{}", urlencode(draft_id)))
+                .await,
+        )
+    }
+
+    /// Send a message as it is, in `thread_id`'s Gmail thread.
+    async fn send_raw(&self, raw: &[u8], thread_id: Option<&str>) -> Result<Value> {
+        self.post_json(
+            &format!("{GMAIL_API}/messages/send"),
+            &json!({
+                "raw": URL_SAFE_NO_PAD.encode(raw),
+                "threadId": thread_id,
+            }),
+        )
+        .await
+    }
+
+    async fn send_draft(&self, draft_id: &str) -> Result<Value> {
+        self.post_json(
+            &format!("{GMAIL_API}/drafts/send"),
+            &json!({ "id": draft_id }),
+        )
+        .await
+    }
+
+    /// Re-check the exact identity at provider I/O time. A cached alias may
+    /// have been revoked after the composer opened; Gmail must remain the
+    /// authority on whether the From address is still usable.
+    /// Confirm `email` is a usable SendAs address right now and return its
+    /// configured Reply-To, which Gmail only applies itself in its web UI.
+    async fn validate_sender_identity(&self, email: &str) -> Result<Option<Address>> {
+        let value = self
+            .get_json(&format!("{GMAIL_API}/settings/sendAs/{}", urlencode(email)))
+            .await
+            .map_err(|error| match error {
+                CoreError::NotFound(_) => CoreError::Other(format!(
+                    "{email} is no longer an authorized Gmail sender identity"
+                )),
+                other => other,
+            })?;
+        let returned = required_string(&value, "sendAsEmail")?;
+        let primary = value
+            .get("isPrimary")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let accepted = value.get("verificationStatus").and_then(Value::as_str) == Some("accepted");
+        if !returned.eq_ignore_ascii_case(email) || !(primary || accepted) {
+            return Err(CoreError::Other(format!(
+                "{email} is not a verified Gmail sender identity"
+            )));
+        }
+        Ok(value
+            .get("replyToAddress")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|reply_to| {
+                !reply_to.is_empty()
+                    && !reply_to.eq_ignore_ascii_case(email)
+                    && !reply_to
+                        .chars()
+                        .any(|c| c.is_control() || c.is_whitespace())
+                    && reply_to.contains('@')
+            })
+            .map(|reply_to| Address {
+                name: None,
+                email: reply_to.to_owned(),
+            }))
+    }
+}
+
+fn messages_list_url(page_token: Option<&str>, cutoff: Option<chrono::NaiveDate>) -> String {
+    let mut url = format!("{GMAIL_API}/messages?maxResults={SYNC_PAGE_SIZE}&includeSpamTrash=true");
+    if let Some(cutoff) = cutoff {
+        // Gmail interprets date-only search terms in Pacific Time. Use an
+        // epoch one second before our inclusive UTC cleanup boundary because
+        // Gmail's `after:` operator itself is exclusive.
+        let seconds = cutoff
+            .and_time(chrono::NaiveTime::MIN)
+            .and_utc()
+            .timestamp()
+            .saturating_sub(1);
+        let query = format!("after:{seconds}");
+        url.push_str("&q=");
+        url.push_str(&urlencode(&query));
+    }
+    if let Some(token) = page_token.filter(|value| !value.is_empty()) {
+        url.push_str("&pageToken=");
+        url.push_str(&urlencode(token));
+    }
+    url
+}
+
+/// Provider mutations are replayed from a durable offline queue. If the
+/// resource disappeared independently (another client, or a retried request
+/// whose response was lost), the requested end state has already been reached.
+fn ignore_not_found(result: Result<Value>) -> Result<()> {
+    match result {
+        Ok(_) | Err(CoreError::NotFound(_)) => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+fn network_error(error: reqwest::Error) -> CoreError {
+    if error.is_timeout() || error.is_connect() {
+        CoreError::Offline
+    } else {
+        CoreError::Network(error.to_string())
+    }
+}
+
+async fn google_json(response: reqwest::Response) -> Result<Value> {
+    let status = response.status();
+    let named_wait = crate::net::retry_after::of(response.headers());
+    let body = http_body::text(response, MAX_GMAIL_JSON_BODY_BYTES, "Gmail JSON response").await?;
+    if status.is_success() {
+        if status == StatusCode::NO_CONTENT || body.trim().is_empty() {
+            return Ok(Value::Null);
+        }
+        return serde_json::from_str(&body)
+            .map_err(|error| CoreError::Network(format!("invalid Gmail JSON: {error}")));
+    }
+    let value = serde_json::from_str::<Value>(&body).unwrap_or(Value::Null);
+    let reason = value
+        .pointer("/error/errors/0/reason")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let message = value
+        .pointer("/error/message")
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| status.canonical_reason().unwrap_or("Gmail request failed"));
+    if let Some(limit) = google_limit(status, reason, message, named_wait) {
+        return Err(limit);
+    }
+    if status == StatusCode::UNAUTHORIZED
+        || (status == StatusCode::FORBIDDEN
+            && matches!(
+                reason,
+                "authError" | "forbidden" | "insufficientPermissions"
+            ))
+    {
+        return Err(CoreError::NeedsReauth);
+    }
+    if status == StatusCode::NOT_FOUND {
+        return Err(CoreError::NotFound(format!("Gmail resource: {message}")));
+    }
+    if status.is_server_error() {
+        return Err(CoreError::Network(format!("Gmail {status}: {message}")));
+    }
+    Err(CoreError::Other(format!("Gmail {status}: {message}")))
+}
+
+/// Gmail asking to slow down: a 429, or a rate or quota reason, as Google's
+/// "Resolve errors" guide lists them. Its backendError is a server error,
+/// tried again as one. The wait is the Retry-After field's, else the time
+/// some messages name, as in "User-rate limit exceeded.  Retry after
+/// 2024-07-16T05:46:20.345Z".
+fn google_limit(
+    status: StatusCode,
+    reason: &str,
+    message: &str,
+    retry_after: Option<Duration>,
+) -> Option<CoreError> {
+    if status != StatusCode::TOO_MANY_REQUESTS && !google_quota_reason(reason) {
+        return None;
+    }
+    Some(CoreError::RateLimited {
+        service: "Gmail".into(),
+        // "Too many concurrent requests for user".
+        kind: if message.to_ascii_lowercase().contains("concurrent") {
+            LimitKind::Connections
+        } else {
+            LimitKind::Requests
+        },
+        retry_after: retry_after.or_else(|| retry_after_in_message(message)),
+        detail: message.to_owned(),
+    })
+}
+
+fn google_quota_reason(reason: &str) -> bool {
+    matches!(
+        reason,
+        "rateLimitExceeded" | "userRateLimitExceeded" | "quotaExceeded" | "dailyLimitExceeded"
+    )
+}
+
+/// The wait until the time a Gmail message names after "Retry after".
+fn retry_after_in_message(message: &str) -> Option<Duration> {
+    const MARKER: &str = "retry after ";
+    // Lowercasing ASCII keeps every byte where it was.
+    let start = message.to_ascii_lowercase().find(MARKER)? + MARKER.len();
+    let stamp = message[start..]
+        .split_whitespace()
+        .next()?
+        .trim_end_matches(['.', ',', ';', ')']);
+    let at = chrono::DateTime::parse_from_rfc3339(stamp).ok()?;
+    crate::net::retry_after::until(at.with_timezone(&chrono::Utc), chrono::Utc::now())
+}
+
+fn required_string<'a>(value: &'a Value, field: &str) -> Result<&'a str> {
+    value
+        .get(field)
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| CoreError::Other(format!("Gmail response omitted {field}")))
+}
+
+fn urlencode(value: &str) -> String {
+    url::form_urlencoded::byte_serialize(value.as_bytes()).collect()
+}
+
+fn build_batch_body(ids: &[String], boundary: &str, headers: &[String]) -> String {
+    let mut output = String::new();
+    for (index, id) in ids.iter().enumerate() {
+        output.push_str("--");
+        output.push_str(boundary);
+        output.push_str("\r\nContent-Type: application/http\r\nContent-ID: <flectar-");
+        output.push_str(&index.to_string());
+        output.push_str(">\r\n\r\nGET /gmail/v1/users/me/messages/");
+        output.push_str(&urlencode(id));
+        output.push_str("?format=metadata");
+        for header in headers {
+            output.push_str("&metadataHeaders=");
+            output.push_str(&urlencode(header));
+        }
+        output.push_str(" HTTP/1.1\r\nAccept: application/json\r\n\r\n");
+    }
+    output.push_str("--");
+    output.push_str(boundary);
+    output.push_str("--\r\n");
+    output
+}
+
+fn multipart_boundary(content_type: &str) -> Option<&str> {
+    content_type.split(';').find_map(|part| {
+        part.trim()
+            .strip_prefix("boundary=")
+            .map(|value| value.trim_matches('"'))
+            .filter(|value| !value.is_empty())
+    })
+}
+
+fn parse_batch_response(body: &str, boundary: &str, expected_parts: usize) -> Result<Vec<Value>> {
+    let marker = format!("--{boundary}");
+    let mut seen = 0usize;
+    let mut messages = Vec::with_capacity(expected_parts);
+    for raw in body.split(&marker).skip(1) {
+        let part = raw.trim();
+        if part.is_empty() || part == "--" || part.starts_with("--\n") || part.starts_with("--\r\n")
+        {
+            continue;
+        }
+        seen += 1;
+        let (_, nested) = split_header_block(part)
+            .ok_or_else(|| CoreError::Network("malformed Gmail batch part".into()))?;
+        let (headers, response_body) = split_header_block(nested)
+            .ok_or_else(|| CoreError::Network("malformed Gmail batch response".into()))?;
+        let status = headers
+            .lines()
+            .next()
+            .and_then(|line| line.split_whitespace().nth(1))
+            .and_then(|value| value.parse::<u16>().ok())
+            .and_then(|value| StatusCode::from_u16(value).ok())
+            .ok_or_else(|| CoreError::Network("invalid Gmail batch status".into()))?;
+        if status == StatusCode::NOT_FOUND {
+            continue;
+        }
+        if !status.is_success() {
+            let error = serde_json::from_str::<Value>(response_body.trim()).unwrap_or(Value::Null);
+            let reason = error
+                .pointer("/error/errors/0/reason")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let message = error
+                .pointer("/error/message")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .unwrap_or_else(|| status.to_string());
+            let named_wait = headers
+                .lines()
+                .filter_map(|line| line.split_once(':'))
+                .find(|(name, _)| name.trim().eq_ignore_ascii_case("retry-after"))
+                .and_then(|(_, value)| crate::net::retry_after::parse(value, chrono::Utc::now()));
+            return Err(
+                if let Some(limit) = google_limit(status, reason, &message, named_wait) {
+                    limit
+                } else if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
+                    CoreError::NeedsReauth
+                } else if status.is_server_error() {
+                    CoreError::Network(format!("Gmail batch {status}: {message}"))
+                } else {
+                    CoreError::Other(format!("Gmail batch {status}: {message}"))
+                },
+            );
+        }
+        messages.push(
+            serde_json::from_str(response_body.trim()).map_err(|error| {
+                CoreError::Network(format!("invalid Gmail batch JSON: {error}"))
+            })?,
+        );
+    }
+    if seen != expected_parts {
+        return Err(CoreError::Network(format!(
+            "Gmail batch returned {seen} of {expected_parts} parts"
+        )));
+    }
+    Ok(messages)
+}
+
+fn split_header_block(value: &str) -> Option<(&str, &str)> {
+    value
+        .find("\r\n\r\n")
+        .map(|position| (&value[..position], &value[position + 4..]))
+        .or_else(|| {
+            value
+                .find("\n\n")
+                .map(|position| (&value[..position], &value[position + 2..]))
+        })
+}
+
+fn parse_history_page(value: &Value, base_history_id: &str) -> Result<HistoryPage> {
+    let mut affected_threads = BTreeSet::new();
+    let mut added_messages = HashSet::new();
+    for history in value
+        .get("history")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        for key in [
+            "messages",
+            "messagesAdded",
+            "messagesDeleted",
+            "labelsAdded",
+            "labelsRemoved",
+        ] {
+            for item in history
+                .get(key)
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                let message = item.get("message").unwrap_or(item);
+                if key == "messagesAdded"
+                    && let Some(id) = message.get("id").and_then(Value::as_str)
+                {
+                    added_messages.insert(id.to_owned());
+                }
+                if let Some(thread_id) = message.get("threadId").and_then(Value::as_str) {
+                    if affected_threads.len() >= MAX_HISTORY_THREADS_PER_PAGE
+                        && !affected_threads.contains(thread_id)
+                    {
+                        return Err(CoreError::Network(format!(
+                            "Gmail history returned more than {MAX_HISTORY_THREADS_PER_PAGE} threads"
+                        )));
+                    }
+                    affected_threads.insert(thread_id.to_owned());
+                }
+            }
+        }
+    }
+    let next_page_token = gmail_page_token(value)?;
+    let completed_history_id = if next_page_token.is_none() {
+        let history_id = value
+            .get("historyId")
+            .and_then(Value::as_str)
+            .unwrap_or(base_history_id);
+        if history_id.len() > MAX_GMAIL_PAGE_TOKEN_BYTES {
+            return Err(CoreError::Network(
+                "Gmail returned an oversized history cursor".into(),
+            ));
+        }
+        Some(history_id.to_owned())
+    } else {
+        None
+    };
+    Ok(HistoryPage {
+        affected_threads,
+        added_messages,
+        next_page_token,
+        completed_history_id,
+    })
+}
+
+fn gmail_page_token(value: &Value) -> Result<Option<String>> {
+    let token = value.get("nextPageToken").and_then(Value::as_str);
+    if token.is_some_and(|token| token.len() > MAX_GMAIL_PAGE_TOKEN_BYTES) {
+        return Err(CoreError::Network(
+            "Gmail returned an oversized page token".into(),
+        ));
+    }
+    Ok(token.filter(|token| !token.is_empty()).map(str::to_owned))
+}
+
+fn decode_gmail_data(value: &str) -> Result<Vec<u8>> {
+    URL_SAFE_NO_PAD
+        .decode(value.trim_end_matches('='))
+        .map_err(|error| CoreError::Mime(format!("invalid Gmail base64url data: {error}")))
+}
+
+fn contrasting_text(background: &str) -> &'static str {
+    let value = background.trim_start_matches('#');
+    let rgb = u32::from_str_radix(value, 16).unwrap_or(0x6b7280);
+    let r = (rgb >> 16) & 0xff;
+    let g = (rgb >> 8) & 0xff;
+    let b = rgb & 0xff;
+    if r * 299 + g * 587 + b * 114 > 150_000 {
+        "#000000"
+    } else {
+        "#ffffff"
+    }
+}
+
+/// Gmail accepts only its documented label palette, not arbitrary CSS hex.
+/// Keep arbitrary local colors local rather than making label creation fail.
+fn gmail_palette_color(value: &str) -> Option<&str> {
+    const COLORS: &[&str] = &[
+        "#000000", "#434343", "#666666", "#999999", "#cccccc", "#efefef", "#f3f3f3", "#ffffff",
+        "#fb4c2f", "#ffad46", "#fad165", "#16a765", "#43d692", "#4a86e8", "#a479e2", "#f691b3",
+        "#f6c5be", "#ffe6c7", "#fef1d1", "#b9e4d0", "#c6f3de", "#c9daf8", "#e4d7f5", "#fcdee8",
+        "#efa093", "#ffd6a2", "#fce8b3", "#89d3b2", "#a0eac9", "#a4c2f4", "#d0bcf1", "#fbc8d9",
+        "#e66550", "#ffbc6b", "#fcda83", "#44b984", "#68dfa9", "#6d9eeb", "#b694e8", "#f7a7c0",
+        "#cc3a21", "#eaa041", "#f2c960", "#149e60", "#3dc789", "#3c78d8", "#8e63ce", "#e07798",
+        "#ac2b16", "#cf8933", "#d5ae49", "#0b804b", "#2a9c68", "#285bac", "#653e9b", "#b65775",
+        "#822111", "#a46a21", "#aa8831", "#076239", "#1a764d", "#1c4587", "#41236d", "#83334c",
+    ];
+    COLORS
+        .iter()
+        .copied()
+        .find(|allowed| allowed.eq_ignore_ascii_case(value))
+}
+
+fn system_role(label_id: &str) -> Option<&'static str> {
+    match label_id {
+        "INBOX" => Some(roles::INBOX),
+        "SENT" => Some(roles::SENT),
+        "DRAFT" => Some(roles::DRAFTS),
+        "TRASH" => Some(roles::TRASH),
+        "SPAM" => Some(roles::SPAM),
+        _ => None,
+    }
+}
+
+async fn sync_labels(ctx: &SyncCtx, config: &AccountConfig, api: &GmailApi) -> Result<()> {
+    let labels = api.labels().await?;
+    let account_id = config.id;
+    ctx.db
+        .write(move |conn| {
+            let tx = conn.transaction()?;
+
+            // Archive is a Gmail state (absence of INBOX), not a provider
+            // label. All Mail is similarly synthetic for the existing folder
+            // UI; every Gmail message receives that membership.
+            repo::folders::upsert(
+                &tx,
+                account_id,
+                "[Gmail]/Archive",
+                Some("/"),
+                Some(roles::ARCHIVE),
+            )?;
+            repo::folders::upsert(
+                &tx,
+                account_id,
+                "[Gmail]/All Mail",
+                Some("/"),
+                Some(roles::ALL),
+            )?;
+
+            for (position, label) in labels.iter().enumerate() {
+                let role = system_role(&label.id);
+                let folder_id = if role.is_some() || label.kind == "user" {
+                    let existing: Option<i64> = tx
+                        .query_row(
+                            "SELECT folder_id FROM gmail_labels
+                             WHERE account_id = ?1 AND provider_id = ?2",
+                            params![account_id, label.id],
+                            |row| row.get(0),
+                        )
+                        .optional()?
+                        .flatten();
+                    let folder_name = if label.kind == "user" {
+                        label.name.as_str()
+                    } else {
+                        label.id.as_str()
+                    };
+                    Some(match existing {
+                        Some(folder_id) => {
+                            tx.execute(
+                                "UPDATE folders SET path = ?2, delimiter = '/', role = ?3
+                                 WHERE id = ?1",
+                                params![folder_id, folder_name, role],
+                            )?;
+                            folder_id
+                        }
+                        None => {
+                            repo::folders::upsert(&tx, account_id, folder_name, Some("/"), role)?
+                        }
+                    })
+                } else {
+                    None
+                };
+
+                let previous_local_label_id: Option<i64> = tx
+                    .query_row(
+                        "SELECT local_label_id FROM gmail_labels
+                         WHERE account_id = ?1 AND provider_id = ?2",
+                        params![account_id, label.id],
+                        |row| row.get(0),
+                    )
+                    .optional()?
+                    .flatten();
+                let local_label_id = if label.kind == "user" {
+                    let existing = previous_local_label_id.filter(|id| {
+                        tx.query_row(
+                            "SELECT EXISTS(
+                               SELECT 1 FROM labels
+                                WHERE id = ?1 AND scope = 'account'
+                                  AND owner_account_id = ?2
+                             )",
+                            params![id, account_id],
+                            |row| row.get::<_, bool>(0),
+                        )
+                        .unwrap_or(false)
+                    });
+                    Some(match existing {
+                        Some(id) => {
+                            tx.execute(
+                                "UPDATE labels
+                                    SET name = ?2, color = ?3, origin = 'provider'
+                                  WHERE id = ?1",
+                                params![
+                                    id,
+                                    label.name,
+                                    label.background_color.as_deref().unwrap_or("#6b7280")
+                                ],
+                            )?;
+                            id
+                        }
+                        None => {
+                            tx.execute(
+                                "INSERT INTO labels (
+                                   name, color, keyword, position, scope,
+                                   owner_account_id, origin
+                                 ) VALUES (?1, ?2, ?3, ?4, 'account', ?5, 'provider')",
+                                params![
+                                    label.name,
+                                    label.background_color.as_deref().unwrap_or("#6b7280"),
+                                    repo::labels::keyword_for(&label.name),
+                                    position as i64,
+                                    account_id,
+                                ],
+                            )?;
+                            tx.last_insert_rowid()
+                        }
+                    })
+                } else {
+                    None
+                };
+
+                if let (Some(previous), Some(current)) = (previous_local_label_id, local_label_id)
+                    && previous != current
+                {
+                    // Repair a stale pre-migration mapping without touching
+                    // memberships owned by another account.
+                    tx.execute(
+                        "INSERT OR IGNORE INTO message_labels (message_id, label_id)
+                             SELECT ml.message_id, ?3
+                             FROM message_labels ml
+                             JOIN messages m ON m.id = ml.message_id
+                             WHERE m.account_id = ?1 AND ml.label_id = ?2",
+                        params![account_id, previous, current],
+                    )?;
+                    tx.execute(
+                        "DELETE FROM message_labels
+                             WHERE label_id = ?2 AND message_id IN (
+                               SELECT id FROM messages WHERE account_id = ?1
+                             )",
+                        params![account_id, previous],
+                    )?;
+                }
+
+                tx.execute(
+                    "INSERT INTO gmail_labels (
+                         account_id, provider_id, name, kind, folder_id,
+                         local_label_id, background_color, text_color
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                     ON CONFLICT(account_id, provider_id) DO UPDATE SET
+                         name = excluded.name,
+                         kind = excluded.kind,
+                         folder_id = excluded.folder_id,
+                         local_label_id = excluded.local_label_id,
+                         background_color = excluded.background_color,
+                         text_color = excluded.text_color",
+                    params![
+                        account_id,
+                        label.id,
+                        label.name,
+                        label.kind,
+                        folder_id,
+                        local_label_id,
+                        label.background_color,
+                        label.text_color,
+                    ],
+                )?;
+            }
+
+            // labels.list is authoritative. A provider-owned label deleted in
+            // another Gmail client disappears locally as well. This must not
+            // leave a reusable row that can recreate the remote label during a
+            // later drag.
+            let seen = labels
+                .iter()
+                .map(|label| label.id.as_str())
+                .collect::<HashSet<_>>();
+            let stale = {
+                let mut stmt = tx.prepare(
+                    "SELECT provider_id, folder_id, local_label_id FROM gmail_labels
+                     WHERE account_id = ?1",
+                )?;
+                stmt.query_map(params![account_id], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<i64>>(1)?,
+                        row.get::<_, Option<i64>>(2)?,
+                    ))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+                .into_iter()
+                .filter(|(provider_id, ..)| !seen.contains(provider_id.as_str()))
+                .collect::<Vec<_>>()
+            };
+            for (provider_id, folder_id, local_label_id) in stale {
+                tx.execute(
+                    "DELETE FROM gmail_labels
+                     WHERE account_id = ?1 AND provider_id = ?2",
+                    params![account_id, provider_id],
+                )?;
+                if let Some(folder_id) = folder_id {
+                    // Only user-label folders are removed here. A missing
+                    // system label must never erase a canonical mailbox.
+                    tx.execute(
+                        "DELETE FROM folders WHERE id = ?1 AND role IS NULL",
+                        params![folder_id],
+                    )?;
+                }
+                if let Some(local_label_id) = local_label_id {
+                    tx.execute(
+                        "DELETE FROM labels
+                          WHERE id = ?1 AND scope = 'account' AND origin = 'provider'
+                            AND NOT EXISTS (
+                              SELECT 1 FROM gmail_labels WHERE local_label_id = ?1
+                            )",
+                        params![local_label_id],
+                    )?;
+                }
+            }
+            tx.commit()?;
+            Ok(())
+        })
+        .await
+}
+
+/// Gmail's vacation responder, which sends the account's automatic replies
+/// (#239), as `users.settings.vacation` has it.
+#[derive(Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct VacationSettings {
+    #[serde(default)]
+    enable_auto_reply: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    response_subject: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    response_body_plain_text: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    response_body_html: Option<String>,
+    #[serde(default)]
+    restrict_to_contacts: bool,
+    #[serde(default)]
+    restrict_to_domain: bool,
+    #[serde(
+        default,
+        with = "google_int64",
+        skip_serializing_if = "Option::is_none"
+    )]
+    start_time: Option<i64>,
+    #[serde(
+        default,
+        with = "google_int64",
+        skip_serializing_if = "Option::is_none"
+    )]
+    end_time: Option<i64>,
+}
+
+/// Google's JSON gives 64-bit numbers as strings, and takes them so too.
+mod google_int64 {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub(super) fn serialize<S: Serializer>(
+        value: &Option<i64>,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        match value {
+            Some(value) => serializer.serialize_str(&value.to_string()),
+            None => serializer.serialize_none(),
+        }
+    }
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Option<i64>, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Number {
+            Text(String),
+            Value(i64),
+        }
+        match Option::<Number>::deserialize(deserializer)? {
+            None => Ok(None),
+            Some(Number::Value(value)) => Ok(Some(value)),
+            Some(Number::Text(text)) => text.parse().map(Some).map_err(serde::de::Error::custom),
+        }
+    }
+}
+
+impl From<VacationSettings> for AutoReply {
+    fn from(settings: VacationSettings) -> Self {
+        // Webmail saves replies as HTML. The app edits them as text.
+        let text = crate::mime::body_text(
+            settings.response_body_plain_text.as_deref(),
+            settings.response_body_html.as_deref(),
+        )
+        .map(|text| text.trim().to_owned())
+        .unwrap_or_default();
+        Self {
+            enabled: settings.enable_auto_reply,
+            subject: settings.response_subject.unwrap_or_default(),
+            text,
+            starts_at: settings.start_time,
+            ends_at: settings.end_time,
+            contacts_only: settings.restrict_to_contacts,
+            domain_only: settings.restrict_to_domain,
+        }
+    }
+}
+
+impl From<&AutoReply> for VacationSettings {
+    fn from(reply: &AutoReply) -> Self {
+        Self {
+            enable_auto_reply: reply.enabled,
+            response_subject: Some(reply.subject.clone()),
+            // Without HTML, Gmail sends the text as it is.
+            response_body_plain_text: Some(reply.text.clone()),
+            response_body_html: None,
+            restrict_to_contacts: reply.contacts_only,
+            restrict_to_domain: reply.domain_only,
+            start_time: reply.starts_at,
+            end_time: reply.ends_at,
+        }
+    }
+}
+
+async fn read_vacation(api: &GmailApi, base: &str) -> Result<AutoReply> {
+    let settings: VacationSettings =
+        serde_json::from_value(api.get_json(&format!("{base}/settings/vacation")).await?)?;
+    Ok(settings.into())
+}
+
+/// The vacation responder of one Gmail account, outside its sync, so that a
+/// missing permission comes back to the caller instead of pausing the sync.
+pub(crate) struct VacationResponder {
+    api: GmailApi,
+    base: String,
+}
+
+impl VacationResponder {
+    pub(crate) fn new(ctx: SyncCtx, config: AccountConfig) -> Result<Self> {
+        Ok(Self {
+            api: GmailApi::new(ctx, config)?,
+            base: GMAIL_API.to_owned(),
+        })
+    }
+
+    /// A responder that talks to a test server instead of Gmail.
+    #[cfg(test)]
+    pub(crate) fn with_base(ctx: SyncCtx, config: AccountConfig, origin: &str) -> Result<Self> {
+        Ok(Self {
+            api: GmailApi::new(ctx, config)?,
+            base: format!("{origin}/gmail/v1/users/me"),
+        })
+    }
+
+    /// Saves `reply`, which needs Gmail's settings permission, and gives the
+    /// replies as Gmail keeps them now.
+    pub(crate) async fn save(&self, reply: &AutoReply) -> Result<AutoReply> {
+        let body = serde_json::to_value(VacationSettings::from(reply))?;
+        let saved: VacationSettings = serde_json::from_value(
+            self.api
+                .put_json(&format!("{}/settings/vacation", self.base), &body)
+                .await?,
+        )?;
+        Ok(saved.into())
+    }
+}
+
+/// Reads the account's automatic replies back, so that replies set in
+/// webmail show in the app too.
+async fn sync_auto_reply(ctx: &SyncCtx, config: &AccountConfig, api: &GmailApi) -> Result<()> {
+    let account_id = config.id;
+    let saved_at = ctx
+        .db
+        .read(move |conn| repo::auto_replies::saved_at(conn, account_id))
+        .await?;
+    let reply = read_vacation(api, GMAIL_API).await?;
+    let changed = ctx
+        .db
+        .write(move |conn| {
+            let read = repo::auto_replies::Origin::Read { saved_at };
+            repo::auto_replies::store(conn, account_id, &reply, now_ms(), read)
+        })
+        .await?;
+    if changed {
+        ctx.bus.emit(CoreEvent::AutoReplyChanged { account_id });
+    }
+    Ok(())
+}
+
+async fn sync_sender_identities(
+    ctx: &SyncCtx,
+    config: &AccountConfig,
+    api: &GmailApi,
+) -> Result<()> {
+    let identities = api.sender_identities().await?;
+    let account_id = config.id;
+    ctx.db
+        .write(move |conn| {
+            repo::sender_identities::replace(conn, account_id, &identities)?;
+            Ok(())
+        })
+        .await
+}
+
+const GMAIL_UPLOAD_API: &str = "https://gmail.googleapis.com/upload/gmail/v1/users/me";
+
+/// Imports messages into a Gmail mailbox, as if they had been delivered,
+/// for mail brought over from files or another app.
+pub(crate) struct Uploader {
+    api: GmailApi,
+    base: String,
+    upload_base: String,
+}
+
+impl Uploader {
+    pub(crate) fn new(ctx: SyncCtx, config: AccountConfig) -> Result<Self> {
+        Ok(Self {
+            api: GmailApi::new(ctx, config)?,
+            base: GMAIL_API.to_owned(),
+            upload_base: GMAIL_UPLOAD_API.to_owned(),
+        })
+    }
+
+    /// An uploader that talks to a test server instead of Gmail.
+    #[cfg(test)]
+    pub(crate) fn with_base(ctx: SyncCtx, config: AccountConfig, origin: &str) -> Result<Self> {
+        Ok(Self {
+            api: GmailApi::new(ctx, config)?,
+            base: format!("{origin}/gmail/v1/users/me"),
+            upload_base: format!("{origin}/upload/gmail/v1/users/me"),
+        })
+    }
+
+    /// Bring the account's labels up to date.
+    pub(crate) async fn refresh_labels(&self) -> Result<()> {
+        sync_labels(&self.api.ctx, &self.api.account, &self.api).await
+    }
+
+    /// Whether the mailbox has a message with this Message-ID anywhere,
+    /// Spam and Trash included.
+    pub(crate) async fn has_message(&self, message_id: &str) -> Result<bool> {
+        let query = format!("rfc822msgid:<{}>", message_id.trim_matches(['<', '>']));
+        let value = self
+            .api
+            .get_json(&format!(
+                "{}/messages?maxResults=1&includeSpamTrash=true&q={}",
+                self.base,
+                urlencode(&query)
+            ))
+            .await?;
+        Ok(value
+            .get("messages")
+            .and_then(Value::as_array)
+            .is_some_and(|messages| !messages.is_empty()))
+    }
+
+    /// Import a raw message with these labels. Its date stays the one in its
+    /// Date header, and the spam filter leaves it alone.
+    pub(crate) async fn import(&self, raw: &[u8], label_ids: &[&str]) -> Result<()> {
+        self.upload(
+            "messages/import?uploadType=multipart&internalDateSource=dateHeader\
+             &neverMarkSpam=true&processForCalendar=false",
+            raw,
+            label_ids,
+        )
+        .await
+    }
+
+    /// Insert a raw message with these labels, as IMAP APPEND does: Gmail
+    /// keeps it as it is, without the scanning and sorting of mail that
+    /// arrives. Its date stays the one in its Date header.
+    pub(crate) async fn insert(&self, raw: &[u8], label_ids: &[&str]) -> Result<()> {
+        self.upload(
+            "messages?uploadType=multipart&internalDateSource=dateHeader",
+            raw,
+            label_ids,
+        )
+        .await
+    }
+
+    /// A message's original bytes. `size` is about how many there are.
+    pub(crate) async fn raw_message(
+        &self,
+        provider_message_id: &str,
+        size: u64,
+    ) -> Result<Vec<u8>> {
+        self.api
+            .raw_message_at(&self.base, provider_message_id, size)
+            .await
+    }
+
+    /// Upload a raw message with these labels to `endpoint`, a path under
+    /// the upload API with its query.
+    async fn upload(&self, endpoint: &str, raw: &[u8], label_ids: &[&str]) -> Result<()> {
+        let boundary = format!("flectar-{:032x}", rand::random::<u128>());
+        let metadata = json!({ "labelIds": label_ids });
+        let mut body = Vec::with_capacity(raw.len() + 512);
+        body.extend_from_slice(
+            format!(
+                "--{boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n{metadata}\r\n\
+                 --{boundary}\r\nContent-Type: message/rfc822\r\n\r\n"
+            )
+            .as_bytes(),
+        );
+        body.extend_from_slice(raw);
+        body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+        let url = format!("{}/{endpoint}", self.upload_base);
+        // A large message gets time to upload at 64 KiB/s.
+        let timeout = HTTP_TIMEOUT.max(Duration::from_secs(raw.len() as u64 / (64 * 1024)));
+        for attempt in 0..2 {
+            let token = self.api.token().await?;
+            let response = self
+                .api
+                .http
+                .post(&url)
+                .bearer_auth(token)
+                .timeout(timeout)
+                .header(
+                    CONTENT_TYPE,
+                    format!("multipart/related; boundary={boundary}"),
+                )
+                .body(body.clone())
+                .send()
+                .await
+                .map_err(network_error)?;
+            let result = google_json(response).await;
+            if attempt == 0 && matches!(&result, Err(CoreError::NeedsReauth)) {
+                self.api.ctx.tokens.invalidate(self.api.account.id).await;
+                continue;
+            }
+            return result.map(|_| ());
+        }
+        Err(CoreError::NeedsReauth)
+    }
+}
+
+pub(crate) async fn create_user_folder(
+    ctx: &SyncCtx,
+    config: &AccountConfig,
+    name: &str,
+) -> Result<()> {
+    let api = GmailApi::new(ctx.clone(), config.clone())?;
+    api.create_label(name, None).await?;
+    sync_labels(ctx, config, &api).await
+}
+
+pub(crate) async fn rename_user_folder(
+    ctx: &SyncCtx,
+    config: &AccountConfig,
+    folder_id: i64,
+    name: &str,
+) -> Result<()> {
+    let account_id = config.id;
+    let provider_id = ctx
+        .db
+        .read(move |conn| repo::gmail::provider_label_for_folder(conn, account_id, folder_id))
+        .await?
+        .ok_or_else(|| CoreError::NotFound(format!("Gmail folder {folder_id}")))?;
+    let api = GmailApi::new(ctx.clone(), config.clone())?;
+    api.update_label(&provider_id, name, None).await?;
+    sync_labels(ctx, config, &api).await
+}
+
+pub(crate) async fn delete_user_folder(
+    ctx: &SyncCtx,
+    config: &AccountConfig,
+    folder_id: i64,
+) -> Result<()> {
+    let account_id = config.id;
+    let provider_id = ctx
+        .db
+        .read(move |conn| repo::gmail::provider_label_for_folder(conn, account_id, folder_id))
+        .await?
+        .ok_or_else(|| CoreError::NotFound(format!("Gmail folder {folder_id}")))?;
+    let api = GmailApi::new(ctx.clone(), config.clone())?;
+    api.delete_label(&provider_id).await?;
+    sync_labels(ctx, config, &api).await
+}
+
+#[derive(Debug, Clone)]
+struct ParsedResource {
+    provider_id: String,
+    thread_id: String,
+    labels: Vec<String>,
+    headers: crate::mime::ParsedHeaders,
+    internal_date: i64,
+    size: Option<i64>,
+    snippet: String,
+    has_attachments: bool,
+    /// The header block, for rules on any header (#238).
+    raw_headers: Vec<u8>,
+}
+
+fn parse_resource(value: &Value) -> Result<ParsedResource> {
+    let provider_id = required_string(value, "id")?.to_owned();
+    let thread_id = required_string(value, "threadId")?.to_owned();
+    let payload = value.get("payload").unwrap_or(&Value::Null);
+    let mut raw_headers = Vec::new();
+    for header in payload
+        .get("headers")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let Some(name) = header.get("name").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(header_value) = header.get("value").and_then(Value::as_str) else {
+            continue;
+        };
+        let additional = name
+            .len()
+            .saturating_add(header_value.len())
+            .saturating_add(4);
+        if additional > MAX_GMAIL_HEADERS_BYTES.saturating_sub(raw_headers.len()) {
+            return Err(CoreError::Mime(format!(
+                "Gmail message headers exceed the {} KiB safety limit",
+                MAX_GMAIL_HEADERS_BYTES / 1024
+            )));
+        }
+        raw_headers.extend_from_slice(name.as_bytes());
+        raw_headers.extend_from_slice(b": ");
+        raw_headers.extend_from_slice(header_value.as_bytes());
+        raw_headers.extend_from_slice(b"\r\n");
+    }
+    raw_headers.extend_from_slice(b"\r\n");
+    let headers = crate::mime::parse_header_block(&raw_headers)?;
+    let internal_date = value
+        .get("internalDate")
+        .and_then(Value::as_str)
+        .and_then(|value| value.parse::<i64>().ok())
+        .unwrap_or_else(now_ms);
+    Ok(ParsedResource {
+        provider_id,
+        thread_id,
+        labels: value
+            .get("labelIds")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .map(str::to_owned)
+            .collect(),
+        headers,
+        internal_date,
+        size: value.get("sizeEstimate").and_then(Value::as_i64),
+        // Gmail returns the snippet HTML-escaped.
+        snippet: crate::mime::make_html_snippet(
+            value
+                .get("snippet")
+                .and_then(Value::as_str)
+                .unwrap_or_default(),
+        ),
+        has_attachments: payload_has_file_attachments(payload)?,
+        raw_headers,
+    })
+}
+
+/// A bounded account still accepts an entire Gmail thread when at least one
+/// message is recent or the thread is already represented locally. This keeps
+/// new replies readable in context and keeps previously downloaded old mail
+/// consistent, without importing unrelated old threads after label changes.
+async fn retain_history_threads(
+    ctx: &SyncCtx,
+    account_id: i64,
+    resources: Vec<Value>,
+    mail_history: MailHistory,
+) -> Result<Vec<Value>> {
+    let Some(cutoff) = mail_history.cutoff_ms_at(now_ms()) else {
+        return Ok(resources);
+    };
+
+    let mut accepted_threads = HashSet::<String>::new();
+    let mut old_resources = Vec::<(String, String)>::new();
+    for resource in &resources {
+        let Some(provider_id) = resource.get("id").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(thread_id) = resource.get("threadId").and_then(Value::as_str) else {
+            continue;
+        };
+        let internal_date = resource
+            .get("internalDate")
+            .and_then(Value::as_str)
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or_default();
+        if internal_date >= cutoff {
+            accepted_threads.insert(thread_id.to_owned());
+        } else {
+            old_resources.push((provider_id.to_owned(), thread_id.to_owned()));
+        }
+    }
+
+    let existing_threads = ctx
+        .db
+        .read(move |conn| {
+            let mut existing = HashSet::new();
+            for (provider_id, thread_id) in &old_resources {
+                if repo::messages::by_gm_msgid(conn, account_id, provider_id)?.is_some() {
+                    existing.insert(thread_id.clone());
+                }
+            }
+            Ok(existing)
+        })
+        .await?;
+    accepted_threads.extend(existing_threads);
+
+    Ok(resources
+        .into_iter()
+        .filter(|resource| {
+            resource
+                .get("threadId")
+                .and_then(Value::as_str)
+                .is_some_and(|thread_id| accepted_threads.contains(thread_id))
+        })
+        .collect())
+}
+
+fn payload_has_file_attachments(root: &Value) -> Result<bool> {
+    let mut stack = vec![root];
+    let mut visited = 0_usize;
+    while let Some(part) = stack.pop() {
+        visited += 1;
+        if visited > MAX_GMAIL_MIME_PARTS {
+            return Err(CoreError::Mime(format!(
+                "Gmail MIME tree exceeds the {MAX_GMAIL_MIME_PARTS}-part safety limit"
+            )));
+        }
+        let filename = part
+            .get("filename")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let disposition = part_headers(part)
+            .get("content-disposition")
+            .map(String::as_str)
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if disposition.starts_with("attachment")
+            || (!filename.is_empty() && !disposition.starts_with("inline"))
+        {
+            return Ok(true);
+        }
+        if let Some(children) = part.get("parts").and_then(Value::as_array) {
+            stack.extend(children);
+        }
+    }
+    Ok(false)
+}
+
+#[derive(Debug, Clone)]
+struct LabelMapping {
+    folder_id: Option<i64>,
+    local_label_id: Option<i64>,
+    role: Option<String>,
+}
+
+/// Which of the mail `store_resources` stores is new mail that rules sort
+/// (#238).
+#[derive(Debug, Clone, Default)]
+enum Arrivals {
+    #[default]
+    None,
+    /// The messages the history added.
+    Added(HashSet<String>),
+    /// Mail received since the account last caught up, when it ever did: a
+    /// full sync after the history expired finds what came in meanwhile, and
+    /// a first one only history.
+    SinceCaughtUp,
+}
+
+#[derive(Default)]
+struct StoreOutcome {
+    touched_threads: Vec<i64>,
+    /// Threads that queued a new-mail notification.
+    fresh_threads: Vec<i64>,
+    /// New read receipts that came back, by provider id, to read now.
+    receipts: Vec<String>,
+    /// New mail whose rules wait for its body (#238), by provider id, to
+    /// fetch now.
+    waiting: Vec<String>,
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn store_resources(
+    ctx: &SyncCtx,
+    config: &AccountConfig,
+    resources: &[Value],
+    generation: Option<i64>,
+    complete_threads: bool,
+    notify_new: bool,
+    notification_cutoff: Option<i64>,
+    arrivals: Arrivals,
+) -> Result<StoreOutcome> {
+    let parsed = resources
+        .iter()
+        .map(parse_resource)
+        .collect::<Result<Vec<_>>>()?;
+    if parsed.is_empty() {
+        return Ok(StoreOutcome::default());
+    }
+    let account_id = config.id;
+    let account_email = config.email.to_ascii_lowercase();
+    ctx.db
+        .write(move |conn| {
+            let tx = conn.transaction()?;
+            let settings = repo::settings::get(&tx)?;
+            let (outgoing_learning_since, incoming_learning_since) =
+                repo::contacts::learning_boundaries(&tx, account_id, now_ms())?;
+            let mut account_emails = repo::sender_identities::own_addresses(&tx, account_id)?;
+            account_emails.insert(account_email);
+            let mut mappings = HashMap::<String, LabelMapping>::new();
+            {
+                let mut stmt = tx.prepare(
+                    "SELECT gl.provider_id, gl.folder_id, gl.local_label_id, f.role
+                     FROM gmail_labels gl
+                     LEFT JOIN folders f ON f.id = gl.folder_id
+                     WHERE gl.account_id = ?1",
+                )?;
+                let rows = stmt.query_map(params![account_id], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        LabelMapping {
+                            folder_id: row.get(1)?,
+                            local_label_id: row.get(2)?,
+                            role: row.get(3)?,
+                        },
+                    ))
+                })?;
+                for row in rows {
+                    let (id, mapping) = row?;
+                    mappings.insert(id, mapping);
+                }
+            }
+            let archive_id = repo::folders::by_role(&tx, account_id, roles::ARCHIVE)?
+                .map(|folder| folder.id)
+                .ok_or_else(|| CoreError::NotFound("Gmail archive folder".into()))?;
+            let all_id = repo::folders::by_role(&tx, account_id, roles::ALL)?
+                .map(|folder| folder.id)
+                .ok_or_else(|| CoreError::NotFound("Gmail all-mail folder".into()))?;
+
+            let provider_local_labels = mappings
+                .values()
+                .filter_map(|mapping| mapping.local_label_id)
+                .collect::<HashSet<_>>();
+            let sorter = match arrivals {
+                Arrivals::None => None,
+                _ => Some(crate::rules::Sorter::load(&tx, account_id)?),
+            };
+            let caught_up_at = match arrivals {
+                Arrivals::SinceCaughtUp => tx.query_row(
+                    "SELECT caught_up_at FROM accounts WHERE id = ?1",
+                    params![account_id],
+                    |row| row.get::<_, Option<i64>>(0),
+                )?,
+                _ => None,
+            };
+            let mut outcome = StoreOutcome::default();
+            let mut complete_by_thread = HashMap::<String, HashSet<String>>::new();
+            let mut old_threads = Vec::<i64>::new();
+
+            for resource in parsed {
+                let thread_id =
+                    match repo::threads::by_gm_thrid(&tx, account_id, &resource.thread_id)? {
+                        Some(id) => id,
+                        None => repo::threads::create(
+                            &tx,
+                            account_id,
+                            Some(&resource.thread_id),
+                            &crate::mime::normalize_subject(&resource.headers.subject),
+                        )?,
+                    };
+                complete_by_thread
+                    .entry(resource.thread_id.clone())
+                    .or_default()
+                    .insert(resource.provider_id.clone());
+
+                let label_set = resource.labels.iter().cloned().collect::<HashSet<_>>();
+                let mut folder_ids = Vec::<i64>::new();
+                let mut role_folders = HashMap::<String, i64>::new();
+                let mut present_local_labels = Vec::<i64>::new();
+                for label in &resource.labels {
+                    if let Some(mapping) = mappings.get(label) {
+                        if let Some(folder_id) = mapping.folder_id {
+                            folder_ids.push(folder_id);
+                            if let Some(role) = &mapping.role {
+                                role_folders.insert(role.clone(), folder_id);
+                            }
+                        }
+                        if let Some(local_id) = mapping.local_label_id {
+                            present_local_labels.push(local_id);
+                        }
+                    }
+                }
+                let archived = !label_set.contains("INBOX")
+                    && !label_set.contains("SENT")
+                    && !label_set.contains("DRAFT")
+                    && !label_set.contains("TRASH")
+                    && !label_set.contains("SPAM");
+                if archived {
+                    folder_ids.push(archive_id);
+                    role_folders.insert(roles::ARCHIVE.into(), archive_id);
+                }
+                folder_ids.push(all_id);
+                role_folders.insert(roles::ALL.into(), all_id);
+                folder_ids.sort_unstable();
+                folder_ids.dedup();
+
+                let canonical_folder = [
+                    roles::TRASH,
+                    roles::SPAM,
+                    roles::DRAFTS,
+                    roles::INBOX,
+                    roles::SENT,
+                    roles::ARCHIVE,
+                    roles::ALL,
+                ]
+                .into_iter()
+                .find_map(|role| role_folders.get(role).copied())
+                .unwrap_or(all_id);
+
+                let date = resource.headers.date_ms.unwrap_or(resource.internal_date);
+                let from_email = resource
+                    .headers
+                    .from
+                    .as_ref()
+                    .map(|address| address.email.to_ascii_lowercase())
+                    .unwrap_or_default();
+                let is_outgoing =
+                    label_set.contains("SENT") || account_emails.contains(&from_email);
+                let is_read = !label_set.contains("UNREAD");
+                let is_starred = label_set.contains("STARRED");
+                let is_draft = label_set.contains("DRAFT");
+
+                let existing = repo::messages::by_gm_msgid(&tx, account_id, &resource.provider_id)?;
+                let inserted = existing.is_none();
+                let local_message_id = if let Some(existing) = existing {
+                    if let Some(old_thread) = existing.thread_id.filter(|id| *id != thread_id) {
+                        old_threads.push(old_thread);
+                    }
+                    tx.execute(
+                        "UPDATE messages SET
+                             thread_id = ?2, folder_id = ?3, uid = NULL,
+                             gm_thrid = ?4, subject = ?5, from_name = ?6,
+                             from_addr = ?7, to_json = ?8, cc_json = ?9,
+                             bcc_json = ?10, date = ?11, internal_date = ?12,
+                             is_read = ?13, is_starred = ?14, is_draft = ?15,
+                             is_outgoing = ?16, is_automated = ?17,
+                             has_attachments = ?18, size = ?19, snippet = ?20,
+                             list_unsubscribe = ?21, list_unsubscribe_post = ?22,
+                             sender_addr = ?23, sender_verification = ?24,
+                             gmail_sync_generation = COALESCE(?25, gmail_sync_generation),
+                             list_id = ?26
+                         WHERE id = ?1",
+                        params![
+                            existing.id,
+                            thread_id,
+                            canonical_folder,
+                            resource.thread_id,
+                            resource.headers.subject,
+                            resource
+                                .headers
+                                .from
+                                .as_ref()
+                                .and_then(|a| a.name.as_deref()),
+                            resource.headers.from.as_ref().map(|a| a.email.as_str()),
+                            serde_json::to_string(&resource.headers.to)?,
+                            serde_json::to_string(&resource.headers.cc)?,
+                            serde_json::to_string(&resource.headers.bcc)?,
+                            date,
+                            resource.internal_date,
+                            is_read as i64,
+                            is_starred as i64,
+                            is_draft as i64,
+                            is_outgoing as i64,
+                            resource.headers.is_automated as i64,
+                            resource.has_attachments as i64,
+                            resource.size,
+                            resource.snippet,
+                            resource.headers.list_unsubscribe,
+                            resource.headers.list_unsubscribe_post,
+                            resource.headers.via,
+                            resource.headers.sender_verification.as_str(),
+                            generation,
+                            resource.headers.list_id,
+                        ],
+                    )?;
+                    existing.id
+                } else {
+                    let message = NewMessage {
+                        account_id,
+                        folder_id: canonical_folder,
+                        uid: None,
+                        message_id: resource.headers.message_id.clone(),
+                        gm_msgid: Some(resource.provider_id.clone()),
+                        gm_thrid: Some(resource.thread_id.clone()),
+                        subject: resource.headers.subject.clone(),
+                        from: resource.headers.from.clone(),
+                        to: resource.headers.to.clone(),
+                        cc: resource.headers.cc.clone(),
+                        bcc: resource.headers.bcc.clone(),
+                        date,
+                        internal_date: Some(resource.internal_date),
+                        is_read,
+                        is_starred,
+                        is_draft,
+                        is_outgoing,
+                        is_automated: resource.headers.is_automated,
+                        has_attachments: resource.has_attachments,
+                        size: resource.size,
+                        snippet: resource.snippet.clone(),
+                        references: resource.headers.references.clone(),
+                        list_unsubscribe: resource.headers.list_unsubscribe.clone(),
+                        list_unsubscribe_post: resource.headers.list_unsubscribe_post.clone(),
+                        list_id: resource.headers.list_id.clone(),
+                        sender_addr: resource.headers.via.clone(),
+                        sender_verification: resource.headers.sender_verification,
+                        receipt_to: resource.headers.receipt_to.clone(),
+                        receipt_confirm: resource.headers.receipt_confirm,
+                        // Gmail keeps no keywords for it; this device
+                        // records the answer.
+                        receipt_handled: false,
+                        importance: resource.headers.importance,
+                    };
+                    let id = repo::messages::insert(&tx, &message, thread_id)?;
+                    tx.execute(
+                        "UPDATE messages SET gmail_sync_generation = ?2 WHERE id = ?1",
+                        params![id, generation],
+                    )?;
+                    id
+                };
+
+                repo::gmail::set_message_folders(&tx, local_message_id, &folder_ids)?;
+                for local_id in &provider_local_labels {
+                    if !present_local_labels.contains(local_id) {
+                        repo::labels::remove_from_message(&tx, local_message_id, *local_id)?;
+                    }
+                }
+                for local_id in present_local_labels {
+                    repo::labels::add_to_message(&tx, local_message_id, local_id)?;
+                }
+                repo::search::index_message(&tx, local_message_id)?;
+                // Mail from a blocked sender goes to Spam as it arrives.
+                let turned_away = inserted && crate::turn_away(&tx, local_message_id)?;
+                // Then rules sort new mail. What they file away or mark read
+                // stays silent.
+                let arrived = match &arrivals {
+                    Arrivals::None => false,
+                    Arrivals::Added(ids) => ids.contains(&resource.provider_id),
+                    Arrivals::SinceCaughtUp => {
+                        caught_up_at.is_some_and(|at| resource.internal_date >= at)
+                    }
+                };
+                let sorted = match &sorter {
+                    Some(sorter) if inserted && !turned_away && arrived => sorter.arrived(
+                        &tx,
+                        local_message_id,
+                        crate::rules::Arrival {
+                            headers: Some(crate::mime::header_fields(&resource.raw_headers)),
+                            text: None,
+                            // Metadata lists no parts; the body tells.
+                            attachments_known: false,
+                        },
+                    )?,
+                    _ => Default::default(),
+                };
+
+                if inserted
+                    && is_outgoing
+                    && settings.collect_outgoing_contacts
+                    && resource.internal_date >= outgoing_learning_since
+                {
+                    let mut harvested_addresses = HashSet::new();
+                    for address in resource
+                        .headers
+                        .to
+                        .iter()
+                        .chain(resource.headers.cc.iter())
+                        .chain(resource.headers.bcc.iter())
+                    {
+                        let email = address.email.to_ascii_lowercase();
+                        if !account_emails.contains(&email) && harvested_addresses.insert(email) {
+                            repo::contacts::harvest(&tx, account_id, address, true, date)?;
+                        }
+                    }
+                } else if inserted
+                    && !turned_away
+                    && !sorted.unwanted
+                    && settings.collect_incoming_contacts
+                    && resource.internal_date >= incoming_learning_since
+                    && !resource.headers.is_automated
+                    && !label_set.contains("SPAM")
+                    && !label_set.contains("TRASH")
+                    && let Some(from) = &resource.headers.from
+                    && !crate::mime::robot_sender(&from.email)
+                {
+                    repo::contacts::harvest(&tx, account_id, from, false, date)?;
+                }
+
+                if !outcome.touched_threads.contains(&thread_id) {
+                    outcome.touched_threads.push(thread_id);
+                }
+                // A read receipt that came back is read now, so what it
+                // reports shows on the sent message (RFC 8098).
+                if inserted && !is_outgoing && resource.headers.disposition_report {
+                    outcome.receipts.push(resource.provider_id.clone());
+                }
+                // One notification per conversation in this batch, for mail
+                // that reached the Inbox after the cutoff. Rules that wait
+                // for the body hold it back until they are done.
+                let eligible = notify_new
+                    && inserted
+                    && !turned_away
+                    && label_set.contains("INBOX")
+                    && crate::sync::ingest::arrival_eligible(
+                        notification_cutoff.is_none_or(|cutoff| resource.internal_date >= cutoff),
+                        is_read,
+                        is_outgoing,
+                        resource.internal_date,
+                        now_ms(),
+                    );
+                let audible = || {
+                    crate::sync::ingest::chime_worthy(resource.headers.is_automated, &from_email)
+                };
+                if sorted.waiting {
+                    if eligible {
+                        crate::rules::hold(&tx, local_message_id, audible())?;
+                    }
+                    outcome.waiting.push(resource.provider_id.clone());
+                } else if eligible
+                    && !sorted.silent()
+                    && !outcome.fresh_threads.contains(&thread_id)
+                {
+                    repo::notifications::enqueue(&tx, local_message_id, audible())?;
+                    outcome.fresh_threads.push(thread_id);
+                }
+            }
+
+            if complete_threads {
+                for (provider_thread_id, ids) in &complete_by_thread {
+                    let local_thread =
+                        repo::threads::by_gm_thrid(&tx, account_id, provider_thread_id)?;
+                    let Some(local_thread) = local_thread else {
+                        continue;
+                    };
+                    let stale = {
+                        let mut stmt = tx.prepare(
+                            "SELECT id, gm_msgid FROM messages
+                             WHERE account_id = ?1 AND thread_id = ?2
+                               AND gm_msgid IS NOT NULL",
+                        )?;
+                        stmt.query_map(params![account_id, local_thread], |row| {
+                            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                        })?
+                        .collect::<rusqlite::Result<Vec<_>>>()?
+                        .into_iter()
+                        .filter_map(|(id, gm)| (!ids.contains(&gm)).then_some(id))
+                        .collect::<Vec<_>>()
+                    };
+                    for id in stale {
+                        repo::messages::delete(&tx, id)?;
+                    }
+                }
+            }
+
+            outcome.touched_threads.extend(old_threads);
+            outcome.touched_threads.sort_unstable();
+            outcome.touched_threads.dedup();
+            for &thread_id in &outcome.touched_threads {
+                repo::threads::recompute(&tx, thread_id)?;
+            }
+            if settings.auto_labels_enabled {
+                for &thread_id in &outcome.touched_threads {
+                    if repo::threads::get_summary(&tx, thread_id)?.is_some() {
+                        crate::route::route_thread_deterministic(
+                            &tx,
+                            settings.ai_categorize,
+                            thread_id,
+                        )?;
+                    }
+                }
+            }
+            tx.commit()?;
+            Ok(outcome)
+        })
+        .await
+}
+
+async fn remove_provider_thread(
+    ctx: &SyncCtx,
+    account_id: i64,
+    provider_thread_id: String,
+) -> Result<Vec<i64>> {
+    ctx.db
+        .write(move |conn| {
+            let tx = conn.transaction()?;
+            let Some(thread_id) = repo::threads::by_gm_thrid(&tx, account_id, &provider_thread_id)?
+            else {
+                tx.commit()?;
+                return Ok(Vec::new());
+            };
+            let ids = {
+                let mut stmt = tx.prepare(
+                    "SELECT id FROM messages
+                     WHERE account_id = ?1 AND thread_id = ?2 AND gm_msgid IS NOT NULL",
+                )?;
+                stmt.query_map(params![account_id, thread_id], |row| row.get(0))?
+                    .collect::<rusqlite::Result<Vec<i64>>>()?
+            };
+            for id in ids {
+                repo::messages::delete(&tx, id)?;
+            }
+            repo::threads::recompute(&tx, thread_id)?;
+            tx.commit()?;
+            Ok(vec![thread_id])
+        })
+        .await
+}
+
+async fn cleanup_full_generation(
+    ctx: &SyncCtx,
+    account_id: i64,
+    generation: i64,
+    started_at: i64,
+    cutoff: Option<i64>,
+) -> Result<Vec<i64>> {
+    ctx.db
+        .write(move |conn| {
+            let tx = conn.transaction()?;
+            let stale = {
+                let mut stmt = tx.prepare(
+                    "SELECT id, thread_id FROM messages
+                     WHERE account_id = ?1 AND gm_msgid IS NOT NULL
+                       AND COALESCE(gmail_sync_generation, 0) <> ?2
+                       AND COALESCE(internal_date, date) < ?3
+                       AND (?4 IS NULL OR COALESCE(internal_date, date) >= ?4)
+                       AND NOT EXISTS (
+                         SELECT 1 FROM pending_actions pa
+                         WHERE pa.message_id = messages.id
+                           AND pa.state IN ('pending','inflight')
+                       )",
+                )?;
+                stmt.query_map(params![account_id, generation, started_at, cutoff], |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, Option<i64>>(1)?))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+            };
+            let mut threads = Vec::new();
+            for (id, thread_id) in stale {
+                repo::messages::delete(&tx, id)?;
+                if let Some(thread_id) = thread_id {
+                    threads.push(thread_id);
+                }
+            }
+            threads.sort_unstable();
+            threads.dedup();
+            for thread_id in &threads {
+                repo::threads::recompute(&tx, *thread_id)?;
+            }
+            tx.commit()?;
+            Ok(threads)
+        })
+        .await
+}
+
+async fn sync_draft_map(ctx: &SyncCtx, config: &AccountConfig, api: &GmailApi) -> Result<()> {
+    let drafts = api.list_drafts().await?;
+    let account_id = config.id;
+    ctx.db
+        .write(move |conn| {
+            conn.execute(
+                "UPDATE messages SET gmail_draft_id = NULL
+                 WHERE account_id = ?1 AND is_draft = 1 AND gm_msgid IS NOT NULL",
+                params![account_id],
+            )?;
+            for (draft_id, message_id) in drafts {
+                repo::gmail::set_draft_ids(conn, account_id, &message_id, &draft_id)?;
+            }
+            Ok(())
+        })
+        .await
+}
+
+fn part_headers(part: &Value) -> BTreeMap<String, String> {
+    part.get("headers")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|header| {
+            Some((
+                header.get("name")?.as_str()?.to_ascii_lowercase(),
+                header.get("value")?.as_str()?.to_owned(),
+            ))
+        })
+        .collect()
+}
+
+#[derive(Debug, Clone)]
+struct PartSpec {
+    part_id: String,
+    mime_type: String,
+    filename: Option<String>,
+    content_id: Option<String>,
+    is_inline: bool,
+    is_attachment: bool,
+    charset: Option<String>,
+    provider_attachment_id: Option<String>,
+    encoded_data: Option<String>,
+    size: i64,
+}
+
+fn collect_part_specs(part: &Value, output: &mut Vec<PartSpec>) -> Result<()> {
+    let mut visited = 0_usize;
+    collect_part_specs_inner(part, output, &mut visited)
+}
+
+fn collect_part_specs_inner(
+    part: &Value,
+    output: &mut Vec<PartSpec>,
+    visited: &mut usize,
+) -> Result<()> {
+    *visited += 1;
+    if *visited > MAX_GMAIL_MIME_PARTS {
+        return Err(CoreError::Mime(format!(
+            "Gmail MIME tree exceeds the {MAX_GMAIL_MIME_PARTS}-part safety limit"
+        )));
+    }
+    let mime_type = part
+        .get("mimeType")
+        .and_then(Value::as_str)
+        .unwrap_or("application/octet-stream")
+        .to_ascii_lowercase();
+    let filename = part
+        .get("filename")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned);
+    let headers = part_headers(part);
+    let disposition = headers
+        .get("content-disposition")
+        .map(String::as_str)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let charset = headers.get("content-type").and_then(|value| {
+        value.split(';').skip(1).find_map(|parameter| {
+            let (name, value) = parameter.trim().split_once('=')?;
+            name.trim()
+                .eq_ignore_ascii_case("charset")
+                .then(|| value.trim().trim_matches(['\'', '"']).to_owned())
+        })
+    });
+    let content_id = headers
+        .get("content-id")
+        .map(|value| value.trim().trim_matches(['<', '>']).to_owned())
+        .filter(|value| !value.is_empty());
+    let body = part.get("body").unwrap_or(&Value::Null);
+    let has_body = body.get("data").and_then(Value::as_str).is_some()
+        || body.get("attachmentId").and_then(Value::as_str).is_some();
+    if has_body {
+        let is_attachment = filename.is_some() || disposition.starts_with("attachment");
+        output.push(PartSpec {
+            part_id: part
+                .get("partId")
+                .and_then(Value::as_str)
+                .unwrap_or("0")
+                .to_owned(),
+            mime_type,
+            filename,
+            content_id: content_id.clone(),
+            is_inline: disposition.starts_with("inline")
+                || (content_id.is_some() && !disposition.starts_with("attachment")),
+            is_attachment,
+            charset,
+            provider_attachment_id: body
+                .get("attachmentId")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            encoded_data: body.get("data").and_then(Value::as_str).map(str::to_owned),
+            size: body.get("size").and_then(Value::as_i64).unwrap_or(0),
+        });
+    }
+    for child in part
+        .get("parts")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        collect_part_specs_inner(child, output, visited)?;
+    }
+    Ok(())
+}
+
+#[derive(Debug)]
+struct HydratedAttachment {
+    part_id: String,
+    provider_attachment_id: Option<String>,
+    filename: Option<String>,
+    mime_type: String,
+    size: i64,
+    content_id: Option<String>,
+    is_inline: bool,
+    inline_bytes: Option<Vec<u8>>,
+}
+
+#[derive(Debug, Default)]
+struct HydratedBody {
+    text: Option<String>,
+    html: Option<String>,
+    calendar_parts: Vec<String>,
+    attachments: Vec<HydratedAttachment>,
+    /// The message is a read receipt that came back.
+    disposition_report: Option<crate::mime::DispositionReport>,
+    /// The original the body was read from, kept on this device, when it was
+    /// read whole.
+    raw_path: Option<String>,
+}
+
+/// A message's body: from its parts as Gmail gives them, or from its
+/// original when it carries a message its body shows (#455). Gmail's parts
+/// don't say which message a part belongs to, so such a message is read the
+/// way mail of every other kind of account is, and its files come from the
+/// original kept here.
+async fn hydrate(
+    ctx: &SyncCtx,
+    config: &AccountConfig,
+    api: &GmailApi,
+    resource: &Value,
+) -> Result<HydratedBody> {
+    hydrate_at(ctx, config, api, GMAIL_API, resource).await
+}
+
+/// [`hydrate`] with the mailbox API at `base`.
+async fn hydrate_at(
+    ctx: &SyncCtx,
+    config: &AccountConfig,
+    api: &GmailApi,
+    base: &str,
+    resource: &Value,
+) -> Result<HydratedBody> {
+    if !shows_messages(resource.get("payload").unwrap_or(&Value::Null)) {
+        return hydrate_parts(api, resource).await;
+    }
+    let provider_message_id = required_string(resource, "id")?;
+    let size = resource
+        .get("sizeEstimate")
+        .and_then(Value::as_u64)
+        .unwrap_or_default();
+    let raw = api.raw_message_at(base, provider_message_id, size).await?;
+    let parsed = crate::sync::ingest::parse_or_text(&raw);
+    let dir = ctx.paths.mail_dir(config.id);
+    tokio::fs::create_dir_all(&dir).await?;
+    let name: String = provider_message_id
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .collect();
+    let path = dir.join(format!("gmail-{name}.eml"));
+    crate::file_io::write_atomic(&path, &raw, "Gmail message cache").await?;
+    Ok(HydratedBody {
+        text: parsed.text,
+        html: parsed.html,
+        calendar_parts: parsed.calendar_parts,
+        attachments: parsed
+            .attachments
+            .into_iter()
+            .map(|attachment| HydratedAttachment {
+                part_id: attachment.part_id,
+                provider_attachment_id: None,
+                filename: attachment.filename,
+                mime_type: attachment
+                    .mime_type
+                    .unwrap_or_else(|| "application/octet-stream".into()),
+                size: attachment.size,
+                content_id: attachment.content_id,
+                is_inline: attachment.is_inline,
+                inline_bytes: None,
+            })
+            .collect(),
+        disposition_report: parsed.disposition_report,
+        raw_path: Some(path.to_string_lossy().into_owned()),
+    })
+}
+
+/// Whether `part`, or a part inside it, is a message the body shows.
+fn shows_messages(part: &Value) -> bool {
+    let media_type = part
+        .get("mimeType")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let disposition = part_headers(part)
+        .remove("content-disposition")
+        .map(|value| {
+            value
+                .split(';')
+                .next()
+                .unwrap_or_default()
+                .trim()
+                .to_owned()
+        });
+    crate::mime::shows_in_body(media_type, disposition.as_deref())
+        || part
+            .get("parts")
+            .and_then(Value::as_array)
+            .is_some_and(|parts| parts.iter().any(shows_messages))
+}
+
+async fn hydrate_parts(api: &GmailApi, resource: &Value) -> Result<HydratedBody> {
+    let message_id = required_string(resource, "id")?;
+    let mut specs = Vec::new();
+    collect_part_specs(resource.get("payload").unwrap_or(&Value::Null), &mut specs)?;
+    let mut hydrated = HydratedBody::default();
+    for spec in specs {
+        let bytes = match (&spec.encoded_data, &spec.provider_attachment_id) {
+            (Some(data), _) => decode_gmail_data(data)?,
+            (None, Some(attachment_id)) => api.attachment(message_id, attachment_id).await?,
+            (None, None) => Vec::new(),
+        };
+        let is_text_body = !spec.is_attachment
+            && !spec.mime_type.eq_ignore_ascii_case("message/rfc822")
+            && (spec.mime_type == "text/plain"
+                || spec.mime_type == "text/html"
+                || spec.mime_type == "text/calendar");
+        if is_text_body {
+            let decoded = decode_text_part(&bytes, spec.charset.as_deref());
+            match spec.mime_type.as_str() {
+                "text/plain" if hydrated.text.is_none() => hydrated.text = Some(decoded),
+                "text/html" if hydrated.html.is_none() => {
+                    hydrated.html = Some(crate::mime::sanitize_html(&decoded))
+                }
+                "text/calendar" => hydrated.calendar_parts.push(decoded),
+                _ => {}
+            }
+            continue;
+        }
+        if hydrated.disposition_report.is_none()
+            && crate::mime::is_disposition_report_part(&spec.mime_type)
+        {
+            hydrated.disposition_report = returned_receipt(resource, &bytes);
+        }
+        let has_provider_attachment = spec.provider_attachment_id.is_some();
+        hydrated.attachments.push(HydratedAttachment {
+            part_id: spec.part_id,
+            provider_attachment_id: spec.provider_attachment_id,
+            filename: spec.filename,
+            mime_type: spec.mime_type,
+            size: if spec.size > 0 {
+                spec.size
+            } else {
+                bytes.len() as i64
+            },
+            content_id: spec.content_id,
+            is_inline: spec.is_inline,
+            // Attachment endpoints can always be fetched again. Preserve bytes
+            // only when Gmail embedded them directly and supplied no opaque id.
+            inline_bytes: (!has_provider_attachment).then_some(bytes),
+        });
+    }
+    if hydrated.text.is_none() {
+        hydrated.text = hydrated.html.as_deref().map(html_to_text);
+    }
+    if hydrated.html.is_none() {
+        hydrated.html = hydrated
+            .text
+            .as_deref()
+            .map(|text| format!("<pre>{}</pre>", escape_html(text)));
+    }
+    Ok(hydrated)
+}
+
+/// The read receipt a message is, from its report part: when the message is
+/// a multipart/report (RFC 6522), and not one forwarded inside another.
+fn returned_receipt(resource: &Value, report: &[u8]) -> Option<crate::mime::DispositionReport> {
+    let payload = resource.get("payload")?;
+    if !payload
+        .get("mimeType")
+        .and_then(Value::as_str)
+        .is_some_and(|mime_type| mime_type.eq_ignore_ascii_case("multipart/report"))
+    {
+        return None;
+    }
+    let headers = parse_resource(resource).ok()?.headers;
+    let in_reply_to = part_headers(payload).remove("in-reply-to");
+    crate::mime::disposition_report(
+        report,
+        in_reply_to.as_deref(),
+        headers.from.as_ref(),
+        headers.date_ms,
+    )
+}
+
+fn decode_text_part(bytes: &[u8], charset: Option<&str>) -> String {
+    let encoding = charset
+        .and_then(|label| encoding_rs::Encoding::for_label(label.as_bytes()))
+        .unwrap_or(encoding_rs::UTF_8);
+    let (decoded, _, _) = encoding.decode(bytes);
+    decoded.into_owned()
+}
+
+fn html_to_text(value: &str) -> String {
+    let mut output = String::with_capacity(value.len());
+    let mut in_tag = false;
+    for character in value.chars() {
+        match character {
+            '<' => in_tag = true,
+            '>' => {
+                in_tag = false;
+                output.push(' ');
+            }
+            _ if !in_tag => output.push(character),
+            _ => {}
+        }
+    }
+    crate::mime::collapse_whitespace(&output, None)
+}
+
+fn escape_html(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+/// Store a hydrated message, and return the threads that changed: its own,
+/// and those holding the message a read receipt it is reports on.
+async fn store_hydrated_body(
+    ctx: &SyncCtx,
+    config: &AccountConfig,
+    provider_message_id: String,
+    body: HydratedBody,
+) -> Result<Vec<i64>> {
+    let account_id = config.id;
+    let text = body.text.clone();
+    let html = body.html.clone();
+    let snippet = crate::mime::make_body_snippet(text.as_deref(), html.as_deref());
+    let has_files = body
+        .attachments
+        .iter()
+        .any(|attachment| !attachment.is_inline);
+    let attachments = body.attachments;
+    let calendar_parts = body.calendar_parts;
+    let disposition_report = body.disposition_report;
+    let raw_path = body.raw_path;
+    let (local_message_id, thread_ids, cached_inline, fresh) = ctx
+        .db
+        .write(move |conn| {
+            let tx = conn.transaction()?;
+            let local_message_id: i64 = tx
+                .query_row(
+                    "SELECT id FROM messages WHERE account_id = ?1 AND gm_msgid = ?2",
+                    params![account_id, provider_message_id],
+                    |row| row.get(0),
+                )
+                .optional()?
+                .ok_or_else(|| CoreError::NotFound("Gmail message".into()))?;
+            // Files read from an original are numbered as the original's
+            // parts, not as Gmail's: the first time a message is read whole,
+            // the files it had are those of another numbering.
+            let read_whole_before = tx.query_row(
+                "SELECT raw_path IS NOT NULL FROM messages WHERE id = ?1",
+                params![local_message_id],
+                |row| row.get::<_, bool>(0),
+            )?;
+            if raw_path.is_some() && !read_whole_before {
+                tx.execute(
+                    "DELETE FROM attachments WHERE message_id = ?1",
+                    params![local_message_id],
+                )?;
+            }
+            repo::messages::store_body(
+                &tx,
+                local_message_id,
+                text.as_deref(),
+                html.as_deref(),
+                raw_path.as_deref(),
+                has_files,
+                Some(&snippet),
+            )?;
+
+            let mut seen_ids = Vec::<i64>::new();
+            let mut cached_inline = Vec::<(i64, Vec<u8>)>::new();
+            for attachment in attachments {
+                let existing: Option<i64> =
+                    if let Some(provider_id) = attachment.provider_attachment_id.as_deref() {
+                        tx.query_row(
+                            "SELECT id FROM attachments
+                         WHERE message_id = ?1 AND provider_attachment_id = ?2",
+                            params![local_message_id, provider_id],
+                            |row| row.get(0),
+                        )
+                        .optional()?
+                    } else {
+                        tx.query_row(
+                            "SELECT id FROM attachments
+                         WHERE message_id = ?1 AND part_id = ?2
+                           AND provider_attachment_id IS NULL",
+                            params![local_message_id, attachment.part_id],
+                            |row| row.get(0),
+                        )
+                        .optional()?
+                    };
+                let id = match existing {
+                    Some(id) => {
+                        tx.execute(
+                            "UPDATE attachments SET
+                                 part_id = ?2, provider_attachment_id = ?3,
+                                 filename = ?4, mime_type = ?5, size = ?6,
+                                 content_id = ?7, is_inline = ?8
+                             WHERE id = ?1",
+                            params![
+                                id,
+                                attachment.part_id,
+                                attachment.provider_attachment_id,
+                                attachment.filename,
+                                attachment.mime_type,
+                                attachment.size,
+                                attachment.content_id,
+                                attachment.is_inline as i64,
+                            ],
+                        )?;
+                        id
+                    }
+                    None => {
+                        tx.execute(
+                            "INSERT INTO attachments (
+                                 message_id, part_id, provider_attachment_id,
+                                 filename, mime_type, size, content_id, is_inline
+                             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                            params![
+                                local_message_id,
+                                attachment.part_id,
+                                attachment.provider_attachment_id,
+                                attachment.filename,
+                                attachment.mime_type,
+                                attachment.size,
+                                attachment.content_id,
+                                attachment.is_inline as i64,
+                            ],
+                        )?;
+                        tx.last_insert_rowid()
+                    }
+                };
+                seen_ids.push(id);
+                if let Some(bytes) = attachment.inline_bytes {
+                    cached_inline.push((id, bytes));
+                }
+            }
+
+            // The full Gmail payload is authoritative. A changed draft can
+            // replace an attachment id while the older part is cached; keeping
+            // that descriptor would show a removed file and could add it back
+            // on the next save.
+            let stale = {
+                let mut stmt = tx.prepare(
+                    "SELECT id FROM attachments
+                     WHERE message_id = ?1 AND imap_section IS NULL",
+                )?;
+                stmt.query_map(params![local_message_id], |row| row.get::<_, i64>(0))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?
+            };
+            for id in stale {
+                if !seen_ids.contains(&id) {
+                    tx.execute("DELETE FROM attachments WHERE id = ?1", params![id])?;
+                }
+            }
+
+            repo::search::index_message(&tx, local_message_id)?;
+            // Rules that waited for this body go on (#238).
+            let fresh = crate::rules::resume(&tx, local_message_id)?
+                .filter(|resumed| resumed.announced)
+                .map(|resumed| resumed.thread_id);
+            let mut thread_ids = match &disposition_report {
+                Some(report) => {
+                    crate::sync::ingest::record_returned_receipt(&tx, local_message_id, report)?
+                }
+                None => Vec::new(),
+            };
+            if let Some(thread_id) =
+                repo::messages::get_row(&tx, local_message_id)?.and_then(|row| row.thread_id)
+            {
+                repo::threads::recompute(&tx, thread_id)?;
+                if !thread_ids.contains(&thread_id) {
+                    thread_ids.push(thread_id);
+                }
+            }
+            tx.commit()?;
+            Ok((local_message_id, thread_ids, cached_inline, fresh))
+        })
+        .await?;
+    if let Some(thread_id) = fresh {
+        ctx.bus.emit(CoreEvent::MailNew {
+            account_id,
+            thread_ids: vec![thread_id],
+        });
+    }
+
+    crate::sync::ingest::store_calendar_events(
+        ctx,
+        account_id,
+        vec![(local_message_id, calendar_parts)],
+        crate::sync::ingest::Arrival::Received,
+    )
+    .await?;
+
+    for (attachment_id, bytes) in cached_inline {
+        let dir = ctx
+            .paths
+            .attachments_dir(config.id)
+            .join(attachment_id.to_string());
+        tokio::fs::create_dir_all(&dir).await?;
+        let path = dir.join("gmail-inline-part");
+        crate::file_io::write_atomic(&path, &bytes, "Gmail inline attachment cache").await?;
+        let path = path.to_string_lossy().to_string();
+        ctx.db
+            .write(move |conn| {
+                conn.execute(
+                    "UPDATE attachments SET file_path = ?2 WHERE id = ?1",
+                    params![attachment_id, path],
+                )?;
+                Ok(())
+            })
+            .await?;
+    }
+    Ok(thread_ids)
+}
+
+/// Read new read receipts whole, so what they report shows on the sent
+/// message without anyone opening them. Gmail sends bodies only on request.
+/// Fetch and store whole, now, messages sync needs read at once: read
+/// receipts that came back, and new mail whose rules wait for its body.
+async fn hydrate_now(ctx: &SyncCtx, config: &AccountConfig, api: &GmailApi, ids: Vec<String>) {
+    let mut touched = Vec::<i64>::new();
+    for provider_message_id in ids {
+        let stored = async {
+            let resource = api.message_full(&provider_message_id).await?;
+            let body = hydrate(ctx, config, api, &resource).await?;
+            store_hydrated_body(ctx, config, provider_message_id.clone(), body).await
+        }
+        .await;
+        match stored {
+            Ok(thread_ids) => {
+                for thread_id in thread_ids {
+                    if !touched.contains(&thread_id) {
+                        touched.push(thread_id);
+                    }
+                }
+            }
+            Err(error) => {
+                tracing::warn!(account_id = config.id, %error, "could not fetch a whole message");
+            }
+        }
+    }
+    if !touched.is_empty() {
+        ctx.bus.emit(CoreEvent::MailUpdated {
+            thread_ids: touched,
+        });
+    }
+}
+
+async fn hydrate_thread(
+    ctx: &SyncCtx,
+    config: &AccountConfig,
+    api: &GmailApi,
+    provider_thread_id: &str,
+) -> Result<Vec<i64>> {
+    let mut thread = api.thread(provider_thread_id, true).await?;
+    let resources = thread
+        .get_mut("messages")
+        .and_then(Value::as_array_mut)
+        .map(std::mem::take)
+        .unwrap_or_default();
+    if resources.len() > MAX_MESSAGES_PER_THREAD {
+        return Err(CoreError::Network(format!(
+            "Gmail thread returned more than {MAX_MESSAGES_PER_THREAD} messages"
+        )));
+    }
+    let mut touched = store_resources(
+        ctx,
+        config,
+        &resources,
+        None,
+        true,
+        false,
+        None,
+        Arrivals::None,
+    )
+    .await?
+    .touched_threads;
+    for resource in resources {
+        let provider_message_id = required_string(&resource, "id")?.to_owned();
+        let body = hydrate(ctx, config, api, &resource).await?;
+        for thread_id in store_hydrated_body(ctx, config, provider_message_id, body).await? {
+            if !touched.contains(&thread_id) {
+                touched.push(thread_id);
+            }
+        }
+    }
+    if !touched.is_empty() {
+        ctx.bus.emit(CoreEvent::MailUpdated {
+            thread_ids: touched.clone(),
+        });
+    }
+    Ok(touched)
+}
+
+/// `live_since` is the receipt time from which new mail counts as arriving
+/// live (see [`crate::sync::ingest::live_since`]); only that notifies.
+async fn sync_once(
+    ctx: &SyncCtx,
+    config: &AccountConfig,
+    api: &GmailApi,
+    refresh_labels: bool,
+    mail_history: MailHistory,
+    live_since: i64,
+) -> Result<bool> {
+    let account_id = config.id;
+    let started = now_ms();
+    let mut state = ctx
+        .db
+        .read(move |conn| repo::gmail::state(conn, account_id))
+        .await?;
+
+    if refresh_labels {
+        sync_labels(ctx, config, api).await?;
+    }
+
+    if !state.backfill_done {
+        if state.history_id.is_none() || state.generation == 0 {
+            let history_id = api.profile_history_id().await?;
+            let generation = ctx
+                .db
+                .write(move |conn| repo::gmail::begin_full_sync(conn, account_id, &history_id))
+                .await?;
+            state = ctx
+                .db
+                .read(move |conn| repo::gmail::state(conn, account_id))
+                .await?;
+            debug_assert_eq!(state.generation, generation);
+        }
+        let cutoff_date = state
+            .full_started_at
+            .and_then(|started_at| mail_history.cutoff_date_at(started_at));
+        let (resources, next_cursor) = api
+            .list_messages_page(state.sync_cursor.as_deref(), cutoff_date)
+            .await?;
+        if next_cursor.is_some() && next_cursor == state.sync_cursor {
+            return Err(CoreError::Network(
+                "Gmail full-sync pagination cursor did not advance".into(),
+            ));
+        }
+        let total = resources.len() as u64;
+        // Mail that arrives while a full sync runs is new; what it finds
+        // from before is history, even when the sync resumes after a restart.
+        let cutoff = state.full_started_at.unwrap_or(live_since).max(live_since);
+        let outcome = store_resources(
+            ctx,
+            config,
+            &resources,
+            Some(state.generation),
+            false,
+            true,
+            Some(cutoff),
+            Arrivals::SinceCaughtUp,
+        )
+        .await?;
+        if !outcome.touched_threads.is_empty() {
+            ctx.bus.emit(CoreEvent::MailUpdated {
+                thread_ids: outcome.touched_threads,
+            });
+        }
+        if !outcome.fresh_threads.is_empty() {
+            ctx.bus.emit(CoreEvent::MailNew {
+                account_id,
+                thread_ids: outcome.fresh_threads,
+            });
+        }
+        hydrate_now(
+            ctx,
+            config,
+            api,
+            outcome
+                .receipts
+                .into_iter()
+                .chain(outcome.waiting)
+                .collect(),
+        )
+        .await;
+        ctx.bus.emit(CoreEvent::SyncProgress(SyncProgress {
+            account_id,
+            folder: "Gmail".into(),
+            phase: if next_cursor.is_some() {
+                "headers".into()
+            } else {
+                "history".into()
+            },
+            done: total,
+            total,
+        }));
+        if next_cursor.is_none()
+            && let Some(started_at) = state.full_started_at
+        {
+            let cutoff = mail_history.cutoff_ms_at(started_at);
+            let changed =
+                cleanup_full_generation(ctx, account_id, state.generation, started_at, cutoff)
+                    .await?;
+            if !changed.is_empty() {
+                ctx.bus.emit(CoreEvent::MailUpdated {
+                    thread_ids: changed,
+                });
+            }
+        }
+        ctx.db
+            .write({
+                let next_cursor = next_cursor.clone();
+                move |conn| {
+                    repo::gmail::checkpoint_full_page(conn, account_id, next_cursor.as_deref())
+                }
+            })
+            .await?;
+        if next_cursor.is_none() {
+            sync_draft_map(ctx, config, api).await?;
+            emit_sync_status(ctx, account_id).await;
+            return Ok(true);
+        }
+        emit_sync_status(ctx, account_id).await;
+        return Ok(false);
+    }
+
+    let Some(history_id) = state.history_id.as_deref() else {
+        ctx.db
+            .write(move |conn| repo::gmail::expire_history(conn, account_id))
+            .await?;
+        return Ok(false);
+    };
+    let page = match api
+        .history(history_id, state.history_page_token.as_deref())
+        .await
+    {
+        Ok(page) => page,
+        Err(CoreError::NotFound(_)) => {
+            tracing::info!(
+                account_id,
+                "Gmail history cursor expired; starting authoritative rescan"
+            );
+            ctx.db
+                .write(move |conn| repo::gmail::expire_history(conn, account_id))
+                .await?;
+            return Ok(false);
+        }
+        Err(error) => return Err(error),
+    };
+    if page.next_page_token.is_some() && page.next_page_token == state.history_page_token {
+        return Err(CoreError::Network(
+            "Gmail history pagination cursor did not advance".into(),
+        ));
+    }
+
+    let affected_ids = page.affected_threads.iter().cloned().collect::<Vec<_>>();
+    let mut touched = Vec::new();
+    let mut fresh_threads = Vec::new();
+    let mut removed = Vec::new();
+    for batch in affected_ids.chunks(HISTORY_THREAD_BATCH) {
+        let api_for_fetch = api.clone();
+        let results = stream::iter(batch.iter().cloned().map(|thread_id| {
+            let api = api_for_fetch.clone();
+            async move {
+                let result = api.thread(&thread_id, false).await;
+                (thread_id, result)
+            }
+        }))
+        .buffer_unordered(HISTORY_FETCH_CONCURRENCY)
+        .collect::<Vec<_>>()
+        .await;
+        let mut resources = Vec::new();
+        for (thread_id, result) in results {
+            match result {
+                Ok(mut thread) => {
+                    let messages = thread
+                        .get_mut("messages")
+                        .and_then(Value::as_array_mut)
+                        .map(std::mem::take)
+                        .unwrap_or_default();
+                    if messages.len() > MAX_MESSAGES_PER_THREAD
+                        || messages.len()
+                            > MAX_HISTORY_MESSAGES_PER_BATCH.saturating_sub(resources.len())
+                    {
+                        return Err(CoreError::Network(
+                            "Gmail history batch exceeded its message safety limit".into(),
+                        ));
+                    }
+                    resources.extend(messages);
+                }
+                Err(CoreError::NotFound(_)) => removed.push(thread_id),
+                Err(error) => return Err(error),
+            }
+        }
+        let resources = retain_history_threads(ctx, account_id, resources, mail_history).await?;
+        let outcome = store_resources(
+            ctx,
+            config,
+            &resources,
+            None,
+            true,
+            true,
+            Some(live_since),
+            Arrivals::Added(page.added_messages.clone()),
+        )
+        .await?;
+        touched.extend(outcome.touched_threads);
+        fresh_threads.extend(outcome.fresh_threads);
+        hydrate_now(
+            ctx,
+            config,
+            api,
+            outcome
+                .receipts
+                .into_iter()
+                .chain(outcome.waiting)
+                .collect(),
+        )
+        .await;
+    }
+    for thread_id in removed {
+        touched.extend(remove_provider_thread(ctx, account_id, thread_id).await?);
+    }
+    touched.sort_unstable();
+    touched.dedup();
+    if !touched.is_empty() {
+        ctx.bus.emit(CoreEvent::MailUpdated {
+            thread_ids: touched,
+        });
+    }
+    fresh_threads.sort_unstable();
+    fresh_threads.dedup();
+    if !fresh_threads.is_empty() {
+        ctx.bus.emit(CoreEvent::MailNew {
+            account_id,
+            thread_ids: fresh_threads,
+        });
+    }
+    ctx.db
+        .write({
+            let next = page.next_page_token.clone();
+            let completed = page.completed_history_id.clone();
+            move |conn| {
+                repo::gmail::checkpoint_history_page(
+                    conn,
+                    account_id,
+                    next.as_deref(),
+                    completed.as_deref(),
+                )
+            }
+        })
+        .await?;
+    if page.next_page_token.is_none() && !page.affected_threads.is_empty() {
+        sync_draft_map(ctx, config, api).await?;
+    }
+    if page.next_page_token.is_none() {
+        // The history ran out: everything up to this pass is stored.
+        caught_up(ctx, account_id, started).await;
+    }
+    Ok(true)
+}
+
+/// Reads the Inbox's unread count from Gmail when `inbox_count_due` says
+/// so. It is read after the history it is compared with, so mail arriving
+/// in between changes the history id and is counted again next time.
+async fn sync_inbox_count(ctx: &SyncCtx, account_id: i64, api: &GmailApi) -> Result<()> {
+    let Some((inbox, history_id)) = ctx
+        .db
+        .read(move |conn| repo::gmail::inbox_count_due(conn, account_id))
+        .await?
+    else {
+        return Ok(());
+    };
+    let unread = api.unread_in_label("INBOX").await?;
+    let changed = ctx
+        .db
+        .write(move |conn| {
+            let tx = conn.transaction()?;
+            let changed =
+                repo::gmail::set_inbox_count(&tx, account_id, inbox, &history_id, unread)?;
+            tx.commit()?;
+            Ok(changed)
+        })
+        .await?;
+    if changed {
+        ctx.bus
+            .emit(CoreEvent::ServerOnlyUnreadChanged { account_id });
+    }
+    Ok(())
+}
+
+struct PreparedDraft {
+    raw: Vec<u8>,
+    message_id: String,
+    provider_thread_id: Option<String>,
+    provider_draft_id: Option<String>,
+}
+
+async fn prepare_draft(
+    ctx: &SyncCtx,
+    config: &AccountConfig,
+    api: &GmailApi,
+    draft_id: i64,
+) -> Result<PreparedDraft> {
+    let (
+        detail,
+        bcc,
+        refs,
+        in_reply_to,
+        provider_thread_id,
+        provider_draft_id,
+        gm_msgid,
+        stored_message_id,
+    ) = ctx
+        .db
+        .read(move |conn| {
+            let detail = repo::messages::detail(conn, draft_id)?;
+            if !detail.is_draft {
+                return Err(CoreError::NotFound(format!("draft {draft_id}")));
+            }
+            let bcc_json: String = conn.query_row(
+                "SELECT bcc_json FROM messages WHERE id = ?1",
+                params![draft_id],
+                |row| row.get(0),
+            )?;
+            let bcc = serde_json::from_str::<Vec<Address>>(&bcc_json)?;
+            let (refs, in_reply_to) = repo::messages::draft_reply_headers(conn, draft_id)?;
+            let provider: (
+                Option<String>,
+                Option<String>,
+                Option<String>,
+                Option<String>,
+            ) = conn.query_row(
+                "SELECT t.gm_thrid, m.gmail_draft_id, m.gm_msgid, m.message_id
+                 FROM messages m LEFT JOIN threads t ON t.id = m.thread_id
+                 WHERE m.id = ?1",
+                params![draft_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )?;
+            Ok((
+                detail,
+                bcc,
+                refs,
+                in_reply_to,
+                provider.0,
+                provider.1,
+                provider.2,
+                provider.3,
+            ))
+        })
+        .await?;
+
+    let reply_to = api.validate_sender_identity(&detail.from.email).await?;
+
+    let staged: Vec<(String, String, Option<String>)> = ctx
+        .db
+        .read(move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT file_path, filename, mime_type
+                 FROM draft_attachments WHERE draft_id = ?1 ORDER BY id",
+            )?;
+            Ok(stmt
+                .query_map(params![draft_id], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?)
+        })
+        .await?;
+    let staging_root = tokio::fs::canonicalize(ctx.paths.draft_attachments_dir())
+        .await
+        .ok();
+    let mut attachments = Vec::new();
+    let mut attachment_bytes = 0usize;
+    for (path, filename, mime_type) in staged {
+        let canonical = tokio::fs::canonicalize(&path)
+            .await
+            .map_err(|error| CoreError::Other(format!("attachment {filename}: {error}")))?;
+        if !staging_root
+            .as_ref()
+            .is_some_and(|root| canonical.starts_with(root))
+        {
+            return Err(CoreError::Other(format!(
+                "attachment {filename}: path is outside the staging area"
+            )));
+        }
+        let remaining = crate::MAX_DRAFT_ATTACHMENT_BYTES.saturating_sub(attachment_bytes);
+        let bytes = crate::file_io::read(canonical, remaining, "draft attachment").await?;
+        attachment_bytes += bytes.len();
+        attachments.push(crate::mime::OutgoingAttachment {
+            filename: filename.clone(),
+            mime_type: mime_type.unwrap_or_else(|| crate::queue::mime_guess_from_name(&filename)),
+            bytes,
+        });
+    }
+
+    // A draft created in another Gmail client has descriptors rather than
+    // staged composer files. Preserve those attachments when it is edited or
+    // sent from Flectar Mail.
+    if attachments.is_empty()
+        && let Some(gm_msgid) = gm_msgid.as_deref()
+    {
+        let remote: Vec<RemoteDraftAttachment> = ctx
+            .db
+            .read(move |conn| {
+                let mut stmt = conn.prepare(
+                    "SELECT provider_attachment_id, file_path,
+                                COALESCE(filename, 'attachment'), mime_type
+                         FROM attachments WHERE message_id = ?1 AND is_inline = 0",
+                )?;
+                Ok(stmt
+                    .query_map(params![draft_id], |row| {
+                        Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()?)
+            })
+            .await?;
+        for (provider_id, file_path, filename, mime_type) in remote {
+            let remaining = crate::MAX_DRAFT_ATTACHMENT_BYTES.saturating_sub(attachment_bytes);
+            let bytes = if let Some(path) = file_path {
+                crate::file_io::read(path, remaining, "draft attachment").await?
+            } else if let Some(provider_id) = provider_id {
+                let bytes = api.attachment(gm_msgid, &provider_id).await?;
+                if bytes.len() > remaining {
+                    return Err(CoreError::Other(format!(
+                        "draft attachments exceed the {} MiB safety limit",
+                        crate::MAX_DRAFT_ATTACHMENT_BYTES / (1024 * 1024)
+                    )));
+                }
+                bytes
+            } else {
+                continue;
+            };
+            attachment_bytes += bytes.len();
+            attachments.push(crate::mime::OutgoingAttachment {
+                filename: filename.clone(),
+                mime_type: mime_type
+                    .unwrap_or_else(|| crate::queue::mime_guess_from_name(&filename)),
+                bytes,
+            });
+        }
+    }
+
+    let from = detail.from.clone();
+    let domain = from
+        .email
+        .split('@')
+        .nth(1)
+        .unwrap_or("localhost")
+        .to_owned();
+    let (receipt_to, importance) = ctx
+        .db
+        .read(move |conn| {
+            Ok((
+                repo::messages::receipt_to(conn, draft_id)?,
+                repo::messages::importance(conn, draft_id)?,
+            ))
+        })
+        .await?;
+    let outgoing = crate::mime::OutgoingMessage {
+        from,
+        reply_to,
+        to: &detail.to,
+        cc: &detail.cc,
+        bcc: &bcc,
+        subject: &detail.subject,
+        body_text: detail.text_body.as_deref().unwrap_or(""),
+        body_html: detail.html_body.as_deref(),
+        in_reply_to: in_reply_to.as_deref(),
+        references: &refs,
+        message_id: stored_message_id.as_deref(),
+        message_id_domain: &domain,
+        attachments,
+        receipt_to: &receipt_to,
+        importance,
+    };
+    let security_recipients = outgoing
+        .to
+        .iter()
+        .chain(outgoing.cc)
+        .chain(outgoing.bcc)
+        .cloned()
+        .collect();
+    let (message_id, raw) = crate::mime::build_message_owned(outgoing)?;
+    let raw =
+        crate::mail_security::protect_draft(&ctx.db, config.id, draft_id, raw, security_recipients)
+            .await?;
+    let bare_message_id = message_id.trim_matches(['<', '>']).to_owned();
+    if stored_message_id.as_deref() != Some(bare_message_id.as_str()) {
+        let stable_id = bare_message_id.clone();
+        ctx.db
+            .write(move |conn| {
+                conn.execute(
+                    "UPDATE messages SET message_id = ?2 WHERE id = ?1",
+                    params![draft_id, stable_id],
+                )?;
+                Ok(())
+            })
+            .await?;
+    }
+    Ok(PreparedDraft {
+        raw,
+        message_id,
+        provider_thread_id,
+        provider_draft_id,
+    })
+}
+
+async fn save_remote_draft(
+    ctx: &SyncCtx,
+    config: &AccountConfig,
+    api: &GmailApi,
+    draft_id: i64,
+) -> Result<()> {
+    let prepared = prepare_draft(ctx, config, api, draft_id).await?;
+    let value = match api
+        .upsert_draft(
+            prepared.provider_draft_id.as_deref(),
+            &prepared.raw,
+            prepared.provider_thread_id.as_deref(),
+        )
+        .await
+    {
+        Ok(value) => value,
+        // A draft deleted in another client no longer has a resource to update;
+        // the local edit is authoritative user intent, so recreate it.
+        Err(CoreError::NotFound(_)) if prepared.provider_draft_id.is_some() => {
+            api.upsert_draft(None, &prepared.raw, prepared.provider_thread_id.as_deref())
+                .await?
+        }
+        Err(error) => return Err(error),
+    };
+    let provider_draft_id = required_string(&value, "id")?.to_owned();
+    let provider_message_id = value
+        .pointer("/message/id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| CoreError::Other("Gmail draft omitted message id".into()))?
+        .to_owned();
+    let provider_thread_id = value
+        .pointer("/message/threadId")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .or(prepared.provider_thread_id);
+    let cleanup_draft_id = provider_draft_id.clone();
+    let persisted = persist_remote_draft_identity(
+        ctx,
+        draft_id,
+        provider_message_id,
+        provider_thread_id,
+        provider_draft_id,
+        prepared.message_id,
+    )
+    .await?;
+    if !persisted {
+        // The user deleted the local draft while the provider request was in
+        // flight. Compensate immediately so the completed autosave cannot
+        // resurrect an orphan draft in Gmail.
+        api.delete_draft(&cleanup_draft_id).await?;
+    }
+    Ok(())
+}
+
+async fn persist_remote_draft_identity(
+    ctx: &SyncCtx,
+    draft_id: i64,
+    provider_message_id: String,
+    provider_thread_id: Option<String>,
+    provider_draft_id: String,
+    message_id: String,
+) -> Result<bool> {
+    let (thread_id, persisted) = ctx
+        .db
+        .write(move |conn| {
+            let tx = conn.transaction()?;
+            let updated = tx.execute(
+                "UPDATE messages SET gm_msgid = ?2, gm_thrid = ?3,
+                        gmail_draft_id = ?4, message_id = ?5
+                 WHERE id = ?1",
+                params![
+                    draft_id,
+                    provider_message_id,
+                    provider_thread_id,
+                    provider_draft_id,
+                    message_id.trim_matches(['<', '>']),
+                ],
+            )?;
+            if updated == 0 {
+                tx.commit()?;
+                return Ok((None, false));
+            }
+            if let Some(provider_thread_id) = provider_thread_id.as_deref()
+                && let Some(local_thread_id) =
+                    repo::messages::get_row(&tx, draft_id)?.and_then(|row| row.thread_id)
+            {
+                tx.execute(
+                    "UPDATE threads SET gm_thrid = COALESCE(gm_thrid, ?2)
+                         WHERE id = ?1",
+                    params![local_thread_id, provider_thread_id],
+                )?;
+            }
+            let thread_id = repo::messages::get_row(&tx, draft_id)?.and_then(|row| row.thread_id);
+            tx.commit()?;
+            Ok((thread_id, true))
+        })
+        .await?;
+    if let Some(thread_id) = thread_id {
+        ctx.bus.emit(CoreEvent::MailUpdated {
+            thread_ids: vec![thread_id],
+        });
+    }
+    Ok(persisted)
+}
+
+async fn send_remote_draft(
+    ctx: &SyncCtx,
+    config: &AccountConfig,
+    api: &GmailApi,
+    draft_id: i64,
+) -> Result<()> {
+    let prepared = prepare_draft(ctx, config, api, draft_id).await?;
+    if let Some(sent) = api.find_sent_by_message_id(&prepared.message_id).await? {
+        return finalize_sent_draft(ctx, config, draft_id, sent, &prepared.message_id).await;
+    }
+
+    // Always update/create the Gmail draft immediately before sending so a
+    // delayed-send action dispatches exactly the local snapshot visible to the
+    // user, even if an earlier background draft-save was interrupted.
+    let draft = match api
+        .upsert_draft(
+            prepared.provider_draft_id.as_deref(),
+            &prepared.raw,
+            prepared.provider_thread_id.as_deref(),
+        )
+        .await
+    {
+        Ok(draft) => draft,
+        Err(CoreError::NotFound(_)) if prepared.provider_draft_id.is_some() => {
+            // drafts.send removes the draft resource. A missing id on retry is
+            // therefore ambiguous: reconcile by Message-ID and wait for Gmail's
+            // search index rather than creating a second outgoing message.
+            if let Some(sent) = api.find_sent_by_message_id(&prepared.message_id).await? {
+                return finalize_sent_draft(ctx, config, draft_id, sent, &prepared.message_id)
+                    .await;
+            }
+            return Err(CoreError::Network(
+                "Gmail draft disappeared; waiting to reconcile the send".into(),
+            ));
+        }
+        Err(error) => return Err(error),
+    };
+    let provider_draft_id = required_string(&draft, "id")?.to_owned();
+    let provider_message_id = draft
+        .pointer("/message/id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| CoreError::Other("Gmail draft omitted message id".into()))?
+        .to_owned();
+    let provider_thread_id = draft
+        .pointer("/message/threadId")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .or(prepared.provider_thread_id.clone());
+    let persisted = persist_remote_draft_identity(
+        ctx,
+        draft_id,
+        provider_message_id,
+        provider_thread_id,
+        provider_draft_id.clone(),
+        prepared.message_id.clone(),
+    )
+    .await?;
+    if !persisted {
+        api.delete_draft(&provider_draft_id).await?;
+        return Err(CoreError::NotFound("local Gmail draft was deleted".into()));
+    }
+
+    let sent = match api.send_draft(&provider_draft_id).await {
+        Ok(sent) => sent,
+        Err(error) => {
+            let ambiguous = matches!(
+                &error,
+                CoreError::Offline
+                    | CoreError::Network(_)
+                    | CoreError::ResponseTooLarge { .. }
+                    | CoreError::NotFound(_)
+            );
+            if ambiguous {
+                if let Some(sent) = api.find_sent_by_message_id(&prepared.message_id).await? {
+                    sent
+                } else {
+                    return Err(error);
+                }
+            } else {
+                return Err(error);
+            }
+        }
+    };
+    finalize_sent_draft(ctx, config, draft_id, sent, &prepared.message_id).await
+}
+
+/// Send a draft another of the user's devices scheduled, as Gmail keeps it:
+/// this device may hold neither its whole body nor its attachments.
+async fn send_draft_as_is(
+    ctx: &SyncCtx,
+    config: &AccountConfig,
+    api: &GmailApi,
+    draft_id: i64,
+) -> Result<()> {
+    let (provider_draft_id, message_id) = ctx
+        .db
+        .read(move |conn| {
+            Ok(conn
+                .query_row(
+                    "SELECT gmail_draft_id, message_id FROM messages WHERE id = ?1 AND is_draft = 1",
+                    params![draft_id],
+                    |row| {
+                        Ok((
+                            row.get::<_, Option<String>>(0)?,
+                            row.get::<_, Option<String>>(1)?,
+                        ))
+                    },
+                )
+                .optional()?)
+        })
+        .await?
+        .ok_or_else(|| CoreError::NotFound(format!("draft {draft_id}")))?;
+    let message_id = message_id
+        .filter(|id| !id.trim().is_empty())
+        .ok_or_else(|| CoreError::NotFound("the draft's Message-ID".into()))?;
+    if let Some(sent) = api.find_sent_by_message_id(&message_id).await? {
+        return finalize_sent_draft(ctx, config, draft_id, sent, &message_id).await;
+    }
+    let provider_draft_id =
+        provider_draft_id.ok_or_else(|| CoreError::NotFound("Gmail draft".into()))?;
+    let sent = match api.send_draft(&provider_draft_id).await {
+        Ok(sent) => sent,
+        Err(error) => {
+            let ambiguous = matches!(
+                &error,
+                CoreError::Offline
+                    | CoreError::Network(_)
+                    | CoreError::ResponseTooLarge { .. }
+                    | CoreError::NotFound(_)
+            );
+            if !ambiguous {
+                return Err(error);
+            }
+            match api.find_sent_by_message_id(&message_id).await? {
+                Some(sent) => sent,
+                None => return Err(error),
+            }
+        }
+    };
+    finalize_sent_draft(ctx, config, draft_id, sent, &message_id).await
+}
+
+async fn finalize_sent_draft(
+    ctx: &SyncCtx,
+    config: &AccountConfig,
+    draft_id: i64,
+    sent: Value,
+    message_id: &str,
+) -> Result<()> {
+    let provider_message_id = required_string(&sent, "id")?.to_owned();
+    let provider_thread_id = sent
+        .get("threadId")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let account_id = config.id;
+    let message_id = message_id.trim_matches(['<', '>']).to_owned();
+    let sent_at = now_ms();
+    let (thread_id, staged_paths) = ctx
+        .db
+        .write(move |conn| {
+            let tx = conn.transaction()?;
+            let sent_folder = match repo::folders::by_role(&tx, account_id, roles::SENT)? {
+                Some(folder) => folder.id,
+                None => {
+                    repo::folders::upsert(&tx, account_id, "SENT", Some("/"), Some(roles::SENT))?
+                }
+            };
+            let all_folder = match repo::folders::by_role(&tx, account_id, roles::ALL)? {
+                Some(folder) => folder.id,
+                None => repo::folders::upsert(
+                    &tx,
+                    account_id,
+                    "[Gmail]/All Mail",
+                    Some("/"),
+                    Some(roles::ALL),
+                )?,
+            };
+            tx.execute(
+                "UPDATE messages SET
+                     is_draft = 0, is_outgoing = 1, is_read = 1,
+                     folder_id = ?2, uid = NULL, gm_msgid = ?3,
+                     gm_thrid = COALESCE(?4, gm_thrid),
+                     gmail_draft_id = NULL, message_id = ?5, date = ?6
+                 WHERE id = ?1",
+                params![
+                    draft_id,
+                    sent_folder,
+                    provider_message_id,
+                    provider_thread_id,
+                    message_id,
+                    sent_at,
+                ],
+            )?;
+            repo::gmail::set_message_folders(&tx, draft_id, &[sent_folder, all_folder])?;
+            tx.execute(
+                "DELETE FROM drafts_meta WHERE message_id = ?1",
+                params![draft_id],
+            )?;
+            let staged_paths = repo::messages::take_draft_attachment_paths(&tx, draft_id)?;
+            let thread_id = repo::messages::get_row(&tx, draft_id)?.and_then(|row| row.thread_id);
+            if let Some(thread_id) = thread_id {
+                if let Some(provider_thread_id) = provider_thread_id.as_deref() {
+                    tx.execute(
+                        "UPDATE threads SET gm_thrid = COALESCE(gm_thrid, ?2)
+                         WHERE id = ?1",
+                        params![thread_id, provider_thread_id],
+                    )?;
+                }
+                repo::threads::recompute(&tx, thread_id)?;
+            }
+            repo::search::index_message(&tx, draft_id)?;
+            repo::contacts::record_sent_recipients(&tx, account_id, draft_id, sent_at)?;
+            tx.commit()?;
+            Ok((thread_id, staged_paths))
+        })
+        .await?;
+    for path in staged_paths {
+        crate::remove_staged_attachment(&ctx.paths.draft_attachments_dir(), &path).await;
+    }
+    if let Some(thread_id) = thread_id {
+        ctx.bus.emit(CoreEvent::MailUpdated {
+            thread_ids: vec![thread_id],
+        });
+    }
+    Ok(())
+}
+
+async fn provider_label_for_action(
+    ctx: &SyncCtx,
+    config: &AccountConfig,
+    local_label_id: i64,
+) -> Result<String> {
+    let account_id = config.id;
+    if let Some(provider_id) = ctx
+        .db
+        .read(move |conn| repo::gmail::provider_label_for_local(conn, account_id, local_label_id))
+        .await?
+    {
+        return Ok(provider_id);
+    }
+    let label = ctx
+        .db
+        .read(move |conn| repo::labels::get(conn, local_label_id))
+        .await?
+        .ok_or_else(|| CoreError::NotFound(format!("label {local_label_id}")))?;
+    if label.is_auto {
+        return Err(CoreError::Other(
+            "local auto-categories cannot be pushed to Gmail".into(),
+        ));
+    }
+    if label.owner_account_id != Some(account_id) {
+        return Err(CoreError::Other(format!(
+            "label '{}' belongs to another account",
+            label.name
+        )));
+    }
+    Err(CoreError::Other(format!(
+        "label '{}' is not linked to this Gmail account",
+        label.name
+    )))
+}
+
+async fn apply_action(
+    ctx: &SyncCtx,
+    config: &AccountConfig,
+    api: &GmailApi,
+    action: &repo::actions::PendingAction,
+) -> Result<()> {
+    match action.kind.as_str() {
+        "empty_trash" => {
+            let snapshot_ids = super::snapshot_trash_ids(ctx, config.id).await?;
+            api.empty_trash().await?;
+            return super::finish_empty_trash(ctx, config.id, snapshot_ids).await;
+        }
+        "mark_folder_read" => {
+            let Some(label) = action.payload["labelId"].as_str() else {
+                return Ok(());
+            };
+            let before = action.payload["before"].as_i64().unwrap_or_else(now_ms);
+            return api.mark_label_read(label, before / 1000).await;
+        }
+        "delete_permanently" => {
+            let Some(message_id) = action.message_id else {
+                return Ok(());
+            };
+            if super::is_local_only_draft(ctx, message_id).await? {
+                return super::finish_permanent_delete(ctx, Some(message_id)).await;
+            }
+            let provider_ids: Option<(Option<String>, Option<String>)> = ctx
+                .db
+                .read(move |conn| {
+                    Ok(conn
+                        .query_row(
+                            "SELECT gm_msgid, gmail_draft_id FROM messages WHERE id = ?1",
+                            params![message_id],
+                            |row| Ok((row.get(0)?, row.get(1)?)),
+                        )
+                        .optional()?)
+                })
+                .await?;
+            let Some((provider_id, draft_id)) = provider_ids else {
+                return Ok(());
+            };
+            if let Some(provider_id) = provider_id {
+                api.delete_message_permanently(&provider_id).await?;
+            } else if let Some(draft_id) = draft_id {
+                api.delete_draft(&draft_id).await?;
+            } else {
+                return Err(CoreError::Other(
+                    "message is waiting for its Gmail remote id".into(),
+                ));
+            }
+            return super::finish_permanent_delete(ctx, action.message_id).await;
+        }
+        "snooze" | "unsnooze" | "show_in" => return Ok(()),
+        // Gmail keeps no mark for an answered request; this device recorded
+        // it. Gmail files what it sends in Sent, as it does every message.
+        "read_receipt" => {
+            let (Some(message_id), true) = (
+                action.message_id,
+                action.payload["send"].as_bool() == Some(true),
+            ) else {
+                return Ok(());
+            };
+            let user_agreed = action.payload["userAgreed"].as_bool().unwrap_or(false);
+            if let Some(receipt) =
+                crate::read_receipts::prepare(ctx, config.id, message_id, user_agreed).await?
+            {
+                api.send_raw(&receipt.raw, receipt.gm_thread.as_deref())
+                    .await?;
+            }
+            return Ok(());
+        }
+        "save_draft" => {
+            let draft_id = action.payload["draftId"]
+                .as_i64()
+                .or(action.message_id)
+                .ok_or_else(|| CoreError::Other("draft save omitted draftId".into()))?;
+            return save_remote_draft(ctx, config, api, draft_id).await;
+        }
+        "delete_draft" => {
+            if let Some(draft_id) = action.payload["gmailDraftId"].as_str() {
+                return api.delete_draft(draft_id).await;
+            }
+            if let Some(message_id) = action.payload["gmailMessageId"].as_str() {
+                return api.trash_message(message_id).await;
+            }
+            return Ok(());
+        }
+        "send" => {
+            let draft_id = action.payload["draftId"]
+                .as_i64()
+                .ok_or_else(|| CoreError::Other("send omitted draftId".into()))?;
+            if action.payload["asIs"].as_bool() == Some(true) {
+                return send_draft_as_is(ctx, config, api, draft_id).await;
+            }
+            return send_remote_draft(ctx, config, api, draft_id).await;
+        }
+        "gmail_label_create" => {
+            let local_label_id = action.payload["labelId"]
+                .as_i64()
+                .ok_or_else(|| CoreError::Other("label creation omitted labelId".into()))?;
+            let Some(label) = ctx
+                .db
+                .read(move |conn| repo::labels::get(conn, local_label_id))
+                .await?
+            else {
+                // A claimed create can race with an immediate user deletion.
+                // No remote request was made, so the desired final state is
+                // already satisfied and the action can complete normally.
+                return Ok(());
+            };
+            if label.owner_account_id != Some(config.id) || label.is_auto {
+                return Err(CoreError::Other(
+                    "only an account-owned label can be created in Gmail".into(),
+                ));
+            }
+            let remote = api.create_label(&label.name, Some(&label.color)).await?;
+            let account_id = config.id;
+            let remote_for_store = remote.clone();
+            let latest = ctx
+                .db
+                .write(move |conn| {
+                    let Some(latest) = repo::labels::get(conn, local_label_id)? else {
+                        return Ok(None);
+                    };
+                    if latest.owner_account_id != Some(account_id) || latest.is_auto {
+                        return Ok(None);
+                    }
+                    let folder_id = repo::folders::upsert(
+                        conn,
+                        account_id,
+                        &remote_for_store.name,
+                        Some("/"),
+                        None,
+                    )?;
+                    conn.execute(
+                        "INSERT INTO gmail_labels (
+                           account_id, provider_id, name, kind, folder_id,
+                           local_label_id, background_color, text_color
+                         ) VALUES (?1, ?2, ?3, 'user', ?4, ?5, ?6, ?7)
+                         ON CONFLICT(account_id, provider_id) DO UPDATE SET
+                           name = excluded.name,
+                           folder_id = excluded.folder_id,
+                           local_label_id = excluded.local_label_id,
+                           background_color = excluded.background_color,
+                           text_color = excluded.text_color",
+                        params![
+                            account_id,
+                            remote_for_store.id,
+                            remote_for_store.name,
+                            folder_id,
+                            local_label_id,
+                            remote_for_store.background_color,
+                            remote_for_store.text_color,
+                        ],
+                    )?;
+                    conn.execute(
+                        "UPDATE labels SET origin = 'provider' WHERE id = ?1",
+                        params![local_label_id],
+                    )?;
+                    Ok(Some(latest))
+                })
+                .await?;
+            let Some(latest) = latest else {
+                // The user deleted the local label while its CREATE request
+                // was in flight. Compensate immediately so no orphan is left
+                // behind in the Gmail account.
+                api.delete_label(&remote.id).await?;
+                return Ok(());
+            };
+            if latest.name != remote.name || latest.color != label.color {
+                api.update_label(&remote.id, &latest.name, Some(&latest.color))
+                    .await?;
+                let provider_id = remote.id;
+                let latest_name = latest.name;
+                let background = gmail_palette_color(&latest.color).map(str::to_owned);
+                let text = background
+                    .as_deref()
+                    .map(contrasting_text)
+                    .map(str::to_owned);
+                ctx.db
+                    .write(move |conn| {
+                        conn.execute(
+                            "UPDATE gmail_labels
+                             SET name=?3, background_color=?4, text_color=?5
+                             WHERE account_id=?1 AND provider_id=?2",
+                            params![account_id, provider_id, latest_name, background, text],
+                        )?;
+                        conn.execute(
+                            "UPDATE folders SET path=?3
+                             WHERE account_id=?1 AND id=(
+                               SELECT folder_id FROM gmail_labels
+                               WHERE account_id=?1 AND provider_id=?2
+                             )",
+                            params![account_id, provider_id, latest_name],
+                        )?;
+                        Ok(())
+                    })
+                    .await?;
+            }
+            return Ok(());
+        }
+        "gmail_label_update" => {
+            let provider_id = action.payload["providerId"]
+                .as_str()
+                .ok_or_else(|| CoreError::Other("label update omitted providerId".into()))?;
+            let name = action.payload["name"]
+                .as_str()
+                .ok_or_else(|| CoreError::Other("label update omitted name".into()))?;
+            let color = action.payload["color"].as_str();
+            api.update_label(provider_id, name, color).await?;
+            let account_id = config.id;
+            let provider_id = provider_id.to_owned();
+            let name = name.to_owned();
+            ctx.db
+                .write(move |conn| {
+                    conn.execute(
+                        "UPDATE gmail_labels SET name = ?3
+                         WHERE account_id = ?1 AND provider_id = ?2",
+                        params![account_id, provider_id, name],
+                    )?;
+                    conn.execute(
+                        "UPDATE folders SET path = ?3
+                         WHERE account_id = ?1 AND id = (
+                           SELECT folder_id FROM gmail_labels
+                           WHERE account_id = ?1 AND provider_id = ?2
+                         )",
+                        params![account_id, provider_id, name],
+                    )?;
+                    Ok(())
+                })
+                .await?;
+            return Ok(());
+        }
+        "gmail_label_delete" => {
+            let provider_id = action.payload["providerId"]
+                .as_str()
+                .ok_or_else(|| CoreError::Other("label delete omitted providerId".into()))?;
+            api.delete_label(provider_id).await?;
+            let account_id = config.id;
+            let provider_id = provider_id.to_owned();
+            ctx.db
+                .write(move |conn| {
+                    let tx = conn.transaction()?;
+                    let folder_id: Option<i64> = tx
+                        .query_row(
+                            "SELECT folder_id FROM gmail_labels
+                             WHERE account_id = ?1 AND provider_id = ?2",
+                            params![account_id, provider_id],
+                            |row| row.get(0),
+                        )
+                        .optional()?
+                        .flatten();
+                    if let Some(folder_id) = folder_id {
+                        let fallback = repo::folders::by_role(&tx, account_id, roles::ALL)?
+                            .or(repo::folders::by_role(&tx, account_id, roles::ARCHIVE)?)
+                            .map(|folder| folder.id);
+                        if let Some(fallback) = fallback {
+                            tx.execute(
+                                "UPDATE messages SET folder_id = ?2 WHERE folder_id = ?1",
+                                params![folder_id, fallback],
+                            )?;
+                        }
+                    }
+                    tx.execute(
+                        "DELETE FROM gmail_labels WHERE account_id = ?1 AND provider_id = ?2",
+                        params![account_id, provider_id],
+                    )?;
+                    if let Some(folder_id) = folder_id {
+                        tx.execute("DELETE FROM folders WHERE id = ?1", params![folder_id])?;
+                    }
+                    tx.commit()?;
+                    Ok(())
+                })
+                .await?;
+            return Ok(());
+        }
+        _ => {}
+    }
+
+    let Some(local_message_id) = action.message_id else {
+        return Ok(());
+    };
+    let account_id = config.id;
+    let provider_target: Option<(Option<String>, Option<String>, bool)> = ctx
+        .db
+        .read(move |conn| {
+            Ok(conn
+                .query_row(
+                    "SELECT m.gm_msgid, t.gm_thrid, m.is_draft
+                     FROM messages m LEFT JOIN threads t ON t.id = m.thread_id
+                     WHERE m.id = ?1 AND m.account_id = ?2",
+                    params![local_message_id, account_id],
+                    |row| {
+                        Ok((
+                            row.get::<_, Option<String>>(0)?,
+                            row.get::<_, Option<String>>(1)?,
+                            row.get::<_, i64>(2)? != 0,
+                        ))
+                    },
+                )
+                .optional()?)
+        })
+        .await?;
+    let Some((Some(provider_message_id), provider_thread_id, is_draft)) = provider_target else {
+        // A local draft-save action earlier in the ordered queue will assign
+        // its id. Other local-only messages have no remote intent to replay.
+        return Ok(());
+    };
+    let provider_thread_id = conversation_scope(provider_thread_id, &action.payload);
+
+    let mut add = Vec::<String>::new();
+    let mut remove = Vec::<String>::new();
+    match action.kind.as_str() {
+        "mark_read" => remove.push("UNREAD".into()),
+        "mark_unread" => add.push("UNREAD".into()),
+        "star" => add.push("STARRED".into()),
+        "unstar" => remove.push("STARRED".into()),
+        "archive" => remove.push("INBOX".into()),
+        "unarchive" => add.push("INBOX".into()),
+        "trash" => {
+            return match provider_thread_id.as_deref().filter(|_| !is_draft) {
+                Some(thread_id) => api.trash_thread(thread_id).await,
+                None => api.trash_message(&provider_message_id).await,
+            };
+        }
+        "spam" => {
+            add.push("SPAM".into());
+            remove.extend(["INBOX".into(), "TRASH".into()]);
+        }
+        "not_spam" => {
+            add.push("INBOX".into());
+            remove.push("SPAM".into());
+        }
+        "add_label" | "remove_label" => {
+            let local_label_id = action.payload["labelId"]
+                .as_i64()
+                .ok_or_else(|| CoreError::Other("label action omitted labelId".into()))?;
+            let provider_id = provider_label_for_action(ctx, config, local_label_id).await?;
+            if action.kind == "add_label" {
+                add.push(provider_id);
+            } else {
+                remove.push(provider_id);
+            }
+        }
+        "move" => {
+            let target_folder = action.payload["targetFolderId"]
+                .as_i64()
+                .ok_or_else(|| CoreError::Other("move omitted targetFolderId".into()))?;
+            let source_folder = action.payload["srcFolderId"].as_i64();
+            let (target_provider, target_role, source_provider): (
+                Option<String>,
+                Option<String>,
+                Option<String>,
+            ) = ctx
+                .db
+                .read(move |conn| {
+                    let target_role: Option<String> = conn
+                        .query_row(
+                            "SELECT role FROM folders WHERE id = ?1",
+                            params![target_folder],
+                            |row| row.get(0),
+                        )
+                        .optional()?
+                        .flatten();
+                    let target_provider = conn
+                        .query_row(
+                            "SELECT provider_id FROM gmail_labels
+                             WHERE account_id = ?1 AND folder_id = ?2",
+                            params![account_id, target_folder],
+                            |row| row.get(0),
+                        )
+                        .optional()?;
+                    let source_provider = source_folder.and_then(|folder_id| {
+                        conn.query_row(
+                            "SELECT provider_id FROM gmail_labels
+                                 WHERE account_id = ?1 AND folder_id = ?2",
+                            params![account_id, folder_id],
+                            |row| row.get(0),
+                        )
+                        .optional()
+                        .ok()
+                        .flatten()
+                    });
+                    Ok((target_provider, target_role, source_provider))
+                })
+                .await?;
+            match target_role.as_deref() {
+                Some(roles::ARCHIVE) => remove.push("INBOX".into()),
+                Some(roles::INBOX) => add.push("INBOX".into()),
+                Some(roles::TRASH) => {
+                    return match provider_thread_id.as_deref().filter(|_| !is_draft) {
+                        Some(thread_id) => api.trash_thread(thread_id).await,
+                        None => api.trash_message(&provider_message_id).await,
+                    };
+                }
+                Some(roles::SPAM) => {
+                    add.push("SPAM".into());
+                    remove.push("INBOX".into());
+                }
+                _ => {
+                    if let Some(provider_id) = target_provider {
+                        add.push(provider_id);
+                    }
+                    if let Some(provider_id) = source_provider {
+                        remove.push(provider_id);
+                    }
+                }
+            }
+        }
+        other => tracing::warn!(kind = other, "unknown Gmail action"),
+    }
+    if add.is_empty() && remove.is_empty() {
+        return Ok(());
+    }
+    if !is_draft
+        && !matches!(action.kind.as_str(), "star" | "unstar")
+        && let Some(provider_thread_id) = provider_thread_id.as_deref()
+    {
+        api.modify_thread(provider_thread_id, &add, &remove).await
+    } else {
+        api.modify_message(&provider_message_id, &add, &remove)
+            .await
+    }
+}
+
+/// The Gmail conversation an action may change as a whole. An action on one
+/// message, made where mail lists do not group conversations, must not reach
+/// the rest of its conversation, so it changes only its message.
+fn conversation_scope(
+    provider_thread_id: Option<String>,
+    payload: &serde_json::Value,
+) -> Option<String> {
+    provider_thread_id.filter(|_| payload["messageOnly"].as_bool() != Some(true))
+}
+
+async fn execute_actions(ctx: &SyncCtx, config: &AccountConfig, api: &GmailApi) -> Result<bool> {
+    const LIMIT: i64 = 20;
+    const MAX_ATTEMPTS: i64 = 8;
+    let account_id = config.id;
+    let actions = ctx
+        .db
+        .read(move |conn| repo::actions::due(conn, account_id, now_ms(), LIMIT))
+        .await?;
+    for action in actions {
+        let action_id = action.id;
+        if action.kind == "save_draft" {
+            let draft_id = action.payload["draftId"].as_i64().or(action.message_id);
+            let has_newer = ctx
+                .db
+                .read(move |conn| {
+                    Ok(draft_id.is_some_and(|draft_id| {
+                        conn.query_row(
+                            "SELECT EXISTS(
+                                 SELECT 1 FROM pending_actions
+                                 WHERE account_id = ?1 AND kind = 'save_draft'
+                                   AND state = 'pending' AND id > ?2
+                                   AND json_extract(payload, '$.draftId') = ?3
+                             )",
+                            params![account_id, action_id, draft_id],
+                            |row| row.get::<_, bool>(0),
+                        )
+                        .unwrap_or(false)
+                    }))
+                })
+                .await?;
+            if has_newer {
+                ctx.db
+                    .write(move |conn| repo::actions::set_state(conn, action_id, "done", None))
+                    .await?;
+                continue;
+            }
+        }
+        let claimed = ctx
+            .db
+            .write(move |conn| repo::actions::try_claim(conn, action_id))
+            .await?;
+        if !claimed {
+            continue;
+        }
+        match apply_action(ctx, config, api, &action).await {
+            Ok(()) => {
+                ctx.db
+                    .write(move |conn| repo::actions::set_state(conn, action_id, "done", None))
+                    .await?;
+                ctx.bus.emit(CoreEvent::ActionState {
+                    action_id,
+                    state: "done".into(),
+                    error: None,
+                });
+            }
+            Err(error @ (CoreError::NeedsReauth | CoreError::Auth(_))) => {
+                let message = error.to_string();
+                ctx.db
+                    .write(move |conn| {
+                        repo::actions::bump_attempt(conn, action_id, now_ms() + 60_000, &message)
+                    })
+                    .await?;
+                if action.kind == "send" {
+                    ctx.bus.emit(CoreEvent::ActionState {
+                        action_id,
+                        state: "paused".into(),
+                        error: Some(error.to_string()),
+                    });
+                }
+                return Err(CoreError::NeedsReauth);
+            }
+            Err(error @ CoreError::RateLimited { .. }) => {
+                // The pass stops, so the account waits as a whole.
+                crate::queue::defer_limited(ctx, action_id, &error).await?;
+                return Err(error);
+            }
+            Err(error) => {
+                let message = error.to_string();
+                let attempts = action.attempts + 1;
+                let permanent = matches!(error, CoreError::NotFound(_))
+                    || message.contains("400 Bad Request")
+                    || message.contains("invalidArgument");
+                if attempts >= MAX_ATTEMPTS || permanent {
+                    let saved = message.clone();
+                    ctx.db
+                        .write(move |conn| {
+                            repo::actions::set_state(conn, action_id, "failed", Some(&saved))
+                        })
+                        .await?;
+                    ctx.bus.emit(CoreEvent::ActionState {
+                        action_id,
+                        state: "failed".into(),
+                        error: Some(message),
+                    });
+                } else {
+                    let retry_at =
+                        now_ms() + (1_i64 << attempts.min(8)) * 1_000 + action_id.rem_euclid(997);
+                    let saved = message.clone();
+                    ctx.db
+                        .write(move |conn| {
+                            repo::actions::bump_attempt(conn, action_id, retry_at, &saved)
+                        })
+                        .await?;
+                    if matches!(
+                        error,
+                        CoreError::Offline
+                            | CoreError::Network(_)
+                            | CoreError::ResponseTooLarge { .. }
+                    ) {
+                        return Err(error);
+                    }
+                }
+            }
+        }
+    }
+    ctx.db
+        .read(move |conn| repo::actions::has_due(conn, account_id, now_ms()))
+        .await
+}
+
+pub(super) fn spawn(
+    ctx: SyncCtx,
+    config: AccountConfig,
+    rx: mpsc::Receiver<SyncCmd>,
+    body_rx: mpsc::Receiver<PriorityFetchCmd>,
+    settings_rx: watch::Receiver<AccountSettings>,
+) -> Vec<tokio::task::JoinHandle<()>> {
+    let actor_ctx = ctx.clone();
+    let actor_config = config.clone();
+    vec![
+        crate::net::timeouts::spawn(async move {
+            run_actor(actor_ctx, actor_config, rx, settings_rx).await
+        }),
+        crate::net::timeouts::spawn(async move { run_reader(ctx, config, body_rx).await }),
+    ]
+}
+
+async fn run_actor(
+    ctx: SyncCtx,
+    config: AccountConfig,
+    mut rx: mpsc::Receiver<SyncCmd>,
+    mut settings_rx: watch::Receiver<AccountSettings>,
+) {
+    let account_id = config.id;
+    debug_assert_eq!(config.provider, Provider::Gmail);
+    debug_assert_eq!(config.auth_kind, AuthKind::Oauth2);
+    let api = match GmailApi::new(ctx.clone(), config.clone()) {
+        Ok(api) => api,
+        Err(error) => {
+            tracing::error!(account_id, %error, "could not create Gmail provider");
+            set_state_error(&ctx, account_id, "offline", &error.to_string()).await;
+            return;
+        }
+    };
+    let mut waiters = Vec::<oneshot::Sender<std::result::Result<(), String>>>::new();
+    let mut refresh_labels = true;
+    // Waits after failures other than Gmail asking to wait. Those the
+    // account's pace keeps.
+    let mut backoff = pacing::Backoff::default();
+    // Mail that came in before this worker started is caught up on silently.
+    let live_since = crate::sync::ingest::live_since(now_ms());
+
+    // Accounts that start together take turns.
+    if !wait_for_turn(&ctx, account_id, &mut rx, &mut waiters).await {
+        return;
+    }
+
+    loop {
+        // Keep a wait Gmail asked for.
+        match wait_out_pause(&ctx, account_id, &mut rx, &mut waiters).await {
+            PauseEnd::Shutdown => return,
+            PauseEnd::Asked => refresh_labels = true,
+            PauseEnd::Over => {}
+        }
+        while let Ok(command) = rx.try_recv() {
+            match command {
+                SyncCmd::SyncNow { complete } => {
+                    refresh_labels = true;
+                    if let Some(complete) = complete {
+                        waiters.push(complete);
+                    }
+                }
+                SyncCmd::Shutdown => return,
+                SyncCmd::RunActions | SyncCmd::FetchBody { .. } => {}
+            }
+        }
+
+        set_state(&ctx, account_id, "syncing").await;
+        let settings = settings_rx.borrow_and_update().clone();
+        let mail_history = settings.mail_history;
+        let result = async {
+            // Provider definitions must exist before replaying actions. This is
+            // important on a new account where the user can compose before the
+            // first metadata page creates Sent, Drafts and All Mail locally.
+            if refresh_labels {
+                sync_sender_identities(&ctx, &config, &api).await?;
+                sync_labels(&ctx, &config, &api).await?;
+                // Replies set in webmail show too. Reading them never fails a sync.
+                if let Err(error) = sync_auto_reply(&ctx, &config, &api).await {
+                    tracing::warn!(account_id, %error, "Gmail automatic replies failed");
+                }
+            }
+            let mut actions_remaining = execute_actions(&ctx, &config, &api).await?;
+            // New mail's metadata brings the headers rules test.
+            api.set_rule_headers(
+                ctx.db
+                    .read(move |conn| crate::rules::header_names(conn, account_id))
+                    .await?,
+            );
+            let backfill_done =
+                sync_once(&ctx, &config, &api, false, mail_history, live_since).await?;
+            super::engine::settle_waiting_rules(&ctx, account_id).await;
+            // Rules and blocked senders file away mail that just arrived.
+            // Change it on Gmail in this pass, not after the next wait.
+            if !actions_remaining {
+                actions_remaining = execute_actions(&ctx, &config, &api).await?;
+            }
+            // The count only explains the Inbox's end, so it never fails a sync.
+            if let Err(error) = sync_inbox_count(&ctx, account_id, &api).await {
+                tracing::warn!(account_id, %error, "Gmail Inbox count failed");
+            }
+            Ok::<_, CoreError>((actions_remaining, backfill_done))
+        }
+        .await;
+        // Labels and sender identities refresh on the first pass and on each
+        // explicit sync. A pass that could not reach Google, or that Google
+        // asked to wait, leaves that refresh to its retry, so starting
+        // offline does not skip it.
+        if !matches!(
+            result,
+            Err(CoreError::Offline | CoreError::RateLimited { .. })
+        ) {
+            refresh_labels = false;
+        }
+
+        let (delay, rerun) = match result {
+            Ok((actions_remaining, backfill_done)) => {
+                backoff.reset();
+                ctx.pace.account(account_id).reached();
+                set_state(&ctx, account_id, "idle").await;
+                ctx.bus.emit(CoreEvent::NetworkState { online: true });
+                let (done, total) = ctx
+                    .db
+                    .read(move |conn| {
+                        repo::messages::body_progress_since(
+                            conn,
+                            account_id,
+                            mail_history.cutoff_ms_at(now_ms()),
+                        )
+                    })
+                    .await
+                    .unwrap_or((0, 0));
+                ctx.bus.emit(CoreEvent::SyncProgress(SyncProgress {
+                    account_id,
+                    folder: "Gmail".into(),
+                    phase: "idle".into(),
+                    done,
+                    total,
+                }));
+                for waiter in waiters.drain(..) {
+                    let _ = waiter.send(Ok(()));
+                }
+                // Older mail keeps downloading at its own pace; then the
+                // account checks as its settings say, varied a little so
+                // accounts don't check together.
+                let delay = if backfill_done {
+                    check_interval(&ctx.db, &settings).await.map(pacing::varied)
+                } else {
+                    Some(BACKFILL_INTERVAL)
+                };
+                (delay, actions_remaining)
+            }
+            Err(CoreError::NeedsReauth) | Err(CoreError::Auth(_)) => {
+                set_state(&ctx, account_id, "needs_reauth").await;
+                for waiter in waiters.drain(..) {
+                    let _ = waiter.send(Err("authentication required".into()));
+                }
+                // A reauth nudge invalidates the old access-token state and
+                // immediately retries. There is no pointless timed auth loop.
+                match rx.recv().await {
+                    None | Some(SyncCmd::Shutdown) => return,
+                    Some(SyncCmd::SyncNow { complete }) => {
+                        refresh_labels = true;
+                        if let Some(complete) = complete {
+                            waiters.push(complete);
+                        }
+                    }
+                    Some(_) => {}
+                }
+                continue;
+            }
+            Err(error @ CoreError::RateLimited { .. }) => {
+                // The wait at the top answers the checks waiting for this one.
+                tracing::warn!(account_id, %error, "Gmail asked to wait");
+                crate::events::sync_diagnostic("gmail_cycle", Some(account_id), error.code());
+                note_limit(&ctx, account_id, &error);
+                continue;
+            }
+            Err(error) => {
+                tracing::warn!(account_id, %error, "Gmail sync cycle failed");
+                crate::events::sync_diagnostic("gmail_cycle", Some(account_id), error.code());
+                ctx.bus.emit(CoreEvent::NetworkState { online: false });
+                let message = error.to_string();
+                set_state_error(&ctx, account_id, "offline", &message).await;
+                for waiter in waiters.drain(..) {
+                    let _ = waiter.send(Err(message.clone()));
+                }
+                // Never later than the next check would be.
+                let retry = backoff.after(&error).duration;
+                let delay = check_interval(&ctx.db, &settings)
+                    .await
+                    .map_or(retry, |interval| interval.min(retry));
+                (Some(delay), false)
+            }
+        };
+
+        if rerun {
+            continue;
+        }
+        let next = async {
+            match delay {
+                Some(delay) => tokio::time::timeout(delay, rx.recv()).await,
+                // Only when asked.
+                None => Ok(rx.recv().await),
+            }
+        };
+        match next.await {
+            Ok(None) | Ok(Some(SyncCmd::Shutdown)) => return,
+            Ok(Some(SyncCmd::SyncNow { complete })) => {
+                refresh_labels = true;
+                if let Some(complete) = complete {
+                    waiters.push(complete);
+                }
+            }
+            Ok(Some(SyncCmd::RunActions)) | Err(_) => {}
+            Ok(Some(SyncCmd::FetchBody { .. })) => {}
+        }
+    }
+}
+
+async fn run_reader(ctx: SyncCtx, config: AccountConfig, mut rx: mpsc::Receiver<PriorityFetchCmd>) {
+    let account_id = config.id;
+    let api = match GmailApi::new(ctx.clone(), config.clone()) {
+        Ok(api) => api,
+        Err(error) => {
+            tracing::error!(account_id, %error, "could not create Gmail reader");
+            return;
+        }
+    };
+    while let Some(command) = rx.recv().await {
+        match command {
+            PriorityFetchCmd::Attachment {
+                attachment_id,
+                complete,
+            } => {
+                let result = fetch_attachment(&ctx, &api, attachment_id)
+                    .await
+                    .map_err(|error| error.to_string());
+                let _ = complete.send(result);
+            }
+            PriorityFetchCmd::Search {
+                tree,
+                cursor,
+                limit,
+                complete,
+            } => {
+                let result = search_server(
+                    &ctx,
+                    &config,
+                    &api,
+                    (GMAIL_API, GMAIL_BATCH_API),
+                    &tree,
+                    &cursor,
+                    limit,
+                )
+                .await
+                .map_err(|error| error.to_string());
+                let _ = complete.send(result);
+            }
+            PriorityFetchCmd::Body(first_message_id) => {
+                let mut message_ids = vec![first_message_id];
+                tokio::time::sleep(Duration::from_millis(40)).await;
+                let mut deferred = Vec::new();
+                while let Ok(next) = rx.try_recv() {
+                    match next {
+                        PriorityFetchCmd::Body(message_id) => message_ids.push(message_id),
+                        other => deferred.push(other),
+                    }
+                }
+                // Attachment and search responses must never be stranded
+                // behind hydration.
+                for command in deferred {
+                    match command {
+                        PriorityFetchCmd::Attachment {
+                            attachment_id,
+                            complete,
+                        } => {
+                            let result = fetch_attachment(&ctx, &api, attachment_id)
+                                .await
+                                .map_err(|error| error.to_string());
+                            let _ = complete.send(result);
+                        }
+                        PriorityFetchCmd::Search {
+                            tree,
+                            cursor,
+                            limit,
+                            complete,
+                        } => {
+                            let result = search_server(
+                                &ctx,
+                                &config,
+                                &api,
+                                (GMAIL_API, GMAIL_BATCH_API),
+                                &tree,
+                                &cursor,
+                                limit,
+                            )
+                            .await
+                            .map_err(|error| error.to_string());
+                            let _ = complete.send(result);
+                        }
+                        PriorityFetchCmd::Body(_) => {}
+                    }
+                }
+                message_ids.sort_unstable();
+                message_ids.dedup();
+                let thread_ids = ctx
+                    .db
+                    .read(move |conn| {
+                        let mut output = Vec::new();
+                        for message_id in &message_ids {
+                            if let Some(thread_id) = conn
+                                .query_row(
+                                    "SELECT gm_thrid FROM messages WHERE id = ?1",
+                                    params![message_id],
+                                    |row| row.get::<_, Option<String>>(0),
+                                )
+                                .optional()?
+                                .flatten()
+                            {
+                                output.push(thread_id);
+                            }
+                        }
+                        output.sort();
+                        output.dedup();
+                        Ok(output)
+                    })
+                    .await;
+                match thread_ids {
+                    Ok(thread_ids) => {
+                        for thread_id in thread_ids {
+                            if let Err(error) =
+                                hydrate_thread(&ctx, &config, &api, &thread_id).await
+                            {
+                                tracing::warn!(account_id, %thread_id, %error, "Gmail hydration failed");
+                            }
+                        }
+                    }
+                    Err(error) => tracing::warn!(account_id, %error, "Gmail body lookup failed"),
+                }
+            }
+        }
+    }
+}
+
+/// Searches the account's mail on Gmail for `tree` from `cursor`, in its own
+/// search syntax, through the API at `endpoints` (its base and its batch
+/// endpoint): the newest `limit` messages it finds that aren't kept here,
+/// which are fetched as their headers and kept, and the ones kept here
+/// already that it passes. Gmail's pages are taken whole. Bodies come when
+/// opened.
+async fn search_server(
+    ctx: &SyncCtx,
+    config: &AccountConfig,
+    api: &GmailApi,
+    endpoints: (&str, &str),
+    tree: &crate::search::Expr,
+    cursor: &ServerSearchCursor,
+    limit: usize,
+) -> Result<ServerHits> {
+    let (base, batch) = endpoints;
+    let query = crate::search::server::gmail(tree);
+    let account_id = config.id;
+    // Gmail's results a page at a time, until a page of them isn't kept here
+    // or they end.
+    let mut token = cursor.page_token.clone().filter(|token| !token.is_empty());
+    let mut ids = Vec::new();
+    let mut missing = Vec::new();
+    for _ in 0..SERVER_SEARCH_PAGES {
+        let mut url = format!("{base}/messages?maxResults={limit}&q={}", urlencode(&query));
+        if let Some(token) = &token {
+            url.push_str("&pageToken=");
+            url.push_str(&urlencode(token));
+        }
+        let response = api.get_json(&url).await?;
+        let page = response
+            .get("messages")
+            .and_then(Value::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|message| message.get("id").and_then(Value::as_str))
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        token = gmail_page_token(&response)?;
+        let wanted = page.clone();
+        missing.extend(
+            ctx.db
+                .read(move |conn| {
+                    let mut missing = Vec::new();
+                    for id in wanted {
+                        if repo::messages::by_gm_msgid(conn, account_id, &id)?.is_none() {
+                            missing.push(id);
+                        }
+                    }
+                    Ok(missing)
+                })
+                .await?,
+        );
+        ids.extend(page);
+        if token.is_none() || missing.len() >= limit {
+            break;
+        }
+    }
+    let mut resources = Vec::with_capacity(missing.len());
+    for chunk in missing.chunks(BATCH_SIZE) {
+        resources.extend(api.batch_metadata_at(batch, chunk).await?);
+    }
+    if !resources.is_empty() {
+        // Found mail notifies of nothing, isn't new mail for rules, and
+        // leaves the rest of its conversation as it is.
+        let outcome = store_resources(
+            ctx,
+            config,
+            &resources,
+            None,
+            false,
+            false,
+            None,
+            Arrivals::None,
+        )
+        .await?;
+        if !outcome.touched_threads.is_empty() {
+            ctx.bus.emit(CoreEvent::MailUpdated {
+                thread_ids: outcome.touched_threads,
+            });
+        }
+    }
+    let message_ids = ctx
+        .db
+        .read(move |conn| {
+            let mut message_ids = Vec::with_capacity(ids.len());
+            for id in &ids {
+                if let Some(row) = repo::messages::by_gm_msgid(conn, account_id, id)? {
+                    message_ids.push(row.id);
+                }
+            }
+            Ok(message_ids)
+        })
+        .await?;
+    Ok(ServerHits {
+        message_ids,
+        next: token.map(|token| ServerSearchCursor {
+            page_token: Some(token),
+            ..ServerSearchCursor::default()
+        }),
+    })
+}
+
+async fn fetch_attachment(ctx: &SyncCtx, api: &GmailApi, attachment_id: i64) -> Result<Vec<u8>> {
+    let (message_id, provider_attachment_id): (String, Option<String>) = ctx
+        .db
+        .read(move |conn| {
+            conn.query_row(
+                "SELECT m.gm_msgid, a.provider_attachment_id
+                 FROM attachments a JOIN messages m ON m.id = a.message_id
+                 WHERE a.id = ?1",
+                params![attachment_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(Into::into)
+        })
+        .await?;
+    let provider_attachment_id = provider_attachment_id
+        .ok_or_else(|| CoreError::NotFound("Gmail attachment resource".into()))?;
+    api.attachment(&message_id, &provider_attachment_id).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A Gmail account 1 with Inbox, Sent, Spam, Archive and All Mail.
+    pub(super) async fn gmail_account() -> (tempfile::TempDir, SyncCtx, AccountConfig) {
+        let dir = tempfile::tempdir().unwrap();
+        let credentials: crate::accounts::credentials::CredentialStoreHandle = std::sync::Arc::new(
+            crate::accounts::credentials::DevelopmentFileCredentialStore::new(
+                dir.path().join("credentials.json"),
+            ),
+        );
+        let ctx = SyncCtx {
+            db: crate::db::Db::open(&dir.path().join("mail.db")).unwrap(),
+            calendar_db: crate::db::Db::deferred_calendar(dir.path().join("calendar.db")),
+            bus: crate::events::EventBus::new(),
+            paths: std::sync::Arc::new(crate::config::Paths::for_tests(dir.path())),
+            tokens: crate::oauth::tokens::TokenProvider::new(
+                credentials.clone(),
+                std::sync::Arc::new(crate::oauth::redirect::LoopbackRedirectBroker::default()),
+            ),
+            credentials,
+            pace: Default::default(),
+        };
+        let config = ctx
+            .db
+            .write(|conn| {
+                crate::db::testutil::seed_account(conn);
+                conn.execute_batch(
+                    "UPDATE accounts SET mail_protocol = 'gmail', provider = 'gmail' WHERE id = 1;
+                     INSERT INTO folders (id, account_id, path, role) VALUES
+                       (2, 1, '[Gmail]/Spam', 'spam'),
+                       (3, 1, 'Archive', 'archive'),
+                       (4, 1, '[Gmail]/All Mail', 'all'),
+                       (5, 1, '[Gmail]/Sent Mail', 'sent');
+                     INSERT INTO gmail_labels (account_id, provider_id, name, folder_id) VALUES
+                       (1, 'INBOX', 'INBOX', 1),
+                       (1, 'SPAM', 'SPAM', 2),
+                       (1, 'SENT', 'SENT', 5);",
+                )?;
+                Ok(repo::accounts::get_config(conn, 1)?.unwrap())
+            })
+            .await
+            .unwrap();
+        (dir, ctx, config)
+    }
+
+    #[tokio::test]
+    async fn a_blocked_senders_new_mail_goes_to_spam_unannounced() {
+        let (_dir, ctx, config) = gmail_account().await;
+        ctx.db
+            .write(|conn| repo::blocked::block(conn, "ads@shop.test", 0))
+            .await
+            .unwrap();
+        let now = now_ms();
+        let resource = |id: &str, from: &str| {
+            json!({
+                "id": id, "threadId": format!("thread-{id}"),
+                "labelIds": ["INBOX", "UNREAD"], "internalDate": now.to_string(),
+                "sizeEstimate": 100, "snippet": "Hello",
+                "payload": {"headers": [
+                    {"name": "From", "value": from},
+                    {"name": "To", "value": "me@test.dev"},
+                    {"name": "Subject", "value": "Hello"},
+                    {"name": "Message-ID", "value": format!("<{id}@shop.test>")},
+                ]}
+            })
+        };
+        let resources = [
+            resource("sale", "Shop <Ads@Shop.test>"),
+            resource("note", "Friend <friend@test.dev>"),
+        ];
+        store_resources(
+            &ctx,
+            &config,
+            &resources,
+            None,
+            false,
+            true,
+            None,
+            Arrivals::None,
+        )
+        .await
+        .unwrap();
+
+        ctx.db
+            .read(|conn| {
+                let placed = |gm_msgid: &str| -> rusqlite::Result<(i64, Vec<i64>)> {
+                    let (id, folder_id): (i64, i64) = conn.query_row(
+                        "SELECT id, folder_id FROM messages WHERE gm_msgid = ?1",
+                        [gm_msgid],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )?;
+                    let mut stmt = conn.prepare(
+                        "SELECT folder_id FROM message_folders WHERE message_id = ?1
+                         ORDER BY folder_id",
+                    )?;
+                    let labels = stmt
+                        .query_map([id], |row| row.get(0))?
+                        .collect::<rusqlite::Result<Vec<i64>>>()?;
+                    Ok((folder_id, labels))
+                };
+                // It left the inbox for Spam. All Mail keeps it until the
+                // server's labels come back, as after Move to spam.
+                assert_eq!(placed("sale")?, (2, vec![2, 4]));
+                assert_eq!(placed("note")?, (1, vec![1, 4]));
+                let pending: Vec<String> = conn
+                    .prepare("SELECT kind FROM pending_actions")?
+                    .query_map([], |row| row.get(0))?
+                    .collect::<rusqlite::Result<_>>()?;
+                assert_eq!(pending, ["spam"]);
+                let notified: Vec<String> = conn
+                    .prepare(
+                        "SELECT m.gm_msgid FROM notification_outbox o
+                         JOIN messages m ON m.id = o.message_id",
+                    )?
+                    .query_map([], |row| row.get(0))?
+                    .collect::<rusqlite::Result<_>>()?;
+                assert_eq!(notified, ["note"]);
+                Ok(())
+            })
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn rules_sort_only_the_mail_the_history_added() {
+        use crate::models::{MailRule, RuleAction, RuleCondition, RuleField, RuleOp};
+        let (_dir, ctx, config) = gmail_account().await;
+        ctx.db
+            .write(|conn| {
+                repo::rules::save(
+                    conn,
+                    &MailRule {
+                        id: 0,
+                        account_id: None,
+                        name: "Shop".into(),
+                        enabled: true,
+                        match_all: true,
+                        conditions: vec![RuleCondition {
+                            field: RuleField::From,
+                            header: String::new(),
+                            op: RuleOp::EndsWith,
+                            value: "@shop.test".into(),
+                            negate: false,
+                        }],
+                        actions: vec![RuleAction::MarkRead, RuleAction::Archive],
+                        stop: false,
+                    },
+                    0,
+                )
+            })
+            .await
+            .unwrap();
+        let now = now_ms();
+        let resource = |id: &str| {
+            json!({
+                "id": id, "threadId": format!("thread-{id}"),
+                "labelIds": ["INBOX", "UNREAD"], "internalDate": now.to_string(),
+                "sizeEstimate": 100, "snippet": "Hello",
+                "payload": {"headers": [
+                    {"name": "From", "value": "Shop <ads@shop.test>"},
+                    {"name": "Subject", "value": "Sale"},
+                    {"name": "Message-ID", "value": format!("<{id}@shop.test>")},
+                ]}
+            })
+        };
+        // An older message of a conversation the history touched isn't new.
+        let resources = [resource("new"), resource("older")];
+        store_resources(
+            &ctx,
+            &config,
+            &resources,
+            None,
+            true,
+            true,
+            None,
+            Arrivals::Added(["new".to_owned()].into()),
+        )
+        .await
+        .unwrap();
+        ctx.db
+            .read(|conn| {
+                let state = |gm_msgid: &str| -> rusqlite::Result<(i64, bool)> {
+                    conn.query_row(
+                        "SELECT folder_id, is_read FROM messages WHERE gm_msgid = ?1",
+                        [gm_msgid],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                };
+                assert_eq!(state("new")?, (3, true));
+                assert_eq!(state("older")?, (1, false));
+                let pending: Vec<String> = conn
+                    .prepare("SELECT kind FROM pending_actions ORDER BY id")?
+                    .query_map([], |row| row.get(0))?
+                    .collect::<rusqlite::Result<_>>()?;
+                assert_eq!(pending, ["mark_read", "archive"]);
+                let notified: Vec<String> = conn
+                    .prepare(
+                        "SELECT m.gm_msgid FROM notification_outbox o
+                         JOIN messages m ON m.id = o.message_id",
+                    )?
+                    .query_map([], |row| row.get(0))?
+                    .collect::<rusqlite::Result<_>>()?;
+                assert_eq!(notified, ["older"]);
+                Ok(())
+            })
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn rules_on_the_body_wait_for_the_whole_message() {
+        use crate::models::{MailRule, RuleAction, RuleCondition, RuleField, RuleOp};
+        let (_dir, ctx, config) = gmail_account().await;
+        ctx.db
+            .write(|conn| {
+                repo::rules::save(
+                    conn,
+                    &MailRule {
+                        id: 0,
+                        account_id: None,
+                        name: "Lists".into(),
+                        enabled: true,
+                        match_all: true,
+                        conditions: vec![RuleCondition {
+                            field: RuleField::Body,
+                            header: String::new(),
+                            op: RuleOp::Contains,
+                            value: "unsubscribe".into(),
+                            negate: false,
+                        }],
+                        actions: vec![RuleAction::Archive],
+                        stop: false,
+                    },
+                    0,
+                )
+            })
+            .await
+            .unwrap();
+        let now = now_ms();
+        let resource = |id: &str| {
+            json!({
+                "id": id, "threadId": format!("thread-{id}"),
+                "labelIds": ["INBOX", "UNREAD"], "internalDate": now.to_string(),
+                "sizeEstimate": 100, "snippet": "Hello",
+                "payload": {"headers": [
+                    {"name": "From", "value": "Shop <ads@shop.test>"},
+                    {"name": "Subject", "value": "News"},
+                    {"name": "Message-ID", "value": format!("<{id}@shop.test>")},
+                ]}
+            })
+        };
+        let outcome = store_resources(
+            &ctx,
+            &config,
+            &[resource("list"), resource("note")],
+            None,
+            true,
+            true,
+            None,
+            Arrivals::Added(["list".to_owned(), "note".to_owned()].into()),
+        )
+        .await
+        .unwrap();
+        // Both wait for their bodies, and nothing notifies yet.
+        assert_eq!(outcome.waiting, ["list", "note"]);
+        assert!(outcome.fresh_threads.is_empty());
+        for (id, text) in [("list", "Unsubscribe here"), ("note", "Hello")] {
+            let body = HydratedBody {
+                text: Some(text.into()),
+                ..HydratedBody::default()
+            };
+            store_hydrated_body(&ctx, &config, id.into(), body)
+                .await
+                .unwrap();
+        }
+        ctx.db
+            .read(|conn| {
+                let folder = |gm_msgid: &str| -> rusqlite::Result<i64> {
+                    conn.query_row(
+                        "SELECT folder_id FROM messages WHERE gm_msgid = ?1",
+                        [gm_msgid],
+                        |row| row.get(0),
+                    )
+                };
+                assert_eq!(folder("list")?, 3);
+                assert_eq!(folder("note")?, 1);
+                let notified: Vec<String> = conn
+                    .prepare(
+                        "SELECT m.gm_msgid FROM notification_outbox o
+                         JOIN messages m ON m.id = o.message_id",
+                    )?
+                    .query_map([], |row| row.get(0))?
+                    .collect::<rusqlite::Result<_>>()?;
+                assert_eq!(notified, ["note"]);
+                Ok(())
+            })
+            .await
+            .unwrap();
+    }
+
+    #[test]
+    fn gmail_asking_to_slow_down_names_its_wait() {
+        // Gmail's own words, with the time it names.
+        let at = chrono::Utc::now() + chrono::Duration::seconds(90);
+        let message = format!(
+            "User-rate limit exceeded.  Retry after {}",
+            at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+        );
+        match google_limit(StatusCode::TOO_MANY_REQUESTS, "", &message, None) {
+            Some(CoreError::RateLimited {
+                service,
+                kind: LimitKind::Requests,
+                retry_after: Some(wait),
+                detail,
+            }) => {
+                assert_eq!(service, "Gmail");
+                assert!((88..=90).contains(&wait.as_secs()), "{wait:?}");
+                assert_eq!(detail, message);
+            }
+            other => panic!("{other:?}"),
+        }
+        // A Retry-After field wins over the message.
+        assert!(matches!(
+            google_limit(
+                StatusCode::TOO_MANY_REQUESTS,
+                "",
+                &message,
+                Some(Duration::from_secs(5))
+            ),
+            Some(CoreError::RateLimited {
+                retry_after: Some(wait),
+                ..
+            }) if wait == Duration::from_secs(5)
+        ));
+        assert!(matches!(
+            google_limit(
+                StatusCode::TOO_MANY_REQUESTS,
+                "rateLimitExceeded",
+                "Too many concurrent requests for user",
+                None
+            ),
+            Some(CoreError::RateLimited {
+                kind: LimitKind::Connections,
+                retry_after: None,
+                ..
+            })
+        ));
+        // Quota reasons come with 403 too.
+        assert!(
+            google_limit(
+                StatusCode::FORBIDDEN,
+                "userRateLimitExceeded",
+                "User Rate Limit Exceeded",
+                None
+            )
+            .is_some()
+        );
+        // A backend error is a server error, and a forbidden one is not a limit.
+        assert!(
+            google_limit(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "backendError",
+                "Backend Error",
+                None
+            )
+            .is_none()
+        );
+        assert!(google_limit(StatusCode::FORBIDDEN, "forbidden", "Forbidden", None).is_none());
+        // A time that passed is no wait, and nonsense none.
+        assert_eq!(
+            retry_after_in_message("Retry after 2020-01-01T00:00:00Z."),
+            Some(Duration::ZERO)
+        );
+        assert_eq!(retry_after_in_message("Retry after a while"), None);
+        assert_eq!(retry_after_in_message("User-rate limit exceeded"), None);
+    }
+
+    #[test]
+    fn single_message_actions_leave_the_rest_of_the_conversation() {
+        let thread = || Some("thread-1".to_owned());
+        assert_eq!(
+            conversation_scope(thread(), &json!({})).as_deref(),
+            Some("thread-1")
+        );
+        assert_eq!(
+            conversation_scope(thread(), &json!({ "messageOnly": true })),
+            None
+        );
+        assert_eq!(
+            conversation_scope(thread(), &json!({ "messageOnly": false })).as_deref(),
+            Some("thread-1")
+        );
+    }
+
+    #[test]
+    fn history_deduplicates_threads_and_advances_only_on_final_page() {
+        let first = json!({
+            "historyId": "200",
+            "nextPageToken": "next",
+            "history": [
+                { "messagesAdded": [{ "message": { "id": "m1", "threadId": "a" } }] },
+                { "labelsRemoved": [
+                    { "message": { "id": "m0", "threadId": "a" } },
+                    { "message": { "id": "m2", "threadId": "b" } }
+                ] }
+            ]
+        });
+        let page = parse_history_page(&first, "100").unwrap();
+        assert_eq!(
+            page.affected_threads.into_iter().collect::<Vec<_>>(),
+            vec!["a", "b"]
+        );
+        // Only an added message is new mail.
+        assert_eq!(
+            page.added_messages.into_iter().collect::<Vec<_>>(),
+            vec!["m1"]
+        );
+        assert_eq!(page.next_page_token.as_deref(), Some("next"));
+        assert!(page.completed_history_id.is_none());
+
+        let final_page = parse_history_page(&json!({ "historyId": "200" }), "100").unwrap();
+        assert_eq!(final_page.completed_history_id.as_deref(), Some("200"));
+    }
+
+    #[test]
+    fn metadata_batch_is_bounded_and_uses_requested_headers() {
+        let headers = METADATA_HEADERS
+            .iter()
+            .map(|header| (*header).to_owned())
+            .collect::<Vec<_>>();
+        let body = build_batch_body(&["a/b".into(), "two".into()], "boundary", &headers);
+        assert!(body.contains("messages/a%2Fb?format=metadata"));
+        assert!(body.contains("metadataHeaders=List-Unsubscribe-Post"));
+        assert!(body.contains("Content-ID: <flectar-1>"));
+        assert!(body.ends_with("--boundary--\r\n"));
+    }
+
+    #[test]
+    fn bounded_message_list_keeps_query_stable_across_pages() {
+        let cutoff = chrono::NaiveDate::from_ymd_opt(2026, 2, 28).unwrap();
+        let first = messages_list_url(None, Some(cutoff));
+        let next = messages_list_url(Some("opaque/page"), Some(cutoff));
+        let expected = cutoff
+            .and_hms_opt(0, 0, 0)
+            .unwrap()
+            .and_utc()
+            .timestamp()
+            .saturating_sub(1);
+        assert!(first.contains(&format!("q=after%3A{expected}")));
+        assert!(next.contains(&format!("q=after%3A{expected}")));
+        assert!(next.contains("pageToken=opaque%2Fpage"));
+        assert!(!messages_list_url(None, None).contains("&q="));
+    }
+
+    #[test]
+    fn per_user_request_fanout_leaves_concurrency_headroom() {
+        // The independent interactive reader can contribute one request while
+        // the actor is synchronizing. Keep both actor paths conservative so
+        // the account remains below Gmail's shared per-user limit.
+        const {
+            assert!(BATCH_SIZE < 11);
+            assert!(HISTORY_FETCH_CONCURRENCY < 3);
+        }
+    }
+
+    #[test]
+    fn batch_parser_accepts_a_raced_remote_deletion() {
+        let body = concat!(
+            "--response\r\nContent-Type: application/http\r\n\r\n",
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n",
+            "{\"id\":\"one\",\"threadId\":\"thread\"}\r\n",
+            "--response\r\nContent-Type: application/http\r\n\r\n",
+            "HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\n\r\n",
+            "{\"error\":{\"message\":\"gone\"}}\r\n",
+            "--response--\r\n"
+        );
+        let resources = parse_batch_response(body, "response", 2).unwrap();
+        assert_eq!(resources.len(), 1);
+        assert_eq!(resources[0]["id"], "one");
+    }
+
+    #[test]
+    fn the_vacation_responder_reads_as_the_app_s_automatic_replies() {
+        // Times as strings, and a reply written in webmail, as HTML only.
+        let settings: VacationSettings = serde_json::from_value(json!({
+            "enableAutoReply": true,
+            "responseSubject": "Away",
+            "responseBodyHtml": "<div>Back on <b>Monday</b>.</div><div>Alex</div>",
+            "restrictToContacts": false,
+            "restrictToDomain": true,
+            "startTime": "1763251200000",
+            "endTime": 1763683199999_i64,
+        }))
+        .unwrap();
+        let reply = AutoReply::from(settings);
+        assert!(reply.enabled && reply.domain_only && !reply.contacts_only);
+        assert_eq!(reply.subject, "Away");
+        assert!(reply.text.contains("Back on Monday."), "{:?}", reply.text);
+        assert!(reply.text.contains("Alex") && !reply.text.contains('<'));
+        assert_eq!(reply.starts_at, Some(1_763_251_200_000));
+        assert_eq!(reply.ends_at, Some(1_763_683_199_999));
+
+        // A responder that was never set reads as off.
+        let unset: VacationSettings = serde_json::from_value(json!({})).unwrap();
+        assert_eq!(AutoReply::from(unset), AutoReply::default());
+
+        // Saved, the text goes as plain text, and times as strings.
+        let saved = serde_json::to_value(VacationSettings::from(&reply)).unwrap();
+        assert_eq!(saved["startTime"], "1763251200000");
+        assert!(saved.get("responseBodyHtml").is_none());
+        let open_ended =
+            serde_json::to_value(VacationSettings::from(&AutoReply::default())).unwrap();
+        assert!(open_ended.get("startTime").is_none() && open_ended.get("endTime").is_none());
+    }
+
+    #[test]
+    fn batch_quota_rejection_is_retryable_not_reauth() {
+        let body = concat!(
+            "--response\r\nContent-Type: application/http\r\n\r\n",
+            "HTTP/1.1 403 Forbidden\r\nContent-Type: application/json\r\n\r\n",
+            "{\"error\":{\"message\":\"slow down\",\"errors\":[{\"reason\":\"userRateLimitExceeded\"}]}}\r\n",
+            "--response--\r\n"
+        );
+        assert!(matches!(
+            parse_batch_response(body, "response", 1),
+            Err(CoreError::RateLimited {
+                kind: LimitKind::Requests,
+                retry_after: None,
+                ..
+            })
+        ));
+        // A part that names its wait.
+        let body = concat!(
+            "--response\r\nContent-Type: application/http\r\n\r\n",
+            "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 30\r\nContent-Type: application/json\r\n\r\n",
+            "{\"error\":{\"message\":\"slow down\",\"errors\":[{\"reason\":\"rateLimitExceeded\"}]}}\r\n",
+            "--response--\r\n"
+        );
+        assert!(matches!(
+            parse_batch_response(body, "response", 1),
+            Err(CoreError::RateLimited {
+                retry_after: Some(wait),
+                ..
+            }) if wait == Duration::from_secs(30)
+        ));
+    }
+
+    #[test]
+    fn replayed_delete_treats_missing_resource_as_success() {
+        assert!(ignore_not_found(Err(CoreError::NotFound("gone".into()))).is_ok());
+        assert!(matches!(
+            ignore_not_found(Err(CoreError::Network("offline".into()))),
+            Err(CoreError::Network(_))
+        ));
+    }
+
+    #[test]
+    fn metadata_parser_keeps_native_ids_labels_and_rfc_headers() {
+        let resource = json!({
+            "id": "msg-1",
+            "threadId": "thread-1",
+            "historyId": "7",
+            "internalDate": "1700000000000",
+            "sizeEstimate": 42,
+            "labelIds": ["INBOX", "UNREAD", "Label_1"],
+            "snippet": "Alice&#39;s\n  report &amp; notes",
+            "payload": {
+                "headers": [
+                    { "name": "From", "value": "Alice <alice@example.com>" },
+                    { "name": "To", "value": "Me <me@example.com>" },
+                    { "name": "Subject", "value": "Native Gmail" },
+                    { "name": "Message-ID", "value": "<m@example.com>" }
+                ],
+                "parts": [{
+                    "partId": "1",
+                    "mimeType": "application/pdf",
+                    "filename": "report.pdf",
+                    "body": { "attachmentId": "opaque", "size": 10 }
+                }]
+            }
+        });
+        let parsed = parse_resource(&resource).unwrap();
+        assert_eq!(parsed.provider_id, "msg-1");
+        assert_eq!(parsed.thread_id, "thread-1");
+        assert_eq!(parsed.headers.subject, "Native Gmail");
+        assert_eq!(parsed.headers.from.unwrap().email, "alice@example.com");
+        assert!(parsed.labels.contains(&"UNREAD".into()));
+        assert!(parsed.has_attachments);
+        assert_eq!(parsed.snippet, "Alice's report & notes");
+    }
+
+    #[test]
+    fn part_plan_distinguishes_external_text_from_file_attachments() {
+        let payload = json!({
+            "mimeType": "multipart/mixed",
+            "parts": [
+                {
+                    "partId": "1",
+                    "mimeType": "text/plain",
+                    "filename": "",
+                    "body": { "attachmentId": "large-text", "size": 100 }
+                },
+                {
+                    "partId": "2",
+                    "mimeType": "image/png",
+                    "filename": "pixel.png",
+                    "headers": [{ "name": "Content-Disposition", "value": "attachment" }],
+                    "body": { "attachmentId": "image", "size": 200 }
+                }
+            ]
+        });
+        let mut parts = Vec::new();
+        collect_part_specs(&payload, &mut parts).unwrap();
+        assert_eq!(parts.len(), 2);
+        assert_eq!(
+            parts[0].provider_attachment_id.as_deref(),
+            Some("large-text")
+        );
+        assert_eq!(parts[1].filename.as_deref(), Some("pixel.png"));
+        assert!(!parts[1].is_inline);
+    }
+
+    #[test]
+    fn arbitrary_local_colors_are_not_sent_to_gmail() {
+        assert_eq!(gmail_palette_color("#4a86e8"), Some("#4a86e8"));
+        assert_eq!(gmail_palette_color("#123456"), None);
+    }
+}
+
+#[cfg(test)]
+mod returned_receipt_tests {
+    use super::tests::gmail_account;
+    use super::*;
+
+    fn receipt_resource(id: &str, labels: &[&str], full: bool) -> Value {
+        let data = |text: &str| URL_SAFE_NO_PAD.encode(text);
+        let mut payload = json!({
+            "mimeType": "multipart/report",
+            "headers": [
+                {"name": "From", "value": "Ana Ruiz <ana@example.com>"},
+                {"name": "To", "value": "me@test.dev"},
+                {"name": "Subject", "value": "Read: Plan"},
+                {"name": "Date", "value": "Tue, 01 Sep 2026 12:30:00 +0000"},
+                {"name": "Message-ID", "value": format!("<{id}@example.com>")},
+                {"name": "Content-Type",
+                 "value": "multipart/report; report-type=disposition-notification; boundary=b"},
+            ]
+        });
+        if full {
+            payload["parts"] = json!([
+                {"partId": "0", "mimeType": "text/plain", "filename": "",
+                 "body": {"size": 9, "data": data("Displayed")}},
+                {"partId": "1", "mimeType": "message/disposition-notification", "filename": "",
+                 "body": {"size": 120, "data": data(
+                    "Final-Recipient: rfc822; ana@example.com\r\n\
+                     Original-Message-ID: <plan@example.org>\r\n\
+                     Disposition: manual-action/MDN-sent-manually; displayed\r\n")}},
+            ]);
+        }
+        json!({
+            "id": id, "threadId": format!("thread-{id}"),
+            "labelIds": labels, "internalDate": "1788265800000",
+            "sizeEstimate": 400, "snippet": "Displayed",
+            "payload": payload,
+        })
+    }
+
+    #[tokio::test]
+    async fn new_receipts_are_read_as_they_arrive() {
+        let (_dir, ctx, config) = gmail_account().await;
+        let mut ordinary = receipt_resource("note", &["INBOX"], false);
+        ordinary["payload"]["headers"][5]["value"] = json!("text/plain");
+        let resources = [
+            receipt_resource("receipt", &["INBOX", "UNREAD"], false),
+            ordinary,
+            // The receipt this account sent, in Sent.
+            receipt_resource("answer", &["SENT"], false),
+        ];
+        let outcome = store_resources(
+            &ctx,
+            &config,
+            &resources,
+            None,
+            false,
+            true,
+            None,
+            Arrivals::None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome.receipts, vec!["receipt".to_owned()]);
+        // Only once.
+        let outcome = store_resources(
+            &ctx,
+            &config,
+            &resources,
+            None,
+            false,
+            true,
+            None,
+            Arrivals::None,
+        )
+        .await
+        .unwrap();
+        assert!(outcome.receipts.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_hydrated_receipt_shows_on_the_sent_message() {
+        let (_dir, ctx, config) = gmail_account().await;
+        let sent_thread = ctx
+            .db
+            .write(|conn| {
+                conn.execute_batch(
+                    r#"INSERT INTO threads (id, account_id, subject_norm, unread_count, last_message_at)
+                           VALUES (70, 1, 'plan', 0, 1000);
+                       INSERT INTO messages (thread_id, account_id, folder_id, message_id, subject,
+                           to_json, date, is_outgoing)
+                           VALUES (70, 1, 5, 'plan@example.org', 'Plan',
+                                   '[{"name":"Ana Ruiz","email":"ana@example.com"}]', 1000, 1);"#,
+                )?;
+                Ok(70_i64)
+            })
+            .await
+            .unwrap();
+        let resource = receipt_resource("receipt", &["INBOX"], true);
+        store_resources(
+            &ctx,
+            &config,
+            std::slice::from_ref(&resource),
+            None,
+            false,
+            false,
+            None,
+            Arrivals::None,
+        )
+        .await
+        .unwrap();
+        let api = GmailApi::new(ctx.clone(), config.clone()).unwrap();
+        let body = hydrate_parts(&api, &resource).await.unwrap();
+        assert!(body.disposition_report.is_some());
+        let threads = store_hydrated_body(&ctx, &config, "receipt".into(), body)
+            .await
+            .unwrap();
+        assert!(threads.contains(&sent_thread), "{threads:?}");
+        let receipts = ctx
+            .db
+            .read(|conn| {
+                let id: i64 = conn.query_row(
+                    "SELECT id FROM messages WHERE message_id = 'plan@example.org'",
+                    [],
+                    |row| row.get(0),
+                )?;
+                Ok(repo::messages::detail(conn, id)?.returned_receipts)
+            })
+            .await
+            .unwrap();
+        assert_eq!(receipts.len(), 1);
+        assert_eq!(receipts[0].recipient.name.as_deref(), Some("Ana Ruiz"));
+        assert_eq!(
+            receipts[0].disposition,
+            crate::models::Disposition::Displayed
+        );
+        assert_eq!(receipts[0].reported_at, 1_788_265_800_000);
+    }
+}
+
+#[cfg(test)]
+mod search_tests {
+    use super::tests::gmail_account;
+    use super::*;
+    use std::sync::{Arc, Mutex};
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+
+    /// A request the stand-in answered: method, target and body.
+    pub(super) type Request = (String, String, String);
+
+    /// A stand-in for Gmail's API and batch endpoint that answers each
+    /// request with `answer`'s content type and body, and keeps the requests.
+    pub(super) async fn stand_in(
+        answer: impl Fn(&Request) -> (String, String) + Send + Sync + 'static,
+    ) -> (String, Arc<Mutex<Vec<Request>>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let kept = Arc::clone(&requests);
+        let answer = Arc::new(answer);
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let (requests, answer) = (Arc::clone(&kept), Arc::clone(&answer));
+                tokio::spawn(async move {
+                    let mut stream = BufReader::new(stream);
+                    let mut line = String::new();
+                    stream.read_line(&mut line).await.unwrap();
+                    let mut words = line.split_whitespace();
+                    let method = words.next().unwrap_or_default().to_owned();
+                    let target = words.next().unwrap_or_default().to_owned();
+                    let mut length = 0;
+                    loop {
+                        let mut header = String::new();
+                        stream.read_line(&mut header).await.unwrap();
+                        if header.trim().is_empty() {
+                            break;
+                        }
+                        if let Some((name, value)) = header.split_once(':')
+                            && name.eq_ignore_ascii_case("content-length")
+                        {
+                            length = value.trim().parse().unwrap();
+                        }
+                    }
+                    let mut body = vec![0; length];
+                    stream.read_exact(&mut body).await.unwrap();
+                    let request = (method, target, String::from_utf8(body).unwrap());
+                    let (content_type, body) = answer(&request);
+                    requests.lock().unwrap().push(request);
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\n\
+                         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    stream
+                        .get_mut()
+                        .write_all(response.as_bytes())
+                        .await
+                        .unwrap();
+                });
+            }
+        });
+        (origin, requests)
+    }
+
+    /// Message `m<day>` in Gmail's metadata format, from Ana on that day in
+    /// March 2020.
+    fn found(id: &str) -> Value {
+        let day = id.trim_start_matches('m').parse::<u32>().unwrap();
+        json!({
+            "id": id, "threadId": format!("thread-{id}"),
+            "labelIds": ["INBOX"],
+            "internalDate": (1_583_056_800_000_i64 + i64::from(day - 1) * 86_400_000).to_string(),
+            "sizeEstimate": 400, "snippet": "The invoice",
+            "payload": {
+                "mimeType": "text/plain",
+                "headers": [
+                    {"name": "From", "value": "Ana <ana@example.com>"},
+                    {"name": "To", "value": "me@test.dev"},
+                    {"name": "Subject", "value": format!("Invoice {id}")},
+                    {"name": "Date", "value": format!("{day} Mar 2020 10:00:00 +0000")},
+                    {"name": "Message-ID", "value": format!("<{id}@example.com>")},
+                ]
+            }
+        })
+    }
+
+    /// Gmail's answer to a batch: each message it asked for.
+    fn batch_answer(body: &str) -> (String, String) {
+        let mut answer = String::new();
+        for line in body.lines() {
+            let Some(asked) = line.strip_prefix("GET /gmail/v1/users/me/messages/") else {
+                continue;
+            };
+            let id = asked.split('?').next().unwrap();
+            answer.push_str(&format!(
+                "--answer\r\nContent-Type: application/http\r\n\r\n\
+                 HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{}\r\n",
+                found(id)
+            ));
+        }
+        answer.push_str("--answer--\r\n");
+        ("multipart/mixed; boundary=answer".into(), answer)
+    }
+
+    /// Gmail's search goes a page at a time with its page tokens, until a
+    /// page of mail not kept here is found. Only those messages are fetched,
+    /// as their metadata, and kept, and the ones kept here come along.
+    #[tokio::test]
+    async fn a_server_search_keeps_what_gmail_finds_a_page_at_a_time() {
+        let (_dir, ctx, config) = gmail_account().await;
+        ctx.tokens
+            .store_initial(
+                config.id,
+                "access".into(),
+                Some(3600),
+                Some("refresh".into()),
+                "client".into(),
+                None,
+            )
+            .await
+            .unwrap();
+        // m2 is kept here already.
+        store_resources(
+            &ctx,
+            &config,
+            &[found("m2")],
+            None,
+            false,
+            false,
+            None,
+            Arrivals::None,
+        )
+        .await
+        .unwrap();
+        let (origin, requests) = stand_in(|(_, target, body)| {
+            if target.starts_with("/batch/") {
+                return batch_answer(body);
+            }
+            assert!(
+                target.starts_with("/gmail/v1/users/me/messages?maxResults=1&q=invoice+from%3Aana"),
+                "{target}"
+            );
+            // A message a page, newest first.
+            let page = if target.ends_with("&pageToken=page-2") {
+                json!({"messages": [{"id": "m2", "threadId": "thread-m2"}], "nextPageToken": "page-3"})
+            } else if target.ends_with("&pageToken=page-3") {
+                json!({"messages": [{"id": "m1", "threadId": "thread-m1"}]})
+            } else {
+                json!({"messages": [{"id": "m3", "threadId": "thread-m3"}], "nextPageToken": "page-2"})
+            };
+            ("application/json".into(), page.to_string())
+        })
+        .await;
+        let api = GmailApi::new(ctx.clone(), config.clone()).unwrap();
+        let (base, batch) = (
+            format!("{origin}/gmail/v1/users/me"),
+            format!("{origin}/batch/gmail/v1"),
+        );
+        let endpoints = (base.as_str(), batch.as_str());
+        let tree = crate::search::parse("invoice from:ana").tree.unwrap();
+
+        let first = search_server(
+            &ctx,
+            &config,
+            &api,
+            endpoints,
+            &tree,
+            &ServerSearchCursor::default(),
+            1,
+        )
+        .await
+        .unwrap();
+        let next = first.next.clone().expect("Gmail had another page");
+        assert_eq!(next.page_token.as_deref(), Some("page-2"));
+        // m2 is kept here, so the page goes on to m1.
+        let second = search_server(&ctx, &config, &api, endpoints, &tree, &next, 1)
+            .await
+            .unwrap();
+        assert_eq!(second.next, None);
+
+        // Only m3 and m1 were fetched, each once.
+        let requests = requests.lock().unwrap().clone();
+        let fetched = requests
+            .iter()
+            .filter(|(_, target, _)| target.starts_with("/batch/"))
+            .flat_map(|(_, _, body)| {
+                body.lines()
+                    .filter_map(|line| line.strip_prefix("GET /gmail/v1/users/me/messages/"))
+                    .map(|asked| asked.split('?').next().unwrap().to_owned())
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(fetched, ["m3", "m1"]);
+
+        // Each page's in Gmail's order, kept in the Inbox.
+        let (first_found, second_found) = ctx
+            .db
+            .read(move |conn| {
+                let found = |ids: &[i64]| -> Result<Vec<(String, Option<i64>)>> {
+                    ids.iter()
+                        .map(|id| {
+                            let row = repo::messages::get_row(conn, *id)?.unwrap();
+                            Ok((row.subject, row.folder_id))
+                        })
+                        .collect()
+                };
+                Ok((found(&first.message_ids)?, found(&second.message_ids)?))
+            })
+            .await
+            .unwrap();
+        let inbox = |subject: &str| (subject.to_owned(), Some(1));
+        assert_eq!(first_found, [inbox("Invoice m3")]);
+        assert_eq!(second_found, [inbox("Invoice m2"), inbox("Invoice m1")]);
+    }
+}
+
+#[cfg(test)]
+mod forwarded_message_tests {
+    use super::search_tests::stand_in;
+    use super::tests::gmail_account;
+    use super::*;
+
+    /// The message of #455 as Gmail keeps it.
+    const RAW: &str = "From: sender@example.com\r\n\
+        To: me@test.dev\r\n\
+        Date: Wed, 18 Nov 2026 12:00:00 +0900\r\n\
+        Subject: Inline forward reproduction\r\n\
+        Message-ID: <fwd@example.com>\r\n\
+        MIME-Version: 1.0\r\n\
+        Content-Type: multipart/mixed; boundary=repro\r\n\
+        \r\n\
+        --repro\r\n\
+        Content-Type: text/plain\r\n\
+        \r\n\
+        Outer body.\r\n\
+        --repro\r\n\
+        Content-Type: message/rfc822\r\n\
+        Content-Disposition: inline\r\n\
+        \r\n\
+        From: original@example.com\r\n\
+        Subject: Original message\r\n\
+        \r\n\
+        Forwarded body.\r\n\
+        --repro--\r\n";
+
+    /// The same message in Gmail's full format, its forward sent `disposition`.
+    fn resource(disposition: &str) -> Value {
+        let data = |text: &str| URL_SAFE_NO_PAD.encode(text);
+        json!({
+            "id": "fwd", "threadId": "thread-fwd", "labelIds": ["INBOX"],
+            "internalDate": "1763434800000", "sizeEstimate": RAW.len(),
+            "snippet": "Outer body.",
+            "payload": {
+                "partId": "", "mimeType": "multipart/mixed", "filename": "",
+                "headers": [
+                    {"name": "From", "value": "sender@example.com"},
+                    {"name": "To", "value": "me@test.dev"},
+                    {"name": "Subject", "value": "Inline forward reproduction"},
+                    {"name": "Date", "value": "Wed, 18 Nov 2026 12:00:00 +0900"},
+                    {"name": "Message-ID", "value": "<fwd@example.com>"},
+                ],
+                "body": {"size": 0},
+                "parts": [
+                    {
+                        "partId": "0", "mimeType": "text/plain", "filename": "",
+                        "headers": [{"name": "Content-Type", "value": "text/plain"}],
+                        "body": {"size": 11, "data": data("Outer body.")},
+                    },
+                    {
+                        "partId": "1", "mimeType": "message/rfc822", "filename": "",
+                        "headers": [
+                            {"name": "Content-Type", "value": "message/rfc822"},
+                            {"name": "Content-Disposition", "value": disposition},
+                        ],
+                        "body": {"size": 0},
+                        "parts": [{
+                            "partId": "1.0", "mimeType": "text/plain", "filename": "",
+                            "headers": [
+                                {"name": "From", "value": "original@example.com"},
+                                {"name": "Subject", "value": "Original message"},
+                            ],
+                            "body": {"size": 15, "data": data("Forwarded body.")},
+                        }],
+                    },
+                ],
+            }
+        })
+    }
+
+    #[test]
+    fn only_a_message_shown_in_the_body_is_read_from_its_original() {
+        assert!(shows_messages(&resource("inline")["payload"]));
+        assert!(shows_messages(&resource("INLINE; foo=bar")["payload"]));
+        assert!(!shows_messages(&resource("attachment")["payload"]));
+        assert!(!shows_messages(
+            &json!({"mimeType": "text/plain", "headers": []})
+        ));
+    }
+
+    #[tokio::test]
+    async fn issue_455_a_gmail_message_shows_the_message_forwarded_in_it() {
+        let (_dir, ctx, config) = gmail_account().await;
+        ctx.tokens
+            .store_initial(
+                config.id,
+                "access".into(),
+                Some(3600),
+                Some("refresh".into()),
+                "client".into(),
+                None,
+            )
+            .await
+            .unwrap();
+        let resource = resource("inline");
+        store_resources(
+            &ctx,
+            &config,
+            std::slice::from_ref(&resource),
+            None,
+            false,
+            false,
+            None,
+            Arrivals::None,
+        )
+        .await
+        .unwrap();
+        let (origin, requests) = stand_in(|(_, target, _)| {
+            assert_eq!(target, "/gmail/v1/users/me/messages/fwd?format=raw");
+            (
+                "application/json".into(),
+                json!({"id": "fwd", "raw": URL_SAFE_NO_PAD.encode(RAW)}).to_string(),
+            )
+        })
+        .await;
+        let api = GmailApi::new(ctx.clone(), config.clone()).unwrap();
+        let body = hydrate_at(
+            &ctx,
+            &config,
+            &api,
+            &format!("{origin}/gmail/v1/users/me"),
+            &resource,
+        )
+        .await
+        .unwrap();
+        assert_eq!(requests.lock().unwrap().len(), 1);
+        let raw_path = body.raw_path.clone().unwrap();
+        assert_eq!(std::fs::read_to_string(&raw_path).unwrap(), RAW);
+        store_hydrated_body(&ctx, &config, "fwd".into(), body)
+            .await
+            .unwrap();
+
+        let (text, stored_path, files) = ctx
+            .db
+            .read(|conn| {
+                let (id, raw_path): (i64, Option<String>) = conn.query_row(
+                    "SELECT id, raw_path FROM messages WHERE gm_msgid = 'fwd'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )?;
+                let detail = repo::messages::detail(conn, id)?;
+                let files: Vec<_> = detail
+                    .attachments
+                    .iter()
+                    .map(|file| (file.filename.clone(), file.mime_type.clone()))
+                    .collect();
+                Ok((detail.text_body, raw_path, files))
+            })
+            .await
+            .unwrap();
+        let text = text.unwrap();
+        assert!(text.starts_with("Outer body.\n\n---------- Forwarded message"));
+        assert!(text.ends_with("Subject: Original message\n\nForwarded body."));
+        assert_eq!(stored_path.as_deref(), Some(raw_path.as_str()));
+        assert_eq!(
+            files,
+            vec![(
+                Some("Original message.eml".to_owned()),
+                Some("message/rfc822".to_owned())
+            )]
+        );
+    }
+}

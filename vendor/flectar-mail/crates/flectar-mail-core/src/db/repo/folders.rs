@@ -1,0 +1,1617 @@
+use crate::error::Result;
+use crate::models::{FolderInfo, MailProtocol, now_ms, roles};
+use rusqlite::{Connection, OptionalExtension, Row, named_params, params};
+use std::collections::{BTreeMap, HashMap, HashSet};
+
+/// The roles an IMAP account's folders can be chosen for by hand (#252).
+pub const CHOOSABLE_ROLES: [&str; 5] = [
+    roles::SENT,
+    roles::DRAFTS,
+    roles::TRASH,
+    roles::SPAM,
+    roles::ARCHIVE,
+];
+
+/// Separates the levels of folders that exist only on this device: those
+/// of POP3 accounts and of mail kept on this device.
+pub const DEVICE_DELIMITER: &str = "/";
+
+#[derive(Debug, Clone)]
+pub struct Folder {
+    pub id: i64,
+    pub account_id: i64,
+    pub parent_id: Option<i64>,
+    pub path: String,
+    pub delimiter: Option<String>,
+    pub role: Option<String>,
+    pub uidvalidity: Option<i64>,
+    pub uidnext: Option<i64>,
+    pub highestmodseq: Option<i64>,
+    pub last_seen_uid: i64,
+    pub backfill_cursor: Option<i64>,
+    pub backfill_done: bool,
+    pub jmap_id: Option<String>,
+    pub selectable: bool,
+    pub can_create_children: bool,
+    pub can_rename: bool,
+    pub can_delete: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FolderPermissions {
+    pub can_create_children: bool,
+    pub can_rename: bool,
+    pub can_delete: bool,
+}
+
+impl FolderPermissions {
+    pub const FULL: Self = Self {
+        can_create_children: true,
+        can_rename: true,
+        can_delete: true,
+    };
+}
+
+fn from_row(row: &Row) -> rusqlite::Result<Folder> {
+    Ok(Folder {
+        id: row.get("id")?,
+        account_id: row.get("account_id")?,
+        parent_id: row.get("parent_id")?,
+        path: row.get("path")?,
+        delimiter: row.get("delimiter")?,
+        role: row.get("role")?,
+        uidvalidity: row.get("uidvalidity")?,
+        uidnext: row.get("uidnext")?,
+        highestmodseq: row.get("highestmodseq")?,
+        last_seen_uid: row.get("last_seen_uid")?,
+        backfill_cursor: row.get("backfill_cursor")?,
+        backfill_done: row.get::<_, i64>("backfill_done")? != 0,
+        jmap_id: row.get("jmap_id")?,
+        selectable: row.get::<_, i64>("selectable")? != 0,
+        can_create_children: row.get::<_, i64>("can_create_children")? != 0,
+        can_rename: row.get::<_, i64>("can_rename")? != 0,
+        can_delete: row.get::<_, i64>("can_delete")? != 0,
+    })
+}
+
+pub fn upsert(
+    conn: &Connection,
+    account_id: i64,
+    path: &str,
+    delimiter: Option<&str>,
+    role: Option<&str>,
+) -> Result<i64> {
+    upsert_discovered(
+        conn,
+        account_id,
+        path,
+        delimiter,
+        role,
+        true,
+        FolderPermissions::FULL,
+    )
+}
+
+pub fn upsert_discovered(
+    conn: &Connection,
+    account_id: i64,
+    path: &str,
+    delimiter: Option<&str>,
+    role: Option<&str>,
+    selectable: bool,
+    permissions: FolderPermissions,
+) -> Result<i64> {
+    conn.execute(
+        "INSERT INTO folders (account_id, path, delimiter, role, detected_role, selectable,
+                              can_create_children, can_rename, can_delete)
+         VALUES (?1,?2,?3,?4,?4,?5,?6,?7,?8)
+         ON CONFLICT(account_id, path)
+         DO UPDATE SET delimiter = excluded.delimiter, role = excluded.role,
+                       detected_role = excluded.detected_role,
+                       selectable = excluded.selectable,
+                       can_create_children = excluded.can_create_children,
+                       can_rename = excluded.can_rename,
+                       can_delete = excluded.can_delete, jmap_id = NULL,
+                       missing_on_server = 0",
+        params![
+            account_id,
+            path,
+            delimiter,
+            role,
+            selectable,
+            permissions.can_create_children,
+            permissions.can_rename,
+            permissions.can_delete,
+        ],
+    )?;
+    let id: i64 = conn.query_row(
+        "SELECT id FROM folders WHERE account_id = ?1 AND path = ?2",
+        params![account_id, path],
+        |r| r.get(0),
+    )?;
+    Ok(id)
+}
+
+pub fn list(conn: &Connection, account_id: Option<i64>) -> Result<Vec<Folder>> {
+    let mut stmt = conn.prepare(
+        "SELECT f.id AS id, f.account_id AS account_id, f.parent_id AS parent_id,
+                f.path AS path,
+                f.delimiter AS delimiter, f.role AS role, f.uidvalidity AS uidvalidity,
+                f.uidnext AS uidnext, f.highestmodseq AS highestmodseq,
+                f.last_seen_uid AS last_seen_uid, f.backfill_cursor AS backfill_cursor,
+                f.backfill_done AS backfill_done, f.jmap_id AS jmap_id,
+                f.selectable AS selectable,
+                f.can_create_children AS can_create_children,
+                f.can_rename AS can_rename, f.can_delete AS can_delete
+         FROM folders f
+         JOIN accounts a ON a.id = f.account_id
+         WHERE (?1 IS NULL OR f.account_id = ?1) AND f.missing_on_server = 0
+           AND ((a.mail_protocol = 'jmap' AND f.jmap_id IS NOT NULL)
+             OR (a.mail_protocol <> 'jmap' AND f.jmap_id IS NULL))
+         ORDER BY f.id",
+    )?;
+    Ok(stmt
+        .query_map(params![account_id], from_row)?
+        .collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+pub fn list_info(conn: &Connection, account_id: Option<i64>) -> Result<Vec<FolderInfo>> {
+    let protocols = conn
+        .prepare("SELECT id, mail_protocol FROM accounts")?
+        .query_map([], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, MailProtocol>(1)?))
+        })?
+        .collect::<rusqlite::Result<HashMap<_, _>>>()?;
+    Ok(list(conn, account_id)?
+        .into_iter()
+        .map(|f| FolderInfo {
+            id: f.id,
+            account_id: f.account_id,
+            parent_id: f.parent_id,
+            // IMAP names are modified UTF-7 on the wire; JMAP names and
+            // folders on this device are stored as shown.
+            display_name: match protocols.get(&f.account_id) {
+                Some(MailProtocol::Gmail | MailProtocol::Imap) => {
+                    crate::imap::decode_mailbox_name(&f.path)
+                }
+                Some(MailProtocol::Jmap | MailProtocol::Pop3 | MailProtocol::Local) | None => {
+                    f.path.clone()
+                }
+            },
+            is_jmap: f.jmap_id.is_some(),
+            path: f.path,
+            delimiter: f.delimiter,
+            role: f.role,
+            selectable: f.selectable,
+            can_create_children: f.can_create_children,
+            can_rename: f.can_rename,
+            can_delete: f.can_delete,
+        })
+        .collect())
+}
+
+fn subtree_pattern(prefix: &str, delimiter: &str) -> String {
+    let extra = prefix
+        .bytes()
+        .chain(delimiter.bytes())
+        .filter(|byte| matches!(byte, b'\\' | b'%' | b'_'))
+        .count();
+    let mut pattern = String::with_capacity(prefix.len() + delimiter.len() + extra + 1);
+    for character in prefix.chars().chain(delimiter.chars()) {
+        if matches!(character, '\\' | '%' | '_') {
+            pattern.push('\\');
+        }
+        pattern.push(character);
+    }
+    pattern.push('%');
+    pattern
+}
+
+pub fn rename_tree(
+    conn: &Connection,
+    account_id: i64,
+    old_prefix: &str,
+    new_prefix: &str,
+    delimiter: &str,
+) -> Result<()> {
+    let mut stmt = conn.prepare(
+        "SELECT id, path FROM folders
+         WHERE account_id = ?1 AND (path = ?2 OR path LIKE ?3 ESCAPE '\\')
+         ORDER BY LENGTH(path)",
+    )?;
+    let pattern = subtree_pattern(old_prefix, delimiter);
+    let rows = stmt
+        .query_map(params![account_id, old_prefix, pattern], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(stmt);
+    for (id, old_name) in rows {
+        let suffix = old_name.strip_prefix(old_prefix).unwrap_or_default();
+        conn.execute(
+            "UPDATE folders SET path = ?2 WHERE id = ?1",
+            params![id, format!("{new_prefix}{suffix}")],
+        )?;
+    }
+    // A role chosen for a folder of the tree follows it (#252).
+    update_chosen_roles(conn, account_id, |chosen| {
+        let inside = format!("{old_prefix}{delimiter}");
+        for path in chosen.values_mut() {
+            if path == old_prefix {
+                *path = new_prefix.to_owned();
+            } else if let Some(rest) = path.strip_prefix(&inside)
+                && !delimiter.is_empty()
+            {
+                *path = format!("{new_prefix}{delimiter}{rest}");
+            }
+        }
+    })
+}
+
+/// Change the account's folders chosen by hand for roles (#252) as
+/// `change` says, and give its folders their roles anew if they changed.
+fn update_chosen_roles(
+    conn: &Connection,
+    account_id: i64,
+    change: impl FnOnce(&mut BTreeMap<String, String>),
+) -> Result<()> {
+    // Only IMAP accounts choose them. The others keep their provider's.
+    let Some(mut config) = super::accounts::get_config(conn, account_id)?
+        .filter(|config| config.mail_protocol == MailProtocol::Imap)
+    else {
+        return Ok(());
+    };
+    let before = config.settings.folder_roles.clone();
+    change(&mut config.settings.folder_roles);
+    if config.settings.folder_roles == before {
+        return Ok(());
+    }
+    super::accounts::set_settings(conn, account_id, &config.settings)?;
+    apply_chosen_roles(conn, account_id, &config.settings.folder_roles)
+}
+
+/// A message in a folder tree.
+pub struct TreeMessage {
+    pub id: i64,
+    pub thread_id: Option<i64>,
+    pub raw_path: Option<String>,
+}
+
+/// Every message in a folder and its subfolders.
+pub fn messages_in_tree(
+    conn: &Connection,
+    account_id: i64,
+    prefix: &str,
+    delimiter: &str,
+) -> Result<Vec<TreeMessage>> {
+    let pattern = subtree_pattern(prefix, delimiter);
+    let mut stmt = conn.prepare(
+        "SELECT m.id, m.thread_id, m.raw_path
+         FROM messages m JOIN folders f ON f.id = m.folder_id
+         WHERE f.account_id = ?1 AND (f.path = ?2 OR f.path LIKE ?3 ESCAPE '\\')",
+    )?;
+    Ok(stmt
+        .query_map(params![account_id, prefix, pattern], |row| {
+            Ok(TreeMessage {
+                id: row.get(0)?,
+                thread_id: row.get(1)?,
+                raw_path: row.get(2)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+/// Every message in one folder.
+pub fn messages_in(conn: &Connection, folder_id: i64) -> Result<Vec<TreeMessage>> {
+    let mut stmt =
+        conn.prepare("SELECT id, thread_id, raw_path FROM messages WHERE folder_id = ?1")?;
+    Ok(stmt
+        .query_map(params![folder_id], |row| {
+            Ok(TreeMessage {
+                id: row.get(0)?,
+                thread_id: row.get(1)?,
+                raw_path: row.get(2)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+/// Whether queued work not yet done involves the folder: a change to mail
+/// in it, or mail moved or copied into or out of it.
+pub fn has_queued_work(conn: &Connection, account_id: i64, folder_id: i64) -> Result<bool> {
+    Ok(conn.query_row(
+        "SELECT EXISTS(
+           SELECT 1 FROM pending_actions p
+           WHERE p.account_id = ?1 AND p.state IN ('pending', 'inflight')
+             AND (p.message_id IN (SELECT id FROM messages WHERE folder_id = ?2)
+               OR json_extract(p.payload, '$.folderId') = ?2
+               OR json_extract(p.payload, '$.srcFolderId') = ?2
+               OR json_extract(p.payload, '$.targetFolderId') = ?2))",
+        params![account_id, folder_id],
+        |row| row.get(0),
+    )?)
+}
+
+/// The account's IMAP folders that are still on the server (`on_server`)
+/// but no longer listed: one outside `listed` goes with its mail (true), and
+/// one listed only as the container of listed folders, not among `synced`,
+/// keeps its place and loses its mail (false).
+pub fn unlisted(
+    conn: &Connection,
+    account_id: i64,
+    on_server: &HashSet<String>,
+    listed: &HashSet<String>,
+    synced: &HashSet<String>,
+) -> Result<Vec<(i64, bool)>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, path, EXISTS(SELECT 1 FROM messages m WHERE m.folder_id = folders.id)
+         FROM folders
+         WHERE account_id = ?1 AND jmap_id IS NULL AND missing_on_server = 0",
+    )?;
+    let folders = stmt
+        .query_map(params![account_id], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, bool>(2)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(folders
+        .into_iter()
+        .filter(|(_, path, _)| on_server.contains(path) && !synced.contains(path))
+        .filter_map(|(id, path, has_mail)| {
+            if !listed.contains(&path) {
+                Some((id, true))
+            } else {
+                has_mail.then_some((id, false))
+            }
+        })
+        .collect())
+}
+
+/// Delete a folder and its subfolders. Their messages go first, with their
+/// search entries and files (see `crate::sync::delete_folder_tree`).
+pub fn delete_tree(
+    conn: &Connection,
+    account_id: i64,
+    prefix: &str,
+    delimiter: &str,
+) -> Result<()> {
+    let pattern = subtree_pattern(prefix, delimiter);
+    conn.execute(
+        "DELETE FROM folders
+         WHERE account_id = ?1 AND (path = ?2 OR path LIKE ?3 ESCAPE '\\')",
+        params![account_id, prefix, pattern],
+    )?;
+    // A role chosen for a deleted folder goes back to the server's
+    // suggestion (#252).
+    let inside = format!("{prefix}{delimiter}");
+    update_chosen_roles(conn, account_id, |chosen| {
+        chosen.retain(|_, path| {
+            path != prefix && (delimiter.is_empty() || !path.starts_with(&inside))
+        });
+    })
+}
+
+pub fn path_exists(conn: &Connection, account_id: i64, path: &str) -> Result<bool> {
+    Ok(conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM folders WHERE account_id = ?1 AND path = ?2)",
+        params![account_id, path],
+        |row| row.get(0),
+    )?)
+}
+
+pub fn get(conn: &Connection, id: i64) -> Result<Option<Folder>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, account_id, parent_id, path, delimiter, role, uidvalidity, uidnext,
+                highestmodseq, last_seen_uid, backfill_cursor, backfill_done, jmap_id, selectable,
+                can_create_children, can_rename, can_delete
+         FROM folders WHERE id = ?1",
+    )?;
+    Ok(stmt.query_row(params![id], from_row).optional()?)
+}
+
+/// Give an account's folders the roles its server suggests, and then the
+/// ones `chosen` by hand, as paths by role (#252). A chosen folder takes its
+/// role from the folder that had it. One that isn't there leaves the role to
+/// the suggested folder.
+pub fn apply_chosen_roles(
+    conn: &Connection,
+    account_id: i64,
+    chosen: &BTreeMap<String, String>,
+) -> Result<()> {
+    // Only roles that can be chosen: the Inbox and the like keep theirs.
+    for role in CHOOSABLE_ROLES {
+        conn.execute(
+            "UPDATE folders SET role = detected_role
+             WHERE account_id = ?1 AND (role = ?2 OR detected_role = ?2)
+               AND role IS NOT detected_role",
+            params![account_id, role],
+        )?;
+    }
+    for (role, path) in chosen {
+        if !CHOOSABLE_ROLES.contains(&role.as_str()) {
+            continue;
+        }
+        // The Inbox keeps its own role.
+        let present: bool = conn.query_row(
+            "SELECT EXISTS (SELECT 1 FROM folders WHERE account_id = ?1 AND path = ?2
+                              AND selectable = 1 AND missing_on_server = 0
+                              AND upper(path) <> 'INBOX')",
+            params![account_id, path],
+            |row| row.get(0),
+        )?;
+        if !present {
+            continue;
+        }
+        conn.execute(
+            "UPDATE folders SET role = NULL WHERE account_id = ?1 AND role = ?2 AND path <> ?3",
+            params![account_id, role, path],
+        )?;
+        conn.execute(
+            "UPDATE folders SET role = ?2 WHERE account_id = ?1 AND path = ?3",
+            params![account_id, role, path],
+        )?;
+    }
+    Ok(())
+}
+
+/// The role the server suggests for each of an account's folders, by id.
+pub fn detected_roles(conn: &Connection, account_id: i64) -> Result<HashMap<i64, String>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, detected_role FROM folders
+         WHERE account_id = ?1 AND detected_role IS NOT NULL",
+    )?;
+    Ok(stmt
+        .query_map([account_id], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<rusqlite::Result<HashMap<_, _>>>()?)
+}
+
+/// The account's folder for a purpose, among those `list` shows.
+pub fn by_role(conn: &Connection, account_id: i64, role: &str) -> Result<Option<Folder>> {
+    let mut stmt = conn.prepare(
+        "SELECT f.id AS id, f.account_id AS account_id, f.parent_id AS parent_id,
+                f.path AS path, f.delimiter AS delimiter, f.role AS role,
+                f.uidvalidity AS uidvalidity, f.uidnext AS uidnext,
+                f.highestmodseq AS highestmodseq, f.last_seen_uid AS last_seen_uid,
+                f.backfill_cursor AS backfill_cursor, f.backfill_done AS backfill_done,
+                f.jmap_id AS jmap_id, f.selectable AS selectable,
+                f.can_create_children AS can_create_children,
+                f.can_rename AS can_rename, f.can_delete AS can_delete
+         FROM folders f
+         JOIN accounts a ON a.id = f.account_id
+         WHERE f.account_id = ?1 AND f.role = ?2 AND f.selectable = 1
+           AND f.missing_on_server = 0
+           AND (a.mail_protocol = 'jmap') = (f.jmap_id IS NOT NULL)
+         ORDER BY f.id
+         LIMIT 1",
+    )?;
+    Ok(stmt
+        .query_row(params![account_id, role], from_row)
+        .optional()?)
+}
+
+pub fn by_jmap_role(conn: &Connection, account_id: i64, role: &str) -> Result<Option<Folder>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, account_id, parent_id, path, delimiter, role, uidvalidity, uidnext,
+                highestmodseq, last_seen_uid, backfill_cursor, backfill_done, jmap_id, selectable,
+                can_create_children, can_rename, can_delete
+         FROM folders
+         WHERE account_id=?1 AND role=?2 AND jmap_id IS NOT NULL AND selectable = 1
+         LIMIT 1",
+    )?;
+    Ok(stmt
+        .query_row(params![account_id, role], from_row)
+        .optional()?)
+}
+
+pub fn by_jmap_id(conn: &Connection, account_id: i64, jmap_id: &str) -> Result<Option<Folder>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, account_id, parent_id, path, delimiter, role, uidvalidity, uidnext,
+                highestmodseq, last_seen_uid, backfill_cursor, backfill_done, jmap_id, selectable,
+                can_create_children, can_rename, can_delete
+         FROM folders WHERE account_id = ?1 AND jmap_id = ?2 LIMIT 1",
+    )?;
+    Ok(stmt
+        .query_row(params![account_id, jmap_id], from_row)
+        .optional()?)
+}
+
+pub fn set_parent(conn: &Connection, folder_id: i64, parent_id: Option<i64>) -> Result<()> {
+    conn.execute(
+        "UPDATE folders SET parent_id = ?2 WHERE id = ?1",
+        params![folder_id, parent_id],
+    )?;
+    Ok(())
+}
+
+pub fn set_permissions(
+    conn: &Connection,
+    folder_id: i64,
+    permissions: FolderPermissions,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE folders
+         SET can_create_children=?2, can_rename=?3, can_delete=?4
+         WHERE id=?1",
+        params![
+            folder_id,
+            permissions.can_create_children,
+            permissions.can_rename,
+            permissions.can_delete,
+        ],
+    )?;
+    Ok(())
+}
+
+pub fn upsert_jmap(
+    conn: &Connection,
+    account_id: i64,
+    jmap_id: &str,
+    name: &str,
+    role: Option<&str>,
+) -> Result<i64> {
+    if let Some(folder) = by_jmap_id(conn, account_id, jmap_id)? {
+        if let Some(conflict_id) = conn
+            .query_row(
+                "SELECT id FROM folders
+                 WHERE account_id=?1 AND path=?2 AND id<>?3 AND jmap_id IS NULL",
+                params![account_id, name, folder.id],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+        {
+            conn.execute(
+                "UPDATE folders SET path = path || ' [removed ' || id || ']'
+                 WHERE id=?1",
+                params![conflict_id],
+            )?;
+        }
+        let name = unique_jmap_name(conn, account_id, name, jmap_id, Some(folder.id))?;
+        conn.execute(
+            "UPDATE folders
+             SET path=?2, role=?3, selectable=1,
+                 can_create_children=0, can_rename=0, can_delete=0
+             WHERE id=?1",
+            params![folder.id, name, role],
+        )?;
+        return Ok(folder.id);
+    }
+    let name = unique_jmap_name(conn, account_id, name, jmap_id, None)?;
+    conn.execute(
+        "INSERT INTO folders (account_id, path, delimiter, role, jmap_id,
+                              backfill_done, can_create_children, can_rename, can_delete)
+         VALUES (?1, ?2, '/', ?3, ?4, 1, 0, 0, 0)
+         ON CONFLICT(account_id, path) DO UPDATE SET
+           role = excluded.role, jmap_id = excluded.jmap_id,
+           backfill_done = 1, selectable = 1,
+           can_create_children = 0, can_rename = 0, can_delete = 0",
+        params![account_id, name, role, jmap_id],
+    )?;
+    Ok(conn.query_row(
+        "SELECT id FROM folders WHERE account_id = ?1 AND jmap_id = ?2",
+        params![account_id, jmap_id],
+        |row| row.get(0),
+    )?)
+}
+
+/// Drops the folders of a JMAP account that no server mailbox stands for,
+/// left by an earlier server or protocol, once nothing is in them. Mail that
+/// stays there, such as the account's drafts and the sent mail only this
+/// device holds, first moves to the account's folder for the same purpose.
+/// Returns the threads of mail that moved.
+pub fn drop_jmap_leftovers(conn: &Connection, account_id: i64) -> Result<Vec<i64>> {
+    let moved = super::messages::rehome_mail(conn, account_id, "f.jmap_id IS NULL")?;
+    conn.execute(
+        "DELETE FROM folders WHERE account_id = ?1 AND jmap_id IS NULL
+           AND NOT EXISTS (SELECT 1 FROM messages WHERE messages.folder_id = folders.id)",
+        params![account_id],
+    )?;
+    Ok(moved)
+}
+
+fn unique_jmap_name(
+    conn: &Connection,
+    account_id: i64,
+    proposed: &str,
+    jmap_id: &str,
+    exclude_id: Option<i64>,
+) -> Result<String> {
+    let conflict: Option<Option<String>> = conn
+        .query_row(
+            "SELECT jmap_id FROM folders
+             WHERE account_id=?1 AND path=?2 AND (?3 IS NULL OR id<>?3)",
+            params![account_id, proposed, exclude_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if conflict.is_none() || conflict == Some(None) {
+        return Ok(proposed.to_owned());
+    }
+    let short_id = jmap_id.chars().take(8).collect::<String>();
+    let base = format!("{proposed} [{short_id}]");
+    let mut candidate = base.clone();
+    let mut suffix = 2;
+    while conn
+        .query_row(
+            "SELECT 1 FROM folders
+             WHERE account_id=?1 AND path=?2 AND (?3 IS NULL OR id<>?3)",
+            params![account_id, candidate, exclude_id],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some()
+    {
+        candidate = format!("{base} {suffix}");
+        suffix += 1;
+    }
+    Ok(candidate)
+}
+
+pub fn set_uid_state(
+    conn: &Connection,
+    id: i64,
+    uidvalidity: Option<i64>,
+    uidnext: Option<i64>,
+    highestmodseq: Option<i64>,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE folders SET uidvalidity = ?2, uidnext = ?3, highestmodseq = ?4 WHERE id = ?1",
+        params![id, uidvalidity, uidnext, highestmodseq],
+    )?;
+    Ok(())
+}
+
+/// Marks the folders of an IMAP account that the server no longer lists,
+/// except INBOX, which always exists. Their mail waits to be matched by
+/// Message-ID with a copy elsewhere on the server, such as under the folder's
+/// new name. Actions queued for it can no longer run, except sending and
+/// filing what was sent, which don't need the folder, and headers that failed
+/// in it can't be fetched again.
+pub fn mark_missing_on_server(
+    conn: &Connection,
+    account_id: i64,
+    listed: &HashSet<String>,
+) -> Result<()> {
+    let mut stmt = conn.prepare(
+        "SELECT id, path FROM folders
+         WHERE account_id = ?1 AND jmap_id IS NULL AND missing_on_server = 0",
+    )?;
+    let missing = stmt
+        .query_map(params![account_id], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?
+        .into_iter()
+        .filter(|(_, path)| !listed.contains(path) && !path.eq_ignore_ascii_case("INBOX"))
+        .map(|(id, _)| id)
+        .collect::<Vec<_>>();
+    drop(stmt);
+    for folder_id in missing {
+        conn.execute(
+            "UPDATE pending_actions SET state = 'cancelled', finished_at = ?2,
+               last_error = 'the folder is no longer on the server'
+             WHERE state IN ('pending', 'inflight')
+               AND kind NOT IN ('send', 'append_sent')
+               AND message_id IN (SELECT id FROM messages WHERE folder_id = ?1)",
+            params![folder_id, now_ms()],
+        )?;
+        super::messages::await_relink(conn, account_id, Some(folder_id))?;
+        conn.execute(
+            "DELETE FROM sync_failures WHERE folder_id = ?1",
+            params![folder_id],
+        )?;
+        conn.execute(
+            "UPDATE folders SET missing_on_server = 1, uidvalidity = NULL, uidnext = NULL,
+                    highestmodseq = NULL, last_seen_uid = 0, backfill_cursor = NULL,
+                    backfill_done = 0, server_only_unseen = NULL
+             WHERE id = ?1",
+            params![folder_id],
+        )?;
+    }
+    Ok(())
+}
+
+pub fn set_last_seen_uid(conn: &Connection, id: i64, uid: i64) -> Result<()> {
+    conn.execute(
+        "UPDATE folders SET last_seen_uid = MAX(last_seen_uid, ?2) WHERE id = ?1",
+        params![id, uid],
+    )?;
+    Ok(())
+}
+
+/// Let the sync fetch again the messages above `uid`, such as those
+/// uploaded to the folder before its first sync, which would otherwise count
+/// as history and could fall outside the account's history window.
+pub fn lower_last_seen_uid(conn: &Connection, id: i64, uid: i64) -> Result<()> {
+    conn.execute(
+        "UPDATE folders SET last_seen_uid = MIN(last_seen_uid, ?2) WHERE id = ?1",
+        params![id, uid],
+    )?;
+    Ok(())
+}
+
+/// Records how far the folder's history has downloaded. Once all of it has,
+/// the server's last unread count tells what is only on the server; returns
+/// whether that changed.
+pub fn set_backfill(conn: &Connection, id: i64, cursor: Option<i64>, done: bool) -> Result<bool> {
+    changes_server_only(conn, id, || {
+        conn.execute(
+            &format!(
+                "UPDATE folders SET backfill_cursor = :cursor, backfill_done = :done,
+                   server_only_unseen = CASE WHEN backfill_done AND :done THEN server_only_unseen
+                     ELSE {} END
+                 WHERE id = :id",
+                server_only_unseen_sql("server_unseen", ":done")
+            ),
+            named_params! { ":id": id, ":cursor": cursor, ":done": done },
+        )
+    })
+}
+
+/// Re-open historical work after an account's download window changes. Keep
+/// the cursor so widening to All can continue below the oldest known UID.
+pub fn reopen_backfill_for_account(conn: &Connection, account_id: i64) -> Result<()> {
+    conn.execute(
+        "UPDATE folders SET backfill_done = 0 WHERE account_id = ?1",
+        params![account_id],
+    )?;
+    Ok(())
+}
+
+/// Forgets what an account's folders had only on the server, as a new mail
+/// history makes it count other mail; returns whether any had a count.
+pub fn forget_server_only_unseen(conn: &Connection, account_id: i64) -> Result<bool> {
+    Ok(conn.execute(
+        "UPDATE folders SET server_only_unseen = NULL
+         WHERE account_id = ?1 AND server_only_unseen IS NOT NULL",
+        params![account_id],
+    )? > 0)
+}
+
+/// UIDVALIDITY changed: drop all UID mappings for the folder. Its mail waits
+/// to be re-linked by Message-ID, and headers that failed under the old UIDs
+/// are no longer worth retrying.
+pub fn reset_uid_mappings(conn: &Connection, id: i64) -> Result<()> {
+    let account_id: i64 = conn.query_row(
+        "SELECT account_id FROM folders WHERE id = ?1",
+        params![id],
+        |row| row.get(0),
+    )?;
+    super::messages::await_relink(conn, account_id, Some(id))?;
+    conn.execute(
+        "DELETE FROM sync_failures WHERE folder_id = ?1 AND stage = 'header'",
+        params![id],
+    )?;
+    conn.execute(
+        "UPDATE folders SET last_seen_uid = 0, uidnext = NULL, highestmodseq = NULL,
+                            backfill_cursor = NULL, backfill_done = 0,
+                            server_messages = NULL, server_unseen = NULL,
+                            server_only_unseen = NULL
+         WHERE id = ?1",
+        params![id],
+    )?;
+    Ok(())
+}
+
+/// What an IMAP server last reported for a folder, as STATUS reports it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ServerStatus {
+    pub uidvalidity: Option<i64>,
+    pub uidnext: Option<i64>,
+    pub messages: Option<i64>,
+    pub unseen: Option<i64>,
+}
+
+/// The last reported status of each of an account's folders, by folder id.
+pub fn server_statuses(conn: &Connection, account_id: i64) -> Result<HashMap<i64, ServerStatus>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, uidvalidity, uidnext, server_messages, server_unseen
+         FROM folders WHERE account_id = ?1",
+    )?;
+    let rows = stmt.query_map(params![account_id], |row| {
+        Ok((
+            row.get(0)?,
+            ServerStatus {
+                uidvalidity: row.get(1)?,
+                uidnext: row.get(2)?,
+                messages: row.get(3)?,
+                unseen: row.get(4)?,
+            },
+        ))
+    })?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
+/// Records the counts the server reported for a folder once a sync has
+/// caught up with them, and how many of its unread messages are kept only
+/// there; returns whether that changed. UIDNEXT and UIDVALIDITY come from
+/// the folder's SELECT, which `set_uid_state` records.
+pub fn set_server_counts(
+    conn: &Connection,
+    id: i64,
+    messages: Option<i64>,
+    unseen: Option<i64>,
+) -> Result<bool> {
+    changes_server_only(conn, id, || {
+        conn.execute(
+            &format!(
+                "UPDATE folders SET server_messages = :messages, server_unseen = :unseen,
+                   server_only_unseen = {}
+                 WHERE id = :id",
+                server_only_unseen_sql(":unseen", "backfill_done")
+            ),
+            named_params! { ":id": id, ":messages": messages, ":unseen": unseen },
+        )
+    })
+}
+
+/// Records how many unread messages a JMAP mailbox or the Gmail Inbox holds
+/// on the server, read once the account's sync has caught up with all of
+/// its mail history; returns whether what is only there changed.
+pub fn set_server_unseen(conn: &Connection, id: i64, unseen: i64) -> Result<bool> {
+    changes_server_only(conn, id, || {
+        conn.execute(
+            &format!(
+                "UPDATE folders SET server_unseen = :unseen, server_only_unseen = {}
+                 WHERE id = :id",
+                server_only_unseen_sql(":unseen", "1")
+            ),
+            named_params! { ":id": id, ":unseen": unseen },
+        )
+    })
+}
+
+/// Runs `update` on folder `id` and tells whether it changed how many of
+/// the folder's unread messages are only on the server.
+fn changes_server_only(
+    conn: &Connection,
+    id: i64,
+    update: impl FnOnce() -> rusqlite::Result<usize>,
+) -> Result<bool> {
+    let read = || {
+        conn.query_row(
+            "SELECT server_only_unseen FROM folders WHERE id = ?1",
+            params![id],
+            |row| row.get::<_, Option<i64>>(0),
+        )
+        .optional()
+        .map(Option::flatten)
+    };
+    let before = read()?;
+    update()?;
+    Ok(read()? != before)
+}
+
+/// The folder's unread messages that are only on the server: the server's
+/// unread count `unseen` less those kept here, the folder's own and those
+/// also filed in it. Unknown until `history_complete`, as mail on its way
+/// here would count. While an action that changes counts is on its way to
+/// the server, the two sides disagree about it, so the last value stays:
+/// mail read here and there alike leaves the difference as it was.
+fn server_only_unseen_sql(unseen: &str, history_complete: &str) -> String {
+    // Two counts, each on an index of the folder's own mail: one over every
+    // unread message of the account would be read again for each folder.
+    format!(
+        "CASE WHEN NOT ({history_complete}) THEN NULL
+              WHEN {} THEN server_only_unseen
+              ELSE MAX(0, {unseen}
+                - (SELECT COUNT(*) FROM messages m
+                   WHERE m.account_id = folders.account_id AND m.folder_id = folders.id
+                     AND m.is_read = 0 AND m.is_draft = 0)
+                - (SELECT COUNT(*) FROM message_folders mf
+                   JOIN messages m ON m.id = mf.message_id
+                   WHERE mf.folder_id = folders.id AND m.folder_id <> folders.id
+                     AND m.is_read = 0 AND m.is_draft = 0)) END",
+        super::actions::counts_settling_sql("folders.account_id")
+    )
+}
+
+/// Unread messages of these folders that are only on the server, as the
+/// last sync that caught up with each found them; `None` where no sync
+/// could tell.
+pub fn server_only_unseen(conn: &Connection, ids: &[i64]) -> Result<Option<i64>> {
+    let mut stmt = conn.prepare_cached("SELECT server_only_unseen FROM folders WHERE id = ?1")?;
+    let mut total = None;
+    for id in ids {
+        if let Some(count) = stmt
+            .query_row(params![id], |row| row.get::<_, Option<i64>>(0))
+            .optional()?
+            .flatten()
+        {
+            total = Some(total.unwrap_or(0) + count);
+        }
+    }
+    Ok(total)
+}
+
+/// Records that the user moved mail into a folder at `at` (ms).
+pub fn mark_moved_to(conn: &Connection, id: i64, at: i64) -> Result<()> {
+    conn.execute(
+        "UPDATE folders SET moved_to_at = ?2 WHERE id = ?1",
+        params![id, at],
+    )?;
+    Ok(())
+}
+
+/// The folders the user moved or copied mail into most recently, of every
+/// account, newest first.
+pub fn recently_moved_to(conn: &Connection, limit: usize) -> Result<Vec<i64>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT id FROM folders
+         WHERE moved_to_at IS NOT NULL
+         ORDER BY moved_to_at DESC, id DESC LIMIT ?1",
+    )?;
+    let ids = stmt
+        .query_map(params![i64::try_from(limit).unwrap_or(i64::MAX)], |row| {
+            row.get(0)
+        })?
+        .collect::<rusqlite::Result<Vec<i64>>>()?;
+    Ok(ids)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::testutil;
+
+    #[test]
+    fn folder_listing_exposes_only_the_active_transport_projection() {
+        let conn = testutil::conn();
+        testutil::seed_account(&conn);
+        conn.execute(
+            "INSERT INTO folders(id,account_id,path,role,jmap_id,backfill_done)
+             VALUES(2,1,'JMAP Inbox','inbox','remote-inbox',1)",
+            [],
+        )
+        .unwrap();
+
+        assert_eq!(
+            list(&conn, Some(1))
+                .unwrap()
+                .into_iter()
+                .map(|folder| folder.id)
+                .collect::<Vec<_>>(),
+            vec![1]
+        );
+        conn.execute("UPDATE accounts SET mail_protocol='jmap' WHERE id=1", [])
+            .unwrap();
+        assert_eq!(
+            list(&conn, Some(1))
+                .unwrap()
+                .into_iter()
+                .map(|folder| folder.id)
+                .collect::<Vec<_>>(),
+            vec![2]
+        );
+    }
+
+    #[test]
+    fn unread_mail_only_on_the_server_is_what_this_device_does_not_keep() {
+        let conn = testutil::conn();
+        testutil::seed_account(&conn);
+        conn.execute(
+            "INSERT INTO folders (id, account_id, path, backfill_done) VALUES (2, 1, 'Projects', 1)",
+            [],
+        )
+        .unwrap();
+        set_backfill(&conn, 1, Some(1), true).unwrap();
+        // Two unread messages kept in the Inbox, one read, and one unread
+        // filed in Projects as well (a JMAP or Gmail message in two).
+        let unread: Vec<i64> = (0..3)
+            .map(|index| testutil::seed_message(&conn, "a@test.dev", &format!("m{index}"), false).1)
+            .collect();
+        conn.execute("UPDATE messages SET is_read = 1 WHERE id = ?1", [unread[2]])
+            .unwrap();
+        conn.execute(
+            "INSERT INTO message_folders (message_id, folder_id) VALUES (?1, 2)",
+            [unread[0]],
+        )
+        .unwrap();
+
+        set_server_counts(&conn, 1, Some(40), Some(5)).unwrap();
+        set_server_counts(&conn, 2, Some(9), Some(3)).unwrap();
+        assert_eq!(server_only_unseen(&conn, &[1]).unwrap(), Some(3));
+        assert_eq!(server_only_unseen(&conn, &[2]).unwrap(), Some(2));
+        assert_eq!(server_only_unseen(&conn, &[1, 2]).unwrap(), Some(5));
+
+        // Mail read here first counts as kept, not missing.
+        set_server_counts(&conn, 1, Some(40), Some(1)).unwrap();
+        assert_eq!(server_only_unseen(&conn, &[1]).unwrap(), Some(0));
+        // A server that gave no count tells nothing.
+        set_server_counts(&conn, 2, Some(9), None).unwrap();
+        assert_eq!(server_only_unseen(&conn, &[2]).unwrap(), None);
+        assert_eq!(server_only_unseen(&conn, &[1, 2]).unwrap(), Some(0));
+    }
+
+    #[test]
+    fn unread_mail_only_on_the_server_waits_for_the_history_and_for_actions() {
+        let conn = testutil::conn();
+        testutil::seed_account(&conn);
+        let (_, kept) = testutil::seed_message(&conn, "a@test.dev", "Kept", false);
+        let pending = |kind: &str| {
+            conn.execute(
+                "INSERT INTO pending_actions (account_id, kind, message_id, created_at)
+                 VALUES (1, ?1, ?2, 0)",
+                params![kind, kept],
+            )
+            .unwrap();
+        };
+
+        // While the history downloads, its unread mail is on its way here.
+        set_backfill(&conn, 1, Some(40), false).unwrap();
+        set_server_counts(&conn, 1, Some(40), Some(5)).unwrap();
+        assert_eq!(server_only_unseen(&conn, &[1]).unwrap(), None);
+        // Once it is here, the server's last count tells.
+        set_backfill(&conn, 1, Some(1), true).unwrap();
+        assert_eq!(server_only_unseen(&conn, &[1]).unwrap(), Some(4));
+        set_backfill(&conn, 1, Some(1), true).unwrap();
+        assert_eq!(server_only_unseen(&conn, &[1]).unwrap(), Some(4));
+
+        // Read here, with the server not told yet: it still counts it.
+        conn.execute("UPDATE messages SET is_read = 1", []).unwrap();
+        pending("mark_read");
+        set_server_counts(&conn, 1, Some(40), Some(5)).unwrap();
+        assert_eq!(server_only_unseen(&conn, &[1]).unwrap(), Some(4));
+        // Told.
+        conn.execute("UPDATE pending_actions SET state = 'done'", [])
+            .unwrap();
+        set_server_counts(&conn, 1, Some(40), Some(4)).unwrap();
+        assert_eq!(server_only_unseen(&conn, &[1]).unwrap(), Some(4));
+        // Sending changes no folder's unread mail.
+        pending("send");
+        set_server_counts(&conn, 1, Some(40), Some(3)).unwrap();
+        assert_eq!(server_only_unseen(&conn, &[1]).unwrap(), Some(3));
+
+        // Another mail history counts other mail.
+        forget_server_only_unseen(&conn, 1).unwrap();
+        assert_eq!(server_only_unseen(&conn, &[1]).unwrap(), None);
+        // Downloading it again forgets it too.
+        set_server_counts(&conn, 1, Some(40), Some(3)).unwrap();
+        set_backfill(&conn, 1, Some(40), false).unwrap();
+        assert_eq!(server_only_unseen(&conn, &[1]).unwrap(), None);
+    }
+
+    #[test]
+    fn recent_move_targets_are_newest_first() {
+        let conn = testutil::conn();
+        testutil::seed_account(&conn);
+        conn.execute(
+            "INSERT INTO accounts (id, email, provider, auth_kind, username,
+             incoming_host, incoming_port, smtp_host, smtp_port, created_at, mail_protocol, settings_json)
+             VALUES (2,'other@test.dev','generic','password','other','h',993,'h',587,0,'imap','{\"connection\":{\"incomingSecurity\":\"tls\",\"smtpSecurity\":\"tls\"}}')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO folders (id, account_id, path) VALUES
+               (2, 1, 'Receipts'), (3, 1, 'Travel'), (4, 1, 'Never'), (5, 2, 'Other')",
+            [],
+        )
+        .unwrap();
+        for (folder, at) in [(2, 10), (3, 30), (5, 40)] {
+            mark_moved_to(&conn, folder, at).unwrap();
+        }
+
+        assert_eq!(recently_moved_to(&conn, 5).unwrap(), [5, 3, 2]);
+        assert_eq!(recently_moved_to(&conn, 1).unwrap(), [5]);
+        mark_moved_to(&conn, 2, 50).unwrap();
+        assert_eq!(recently_moved_to(&conn, 5).unwrap(), [2, 5, 3]);
+    }
+
+    #[test]
+    fn imap_upsert_reclaims_a_same_name_folder_from_jmap() {
+        let conn = testutil::conn();
+        testutil::seed_account(&conn);
+        conn.execute("UPDATE folders SET jmap_id='remote-inbox' WHERE id=1", [])
+            .unwrap();
+        assert_eq!(
+            upsert(&conn, 1, "INBOX", Some("/"), Some("inbox")).unwrap(),
+            1
+        );
+        assert!(get(&conn, 1).unwrap().unwrap().jmap_id.is_none());
+    }
+
+    #[test]
+    fn hierarchy_containers_are_listed_but_not_role_destinations() {
+        let conn = testutil::conn();
+        testutil::seed_account(&conn);
+        let archive = upsert_discovered(
+            &conn,
+            1,
+            "Archive",
+            Some("/"),
+            Some("archive"),
+            false,
+            FolderPermissions::FULL,
+        )
+        .unwrap();
+        let year = upsert_discovered(
+            &conn,
+            1,
+            "Archive/2025",
+            Some("/"),
+            None,
+            false,
+            FolderPermissions::FULL,
+        )
+        .unwrap();
+        let leaf = upsert_discovered(
+            &conn,
+            1,
+            "Archive/2025/GitHub",
+            Some("/"),
+            None,
+            true,
+            FolderPermissions::FULL,
+        )
+        .unwrap();
+        set_parent(&conn, year, Some(archive)).unwrap();
+        set_parent(&conn, leaf, Some(year)).unwrap();
+
+        let listed = list_info(&conn, Some(1)).unwrap();
+        let year_info = listed.iter().find(|folder| folder.id == year).unwrap();
+        let leaf_info = listed.iter().find(|folder| folder.id == leaf).unwrap();
+        assert!(!year_info.selectable);
+        assert!(year_info.can_create_children);
+        assert_eq!(year_info.parent_id, Some(archive));
+        assert!(leaf_info.selectable);
+        assert_eq!(leaf_info.parent_id, Some(year));
+        assert!(by_role(&conn, 1, "archive").unwrap().is_none());
+    }
+
+    #[test]
+    fn explicit_jmap_parent_is_exposed_to_the_sidebar_projection() {
+        let conn = testutil::conn();
+        testutil::seed_account(&conn);
+        conn.execute("UPDATE accounts SET mail_protocol='jmap' WHERE id=1", [])
+            .unwrap();
+        let parent = upsert_jmap(&conn, 1, "parent", "Archive", Some("archive")).unwrap();
+        let child = upsert_jmap(&conn, 1, "child", "Archive / 2025", None).unwrap();
+        set_parent(&conn, child, Some(parent)).unwrap();
+
+        let listed = list_info(&conn, Some(1)).unwrap();
+        let child = listed.iter().find(|folder| folder.id == child).unwrap();
+        assert_eq!(child.parent_id, Some(parent));
+        assert!(!child.can_create_children);
+        assert!(!child.can_rename);
+        assert!(!child.can_delete);
+    }
+
+    #[test]
+    fn distinct_jmap_mailboxes_with_the_same_display_path_are_not_merged() {
+        let conn = testutil::conn();
+        testutil::seed_account(&conn);
+        let first = upsert_jmap(&conn, 1, "remote-one", "Projects / Release", None).unwrap();
+        let second = upsert_jmap(&conn, 1, "remote-two", "Projects / Release", None).unwrap();
+        assert_ne!(first, second);
+        assert_eq!(
+            by_jmap_id(&conn, 1, "remote-one").unwrap().unwrap().id,
+            first
+        );
+        assert_eq!(
+            by_jmap_id(&conn, 1, "remote-two").unwrap().unwrap().id,
+            second
+        );
+        assert_ne!(
+            get(&conn, first).unwrap().unwrap().path,
+            get(&conn, second).unwrap().unwrap().path
+        );
+    }
+
+    #[test]
+    fn folder_info_decodes_imap_names_but_keeps_jmap_unicode_verbatim() {
+        let conn = testutil::conn();
+        testutil::seed_account(&conn);
+        let imap = upsert(&conn, 1, "&Jjo- Projects", Some("/"), None).unwrap();
+        let jmap = upsert_jmap(&conn, 1, "remote", "A&-B", None).unwrap();
+
+        let all = list_info(&conn, Some(1)).unwrap();
+        assert_eq!(
+            all.iter()
+                .find(|folder| folder.id == imap)
+                .unwrap()
+                .display_name,
+            "☺ Projects"
+        );
+        conn.execute("UPDATE accounts SET mail_protocol='jmap' WHERE id=1", [])
+            .unwrap();
+        let all = list_info(&conn, Some(1)).unwrap();
+        assert_eq!(
+            all.iter()
+                .find(|folder| folder.id == jmap)
+                .unwrap()
+                .display_name,
+            "A&-B"
+        );
+    }
+
+    #[test]
+    fn renaming_a_folder_updates_its_descendant_paths() {
+        let conn = testutil::conn();
+        testutil::seed_account(&conn);
+        let parent = upsert(&conn, 1, "Projects", Some("/"), None).unwrap();
+        let child = upsert(&conn, 1, "Projects/2026", Some("/"), None).unwrap();
+
+        rename_tree(&conn, 1, "Projects", "Work", "/").unwrap();
+
+        assert_eq!(get(&conn, parent).unwrap().unwrap().path, "Work");
+        assert_eq!(get(&conn, child).unwrap().unwrap().path, "Work/2026");
+    }
+
+    fn relink_pending(conn: &Connection, id: i64) -> bool {
+        conn.query_row(
+            "SELECT relink_pending FROM messages WHERE id = ?1",
+            params![id],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    fn header_failures(conn: &Connection, folder_id: i64) -> i64 {
+        conn.query_row(
+            "SELECT COUNT(*) FROM sync_failures WHERE folder_id = ?1",
+            params![folder_id],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn folders_the_server_stops_listing_hide_until_it_lists_them_again() {
+        let conn = testutil::conn();
+        testutil::seed_account(&conn);
+        let projects = upsert(&conn, 1, "Projects", Some("/"), None).unwrap();
+        set_uid_state(&conn, projects, Some(5), Some(10), None).unwrap();
+        set_last_seen_uid(&conn, projects, 9).unwrap();
+        set_backfill(&conn, projects, Some(1), true).unwrap();
+        let notes = upsert_jmap(&conn, 1, "notes", "Notes", None).unwrap();
+        let (_, received) = testutil::seed_message(&conn, "sender@example.com", "Plan", false);
+        let (thread_id, sent) = testutil::seed_message(&conn, "me@test.dev", "Re: Plan", false);
+        conn.execute(
+            "UPDATE messages SET folder_id = ?1 WHERE id IN (?2, ?3)",
+            params![projects, received, sent],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE messages SET uid = NULL, is_outgoing = 1 WHERE id = ?1",
+            params![sent],
+        )
+        .unwrap();
+        let actions = [("star", received), ("append_sent", sent)].map(|(kind, id)| {
+            crate::db::repo::actions::enqueue(
+                &conn,
+                1,
+                kind,
+                Some(id),
+                Some(thread_id),
+                &serde_json::json!({}),
+                None,
+            )
+            .unwrap()
+        });
+        crate::db::repo::sync_failures::record_header(&conn, projects, 11, None, "bad header")
+            .unwrap();
+
+        // The server spells INBOX its own way, and JMAP folders aren't IMAP's.
+        let listed = HashSet::from(["Inbox".to_owned()]);
+        mark_missing_on_server(&conn, 1, &listed).unwrap();
+        assert_eq!(
+            list(&conn, Some(1))
+                .unwrap()
+                .into_iter()
+                .map(|folder| folder.id)
+                .collect::<Vec<_>>(),
+            [1]
+        );
+        let folder = get(&conn, projects).unwrap().unwrap();
+        assert_eq!(
+            (
+                folder.uidvalidity,
+                folder.last_seen_uid,
+                folder.backfill_cursor
+            ),
+            (None, 0, None)
+        );
+        assert!(!folder.backfill_done);
+        assert!(get(&conn, notes).unwrap().is_some());
+        let missing = |id: i64| {
+            conn.query_row(
+                "SELECT missing_on_server FROM folders WHERE id = ?1",
+                params![id],
+                |row| row.get::<_, bool>(0),
+            )
+            .unwrap()
+        };
+        assert!(missing(projects));
+        assert!(!missing(notes));
+        assert!(!missing(1));
+        assert!(relink_pending(&conn, received));
+        assert_eq!(
+            crate::db::repo::messages::get_row(&conn, received)
+                .unwrap()
+                .unwrap()
+                .uid,
+            None
+        );
+        // Only this device holds the reply.
+        assert!(!relink_pending(&conn, sent));
+        let states = actions.map(|id| {
+            crate::db::repo::actions::get(&conn, id)
+                .unwrap()
+                .unwrap()
+                .state
+        });
+        assert_eq!(states, ["cancelled", "pending"]);
+        assert_eq!(header_failures(&conn, projects), 0);
+
+        upsert_discovered(
+            &conn,
+            1,
+            "Projects",
+            Some("/"),
+            None,
+            true,
+            FolderPermissions::FULL,
+        )
+        .unwrap();
+        assert!(!missing(projects));
+        assert_eq!(list(&conn, Some(1)).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn a_role_is_looked_up_among_the_folders_the_account_shows() {
+        let conn = testutil::conn();
+        testutil::seed_account(&conn);
+        upsert_jmap(&conn, 1, "sent-mailbox", "Sent", Some("sent")).unwrap();
+        let old = upsert(&conn, 1, "Sent Messages", Some("/"), Some("sent")).unwrap();
+        conn.execute(
+            "UPDATE folders SET missing_on_server = 1 WHERE id = ?1",
+            params![old],
+        )
+        .unwrap();
+        let current = upsert(&conn, 1, "Sent Items", Some("/"), Some("sent")).unwrap();
+        assert_eq!(by_role(&conn, 1, "sent").unwrap().unwrap().id, current);
+
+        conn.execute(
+            "UPDATE accounts SET mail_protocol = 'jmap' WHERE id = 1",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            by_role(&conn, 1, "sent")
+                .unwrap()
+                .unwrap()
+                .jmap_id
+                .as_deref(),
+            Some("sent-mailbox")
+        );
+    }
+
+    fn chosen(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(role, path)| ((*role).to_owned(), (*path).to_owned()))
+            .collect()
+    }
+
+    fn role_of(conn: &Connection, id: i64) -> Option<String> {
+        get(conn, id).unwrap().unwrap().role
+    }
+
+    /// A folder chosen for a role takes it from the one the server suggests,
+    /// and keeps it each time the folder list is read again (#252).
+    #[test]
+    fn a_folder_chosen_for_a_role_takes_it_from_the_suggested_one() {
+        let conn = testutil::conn();
+        testutil::seed_account(&conn);
+        let sent = upsert(&conn, 1, "Sent", Some("/"), Some(roles::SENT)).unwrap();
+        let sent_items = upsert(&conn, 1, "Sent Items", Some("/"), None).unwrap();
+        let trash = upsert(&conn, 1, "Trash", Some("/"), Some(roles::TRASH)).unwrap();
+        let choice = chosen(&[(roles::SENT, "Sent Items")]);
+
+        apply_chosen_roles(&conn, 1, &choice).unwrap();
+        assert_eq!(
+            by_role(&conn, 1, roles::SENT).unwrap().unwrap().id,
+            sent_items
+        );
+        assert_eq!(role_of(&conn, sent), None);
+        assert_eq!(by_role(&conn, 1, roles::TRASH).unwrap().unwrap().id, trash);
+        assert_eq!(by_role(&conn, 1, roles::INBOX).unwrap().unwrap().id, 1);
+        assert_eq!(
+            detected_roles(&conn, 1)
+                .unwrap()
+                .get(&sent)
+                .map(String::as_str),
+            Some(roles::SENT)
+        );
+
+        // Reading the folder list gives the server's roles back, and the
+        // choice wins again.
+        upsert_discovered(
+            &conn,
+            1,
+            "Sent",
+            Some("/"),
+            Some(roles::SENT),
+            true,
+            FolderPermissions::FULL,
+        )
+        .unwrap();
+        apply_chosen_roles(&conn, 1, &choice).unwrap();
+        assert_eq!(
+            by_role(&conn, 1, roles::SENT).unwrap().unwrap().id,
+            sent_items
+        );
+        assert_eq!(role_of(&conn, sent), None);
+
+        // Without the choice the suggested folder has the role again.
+        apply_chosen_roles(&conn, 1, &BTreeMap::new()).unwrap();
+        assert_eq!(by_role(&conn, 1, roles::SENT).unwrap().unwrap().id, sent);
+        assert_eq!(role_of(&conn, sent_items), None);
+    }
+
+    /// A folder holds one role: chosen for another, it leaves the role the
+    /// server suggested it for without a folder until one is chosen.
+    #[test]
+    fn a_folder_chosen_for_another_role_leaves_its_own_role() {
+        let conn = testutil::conn();
+        testutil::seed_account(&conn);
+        let trash = upsert(&conn, 1, "Trash", Some("/"), Some(roles::TRASH)).unwrap();
+        let bin = upsert(&conn, 1, "Bin", Some("/"), None).unwrap();
+
+        apply_chosen_roles(&conn, 1, &chosen(&[(roles::ARCHIVE, "Trash")])).unwrap();
+        assert_eq!(
+            by_role(&conn, 1, roles::ARCHIVE).unwrap().unwrap().id,
+            trash
+        );
+        assert!(by_role(&conn, 1, roles::TRASH).unwrap().is_none());
+
+        apply_chosen_roles(
+            &conn,
+            1,
+            &chosen(&[(roles::ARCHIVE, "Trash"), (roles::TRASH, "Bin")]),
+        )
+        .unwrap();
+        assert_eq!(
+            by_role(&conn, 1, roles::ARCHIVE).unwrap().unwrap().id,
+            trash
+        );
+        assert_eq!(by_role(&conn, 1, roles::TRASH).unwrap().unwrap().id, bin);
+    }
+
+    /// A choice of a folder that isn't there, can't hold mail, or is the
+    /// Inbox leaves the role where the server suggests, as does a role that
+    /// can't be chosen.
+    #[test]
+    fn choices_that_cannot_apply_leave_the_suggested_roles() {
+        let conn = testutil::conn();
+        testutil::seed_account(&conn);
+        let sent = upsert(&conn, 1, "Sent", Some("/"), Some(roles::SENT)).unwrap();
+        let gone = upsert(&conn, 1, "Gone", Some("/"), None).unwrap();
+        conn.execute(
+            "UPDATE folders SET missing_on_server = 1 WHERE id = ?1",
+            params![gone],
+        )
+        .unwrap();
+        upsert_discovered(
+            &conn,
+            1,
+            "Shared",
+            Some("/"),
+            None,
+            false,
+            FolderPermissions::FULL,
+        )
+        .unwrap();
+
+        for choice in [
+            chosen(&[(roles::SENT, "Gone")]),
+            chosen(&[(roles::SENT, "Shared")]),
+            chosen(&[(roles::SENT, "Nowhere")]),
+            chosen(&[(roles::SENT, "INBOX")]),
+            chosen(&[(roles::INBOX, "Sent")]),
+        ] {
+            apply_chosen_roles(&conn, 1, &choice).unwrap();
+            assert_eq!(by_role(&conn, 1, roles::SENT).unwrap().unwrap().id, sent);
+            assert_eq!(by_role(&conn, 1, roles::INBOX).unwrap().unwrap().id, 1);
+        }
+    }
+
+    /// A chosen folder renamed here keeps its role under its new name, and
+    /// one deleted here gives the role back to the suggested folder.
+    #[test]
+    fn renaming_or_deleting_a_chosen_folder_keeps_the_choice_in_step() {
+        let conn = testutil::conn();
+        testutil::seed_account(&conn);
+        let sent = upsert(&conn, 1, "Sent", Some("/"), Some(roles::SENT)).unwrap();
+        upsert(&conn, 1, "Old", Some("/"), None).unwrap();
+        let old_sent = upsert(&conn, 1, "Old/Sent", Some("/"), None).unwrap();
+        let older = upsert(&conn, 1, "Older", Some("/"), None).unwrap();
+        let mut config = super::super::accounts::get_config(&conn, 1)
+            .unwrap()
+            .unwrap();
+        config.settings.folder_roles =
+            chosen(&[(roles::SENT, "Old/Sent"), (roles::ARCHIVE, "Older")]);
+        super::super::accounts::set_settings(&conn, 1, &config.settings).unwrap();
+        apply_chosen_roles(&conn, 1, &config.settings.folder_roles).unwrap();
+        let choices = |conn: &Connection| {
+            super::super::accounts::get_config(conn, 1)
+                .unwrap()
+                .unwrap()
+                .settings
+                .folder_roles
+        };
+
+        rename_tree(&conn, 1, "Old", "Earlier", "/").unwrap();
+        assert_eq!(
+            choices(&conn),
+            chosen(&[(roles::SENT, "Earlier/Sent"), (roles::ARCHIVE, "Older")])
+        );
+        assert_eq!(
+            by_role(&conn, 1, roles::SENT).unwrap().unwrap().id,
+            old_sent
+        );
+        assert_eq!(
+            by_role(&conn, 1, roles::ARCHIVE).unwrap().unwrap().id,
+            older
+        );
+
+        delete_tree(&conn, 1, "Earlier", "/").unwrap();
+        assert_eq!(choices(&conn), chosen(&[(roles::ARCHIVE, "Older")]));
+        assert_eq!(by_role(&conn, 1, roles::SENT).unwrap().unwrap().id, sent);
+        assert_eq!(
+            by_role(&conn, 1, roles::ARCHIVE).unwrap().unwrap().id,
+            older
+        );
+    }
+
+    #[test]
+    fn a_new_uidvalidity_unlinks_the_mail_that_came_from_the_server() {
+        let conn = testutil::conn();
+        testutil::seed_account(&conn);
+        set_uid_state(&conn, 1, Some(5), Some(10), None).unwrap();
+        set_last_seen_uid(&conn, 1, 9).unwrap();
+        set_backfill(&conn, 1, Some(1), true).unwrap();
+        let (_, received) = testutil::seed_message(&conn, "sender@example.com", "Hi", false);
+        let (_, filed) = testutil::seed_message(&conn, "me@test.dev", "Re: Hi", false);
+        let (_, local) = testutil::seed_message(&conn, "me@test.dev", "Re: Hi again", false);
+        conn.execute(
+            "UPDATE messages SET is_outgoing = 1 WHERE id IN (?1, ?2)",
+            params![filed, local],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE messages SET uid = NULL WHERE id = ?1",
+            params![local],
+        )
+        .unwrap();
+        crate::db::repo::sync_failures::record_header(&conn, 1, 12, None, "bad header").unwrap();
+        crate::db::repo::sync_failures::record_content(&conn, received, None, "no body").unwrap();
+
+        reset_uid_mappings(&conn, 1).unwrap();
+        assert!(relink_pending(&conn, received));
+        assert!(relink_pending(&conn, filed));
+        assert!(!relink_pending(&conn, local));
+        let uids = conn
+            .prepare("SELECT uid FROM messages ORDER BY id")
+            .unwrap()
+            .query_map([], |row| row.get::<_, Option<i64>>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(uids, [None, None, None]);
+        assert_eq!(header_failures(&conn, 1), 0);
+        let content_failures: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sync_failures WHERE message_id = ?1",
+                params![received],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(content_failures, 1);
+        let folder = get(&conn, 1).unwrap().unwrap();
+        assert_eq!((folder.last_seen_uid, folder.backfill_done), (0, false));
+    }
+}

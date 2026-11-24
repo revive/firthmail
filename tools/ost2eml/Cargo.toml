@@ -1,0 +1,18 @@
+[package]
+name = "ost2eml"
+description = "Export mail from Outlook OST/PST data files to EML or mbox, for import into other mail clients (e.g. Flectar Mail)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+# Microsoft's Rust PST parser with the Outlook 2013+ OST layout fixes,
+# vendored: FirthMail needs to fix large-table bugs in it on our own.
+outlook-pst-ost = { path = "../../vendor/outlook-pst-ost" }
+# charset decoding for PtypString8 values (GBK, Shift-JIS, Windows-125x, ...)
+mail-parser = { version = "0.11", features = ["full_encoding"] }
+base64 = "0.22"
+
+[[bin]]
+name = "ost2eml"
+path = "src/main.rs"

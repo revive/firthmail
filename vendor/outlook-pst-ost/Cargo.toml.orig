@@ -1,0 +1,40 @@
+# outlook-pst 1.2.0 (MIT, Microsoft) with reader fixes and the Outlook 2013 OST layout, published as outlook-pst-ost: see VENDORED.md.
+[package]
+edition = "2021"
+rust-version = "1.82"
+name = "outlook-pst-ost"
+version = "1.3.0"
+authors = ["Microsoft (outlook-pst)", "Rick Mark-Penwell (fixes)"]
+build = false
+autolib = false
+autobins = false
+autoexamples = false
+autotests = false
+autobenches = false
+description = "Microsoft's outlook-pst 1.2.0 with fixes for real-world PST files and the Outlook 2013 OST layout, until they are released upstream"
+readme = "VENDORED.md"
+keywords = [
+    "win32",
+    "outlook",
+    "mapi",
+]
+categories = ["os::windows-apis"]
+license = "MIT"
+repository = "https://github.com/lwm-luminx/markdown-extract"
+homepage = "https://github.com/microsoft/outlook-pst-rs"
+
+[lib]
+name = "outlook_pst"
+path = "src/lib.rs"
+
+[dependencies.byteorder]
+version = "1"
+
+[dependencies.flate2]
+version = "1"
+
+[dependencies.thiserror]
+version = "2"
+
+[dependencies.tracing]
+version = "0.1"

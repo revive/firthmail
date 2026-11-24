@@ -1,0 +1,205 @@
+def favicon_path(address):
+  ($favicon_dir + "/" + (address | split("@") | last | ascii_downcase) + ".png");
+# Event rows leave out what the demo data doesn't use.
+def event_defaults:
+  .answerable = (.answerable // false) | .removable = (.removable // false) | .recurrence_id = (.recurrence_id // "");
+# Settings is a screen of its own, which goes back to the given view.
+(if $settings_tab == "" then $active_view else "settings" end) as $shown_view
+| .theme_mode = $theme
+| .["MotionSettings.enabled"] = false
+# Notifications show, as on a desktop that allows them.
+| .["SystemNotifications.availability"] = "allowed"
+| .workspace_layout = $workspace_layout
+| .screenshot_theme_preset = $theme_preset
+| .active_view = $shown_view
+| .settings_return_view = $active_view
+| .FilesUi["preview-image"] = $pdf_preview
+# The app always has at least one tab; show the same strip as the frameless
+# screenshots: the current view, a background conversation and the calendar.
+# The tabs showcase adds more conversations and every other workspace.
+| .["TabsUi.rows"] = (if $tab_strip == "showcase" then [
+    {"id": 1, "workspace": $shown_view, "title": "", "active": true},
+    {"id": 2, "workspace": "mail", "title": .emails[1].subject, "active": false},
+    {"id": 3, "workspace": "mail", "title": .emails[2].subject, "active": false},
+    {"id": 4, "workspace": "calendar", "title": "", "active": false},
+    {"id": 5, "workspace": "contacts", "title": "", "active": false},
+    {"id": 6, "workspace": "files", "title": "", "active": false}
+  ] else [
+    {"id": 1, "workspace": $shown_view, "title": "", "active": true},
+    {"id": 2, "workspace": "mail", "title": .emails[1].subject, "active": false},
+    {"id": 3, "workspace": (if $active_view == "calendar" then "mail" else "calendar" end), "title": "", "active": false}
+  ] end)
+| if $window_frame == "" then . else
+    .["WindowChrome.platform"] = $window_frame
+    | .["WindowChrome.preference"] = "integrated"
+    | .["WindowChrome.integrated"] = true
+  end
+| .startup_hydrated = true
+| .calendar_view_mode = $calendar_mode
+| .calendar_period_title = (if $calendar_mode == "agenda" then .calendar_month_title else .calendar_period_title end)
+| .settings_tab = (if $settings_tab == "" then (.settings_tab // "General") else $settings_tab end)
+| .text_mode = false
+| .show_account_markers = $show_account_markers
+| .storage_loading = false
+| .storage_loaded = true
+| .storage_total = "18.42 GB"
+| .storage_error = ""
+| .storage_usage = [
+    {"kind": "mail", "size": "9.84 GB", "fraction": 0.5342, "offset": 0, "color": "#3b82f6"},
+    {"kind": "attachments", "size": "5.21 GB", "fraction": 0.2828, "offset": 0.5342, "color": "#f59e0b"},
+    {"kind": "files", "size": "1.76 GB", "fraction": 0.0955, "offset": 0.817, "color": "#22c55e"},
+    {"kind": "databases", "size": "1.34 GB", "fraction": 0.0727, "offset": 0.9125, "color": "#a855f7"},
+    {"kind": "other", "size": "279.6 MB", "fraction": 0.0148, "offset": 0.9852, "color": "#94a3b8"}
+  ]
+# The reader's rendering of demo-email.html for this preset and scheme.
+| if $email == null then . else . + $email end
+| .selected_favicon = favicon_path(.selected_address)
+| .selected_has_favicon = true
+| .contacts |= map(.suggested = (.suggested // false)
+    | .["has-avatar"] = false
+    | .source = "Personal")
+| .["contact-source"] = "Personal"
+| .["contact-sync"] = "synced"
+| .["contact-emails"] = [{key: "", value: .contact_email, label: "WORK", preference: 1}]
+| .["contact-phones"] = [{key: "", value: .contact_phone, label: "CELL", preference: 100}]
+| del(.contact_email, .contact_phone)
+| .connected_accounts |= map(
+    .mail_protocol = (.mail_protocol // "")
+    | .custom_name = (.custom_name // "")
+    | .default_name = (.default_name // .email)
+    | .profile_id = (if .id == 2 then "support" else "work" end)
+    | .profile_name = (if .id == 2 then "Support" else "Work" end)
+    | .profile_color = (if .id == 2 then "#ea580c" else "#8b5cf6" end)
+    | .has_profile = true
+    | .has_account_color = false
+    | .jmap_url = (.jmap_url // "")
+    | .incoming_security = (.incoming_security // "tls")
+    | .smtp_security = (.smtp_security // "tls")
+    | .trusted_certificate_pem = (.trusted_certificate_pem // "")
+    | .mail_history = (.mail_history // "sixMonths")
+    | .keep_on_server = (.keep_on_server // "always")
+    | .subscribed_folders_only = (.subscribed_folders_only // false)
+    | .check_interval = (.check_interval // "app")
+    | .push = (if .push == null then true else .push end)
+    | .server_timeout = (.server_timeout // "30")
+    | .download = (.download // "messages")
+    | .receive_only = (.receive_only // false)
+    | .incoming_login = (.incoming_login // "automatic")
+    | .smtp_login = (.smtp_login // "automatic")
+    | .smtp_username = (.smtp_username // "")
+    | .server_keeps_mail_days = (.server_keeps_mail_days // -1)
+    | .calendar_connections = (.calendar_connections // [])
+    | .provider_calendar_connected = (.provider_calendar_connected // false)
+    | .provider_calendar_error = (.provider_calendar_error // "")
+    | .carddav_connected = (.carddav_connected // false)
+    | .carddav_enabled = (.carddav_enabled // false)
+    | .carddav_status = (.carddav_status // "")
+    | .carddav_url = (.carddav_url // "")
+    | .carddav_username = (.carddav_username // "")
+    | .checked_day = (.checked_day // -1)
+    | .checked_at = (.checked_at // "")
+    | .resume_day = (.resume_day // -1)
+    | .resume_at = (.resume_at // "")
+  )
+| .calendar_month_bars |= map(.event |= event_defaults)
+| .calendar_week_bars |= map(.event |= event_defaults)
+| .calendar_timed_blocks |= map(.event |= event_defaults)
+| .calendar_selected_day_events |= map(event_defaults)
+| .calendar_month_days |= map(.events |= map(event_defaults))
+| .calendar_week_days |= map(.events |= map(event_defaults))
+| .calendar_agenda_rows |= map(if .event then .event |= event_defaults else . end)
+| .mail_profiles = [
+    {"id": "work", "name": "Work", "color": "#8b5cf6", "account_count": 1},
+    {"id": "support", "name": "Support", "color": "#ea580c", "account_count": 1}
+  ]
+| .sidebar_rows |= map(
+    .show_row = true
+    | .reveal_row = false
+    | .mailbox.role = (.mailbox.role // "none")
+    | .mailbox.is_selectable = (if .mailbox.is_selectable == null then true else .mailbox.is_selectable end)
+    | .mailbox.can_create_children = (.mailbox.can_create_children // false)
+    | .mailbox.can_rename = (.mailbox.can_rename // false)
+    | .mailbox.can_delete = (.mailbox.can_delete // false)
+    | .mailbox.status = (.mailbox.status // {checking: false, problem: "none", marked: false, reason: "", checked_day: -1, checked_at: "", resume_day: -1, resume_at: ""})
+    | .label.account_id = (.label.account_id // -1)
+    | .label.account_name = (.label.account_name // "")
+    | .label.display_name = (.label.display_name // .label.name // "")
+    | .label.depth = (.label.depth // 0)
+    | .label.has_children = (.label.has_children // false)
+    | .label.expanded = (if .label.expanded == null then true else .label.expanded end)
+    | .label.can_create_children = (.label.can_create_children // false)
+    | .label.is_global = (.label.is_global // false)
+    | .label.count = (.label.count // "")
+  )
+| .mail_labels |= map(
+    .account_id = (.account_id // -1)
+    | .account_name = (.account_name // "")
+    | .display_name = (.display_name // .name // "")
+    | .depth = (.depth // 0)
+    | .has_children = (.has_children // false)
+    | .expanded = (if .expanded == null then true else .expanded end)
+    | .can_create_children = (.can_create_children // false)
+    | .is_global = (.is_global // false)
+    | .count = (.count // "")
+  )
+| .mail_label_results |= map(
+    .account_id = (.account_id // -1)
+    | .account_name = (.account_name // "")
+    | .display_name = (.display_name // .name // "")
+    | .depth = (.depth // 0)
+    | .has_children = (.has_children // false)
+    | .expanded = (if .expanded == null then true else .expanded end)
+    | .can_create_children = (.can_create_children // false)
+    | .is_global = (.is_global // false)
+    | .count = (.count // "")
+  )
+| (.thread_messages // [] | length) as $thread_count
+| .emails |= map(
+    .has_replied = (.has_replied // false)
+    | .high_importance = (.high_importance // false)
+    | .account_uses_labels = (.account_uses_labels // false)
+    | .verification_code = (.verification_code // "")
+    | .verification_code_spelled = (.verification_code_spelled // "")
+    | .attachment = ({id: "", stem: "", extension: "", kind: "", previewable: false} + (.attachment // {}))
+    | .attachment_total = (.attachment_total // 0)
+    | .message_count = (if $show_threads and .selected then ([1, $thread_count] | max) else (.message_count // 1) end)
+    | .checked = (.checked // false)
+    | .account_id = (if .account == "Flectar Support" then 2 else 1 end)
+    | .account_color = (if .account == "Flectar Support" then "#ea580c" else "#8b5cf6" end)
+    | .account_profile = (if .account == "Flectar Support" then "Support" else "Work" end)
+    | .show_account_marker = $show_account_markers
+    | .labels |= map(
+        .account_id = (.account_id // -1)
+        | .account_name = (.account_name // "")
+        | .display_name = (.display_name // .name // "")
+        | .depth = (.depth // 0)
+        | .has_children = (.has_children // false)
+        | .expanded = (if .expanded == null then true else .expanded end)
+        | .can_create_children = (.can_create_children // false)
+        | .is_global = (.is_global // false)
+      )
+    | .favicon = favicon_path(.address)
+    | .favicon_small = favicon_path(.address)
+    | .has_favicon = true
+  )
+# The viewer runs no Rust projection or accordion initialization.
+# Build the ungrouped list from the fully prepared email rows.
+| .mail_list_entries = (.emails | to_entries | map({
+    is_header: false,
+    group_key: "",
+    group_kind: "",
+    group_count: 0,
+    expanded: false,
+    show_row: true,
+    reveal_row: false,
+    email_index: .key,
+    email: .value
+  }))
+| .selected_address as $selected_address
+| .thread_messages = (if $show_threads then (.thread_messages // []) else [] end)
+| .thread_messages |= map(
+    .favicon = favicon_path(if .outgoing then $selected_address else .address end)
+    | .favicon_small = favicon_path(if .outgoing then $selected_address else .address end)
+    | .has_favicon = (.outgoing | not)
+  )
+| .selected_thread_index = (if $show_threads then (.selected_thread_index // 0) else 0 end)

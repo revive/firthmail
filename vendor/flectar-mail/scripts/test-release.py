@@ -1,0 +1,1395 @@
+#!/usr/bin/env python3
+"""Exercise release validation and publishing without contacting GitHub."""
+
+import base64
+import hashlib
+import importlib.util
+import json
+import os
+import plistlib
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import tomllib
+import unittest
+import xml.etree.ElementTree as ET
+import zipfile
+from pathlib import Path
+from unittest.mock import patch
+
+SCRIPTS = Path(__file__).resolve().parent
+sys.dont_write_bytecode = True
+
+
+def load_script(name):
+    spec = importlib.util.spec_from_file_location(name, SCRIPTS / f"{name}.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+metadata = load_script("release-metadata").metadata
+release_assets = load_script("prepare-release")
+prepare = release_assets.prepare
+android_signing = load_script("verify-android-signing")
+verify_android_signing = android_signing.verify
+android_version_code = load_script("android-version-code").version_code
+linux_metadata = load_script("stage-linux-metadata")
+ios_release = load_script("ios-release")
+flathub = load_script("flathub-manifest")
+stage_linux_metadata = linux_metadata.stage
+
+
+def workspace_keys(manifest):
+    """Keys of a parsed Cargo manifest still taken from a workspace."""
+    found = []
+
+    def walk(path, value):
+        if isinstance(value, dict):
+            if value.get("workspace") is True:
+                found.append(".".join(path))
+            for key, item in value.items():
+                walk([*path, key], item)
+
+    walk([], manifest)
+    return found
+
+
+class ReleaseTests(unittest.TestCase):
+    def test_android_ci_never_generates_a_release_key(self):
+        for ci_variable in ("CI", "GITHUB_ACTIONS"):
+            with self.subTest(ci_variable=ci_variable), tempfile.TemporaryDirectory() as directory:
+                environment = {
+                    **os.environ,
+                    "CI": "", "GITHUB_ACTIONS": "", ci_variable: "true",
+                    "FLECTAR_ANDROID_KEYSTORE": "",
+                    "FLECTAR_ANDROID_VERSION_NAME": "0.1.0-alpha.8",
+                    "XDG_DATA_HOME": directory,
+                }
+                result = subprocess.run(
+                    ["bash", str(SCRIPTS / "build-android-test-apk.sh")],
+                    env=environment, capture_output=True, text=True,
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("requires FLECTAR_ANDROID_KEYSTORE", result.stderr)
+                self.assertEqual(list(Path(directory).rglob("*")), [])
+
+    def test_android_persistent_key_restore_and_pin(self):
+        # Exercise the workflow's actual restore command and its verifier.
+        # Stand in for keytool's public DER export; no private keys in fixtures.
+        certificate = b"original public certificate"
+        digest = hashlib.sha256(certificate).hexdigest()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "scripts").mkdir()
+            (root / "platform/android").mkdir(parents=True)
+            pin = root / "platform/android/app-signing-certificate.sha256"
+            pin.write_text(digest + "\n")
+            for name in ("verify-android-keystore.sh", "restore-android-keystore.sh"):
+                shutil.copyfile(SCRIPTS / name, root / "scripts" / name)
+            keytool = root / "keytool"
+            keytool.write_text(
+                "#!/usr/bin/env python3\n"
+                "import os, pathlib, sys\n"
+                "if sys.argv[1] == '-list':\n"
+                "    print('Keystore type: JKS')\n"
+                "    sys.exit(0)\n"
+                "assert sys.argv[1] in ('-exportcert', '-certreq')\n"
+                "assert sys.argv[2] == '-keystore'\n"
+                "assert sys.argv[4:8] == ['-alias', 'release-key', '-storepass:env', 'FLECTAR_ANDROID_KEYSTORE_PASSWORD']\n"
+                "if os.environ['FLECTAR_ANDROID_KEYSTORE_PASSWORD'] != 'fixture store password': sys.exit(1)\n"
+                "if sys.argv[1] == '-certreq':\n"
+                "    assert sys.argv[8:] == ['-keypass:env', 'FLECTAR_ANDROID_KEY_PASSWORD']\n"
+                "    sys.exit(0 if os.environ['FLECTAR_ANDROID_KEY_PASSWORD'] == 'fixture key password' else 1)\n"
+                "data = pathlib.Path(sys.argv[3]).read_bytes()\n"
+                "if data == b'unreadable keystore': sys.exit(1)\n"
+                "sys.stdout.buffer.write(data)\n"
+            )
+            keytool.chmod(0o755)
+            output = root / "github-env"
+            environment = {
+                **os.environ, "PATH": f"{root}{os.pathsep}{os.environ['PATH']}",
+                "RUNNER_TEMP": str(root), "GITHUB_ENV": str(output),
+                "FLECTAR_ANDROID_KEY_ALIAS": "release-key",
+                "FLECTAR_ANDROID_KEYSTORE_PASSWORD": "fixture store password",
+                "FLECTAR_ANDROID_KEY_PASSWORD": "fixture key password",
+            }
+            for encoded, success, message in (
+                ("", False, "FLECTAR_ANDROID_KEYSTORE_BASE64 is required"),
+                ("not base64!", False, ""),
+                (base64.b64encode(b"unreadable keystore").decode(), False, ""),
+                (base64.b64encode(b"replacement public certificate").decode(), False, "differs from the pinned"),
+                (base64.b64encode(certificate).decode(), True, digest),
+            ):
+                with self.subTest(encoded=encoded):
+                    output.unlink(missing_ok=True)
+                    result = subprocess.run(
+                        ["bash", str(root / "scripts/restore-android-keystore.sh")], cwd=root,
+                        env={**environment, "FLECTAR_ANDROID_KEYSTORE_BASE64": encoded},
+                        capture_output=True, text=True,
+                    )
+                    self.assertEqual(result.returncode == 0, success, result.stderr)
+                    self.assertIn(message, result.stdout + result.stderr)
+                    if success:
+                        keystore = Path(output.read_text().strip().split("=", 1)[1])
+                        self.assertEqual(keystore.stat().st_mode & 0o777, 0o600)
+                    else:
+                        self.assertFalse(output.exists())
+                        self.assertFalse(list(root.glob("flectar-app-signing.*.keystore")))
+            output.unlink()
+            result = subprocess.run(
+                ["bash", str(root / "scripts/restore-android-keystore.sh")],
+                env={**environment, "FLECTAR_ANDROID_KEYSTORE_BASE64": base64.b64encode(certificate).decode(),
+                     "FLECTAR_ANDROID_KEY_PASSWORD": "wrong password"},
+                capture_output=True, text=True,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertFalse(output.exists())
+            self.assertEqual(list(root.glob("flectar-app-signing.*.keystore")), [keystore])
+            for missing in ("FLECTAR_ANDROID_KEYSTORE_PASSWORD", "FLECTAR_ANDROID_KEY_ALIAS", "FLECTAR_ANDROID_KEY_PASSWORD"):
+                with self.subTest(missing=missing):
+                    result = subprocess.run(
+                        ["bash", str(root / "scripts/restore-android-keystore.sh")],
+                        env={**environment, "FLECTAR_ANDROID_KEYSTORE_BASE64": base64.b64encode(certificate).decode(),
+                             missing: ""},
+                        capture_output=True, text=True,
+                    )
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn(f"requires {missing}", result.stderr)
+                    self.assertFalse(output.exists())
+                    self.assertEqual(list(root.glob("flectar-app-signing.*.keystore")), [keystore])
+            for value in ("", "not-a-digest"):
+                pin.write_text(value)
+                result = subprocess.run(
+                    ["bash", str(root / "scripts/verify-android-keystore.sh")],
+                    env={**environment, "FLECTAR_ANDROID_KEYSTORE": str(keystore)},
+                    capture_output=True, text=True,
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("pinned Android app signing certificate SHA-256 is invalid", result.stderr)
+
+    def test_android_version_codes_order_all_release_channels(self):
+        versions = (
+            "0.1.0-alpha.8", "0.1.0-alpha.999", "0.1.0-beta.1", "0.1.0-beta.999",
+            "0.1.0-rc.1", "0.1.0-rc.999", "0.1.0", "0.1.1-alpha.1", "0.1.1",
+            "0.2.0-alpha.1", "0.99.99", "1.0.0-alpha.1", "20.99.99",
+        )
+        codes = [android_version_code(version) for version in versions]
+        self.assertEqual(codes, sorted(set(codes)))
+        self.assertEqual(android_version_code("0.1.0-alpha.8"), 1_000_008)
+        self.assertEqual(android_version_code("0.1.0"), 1_009_999)
+        self.assertLessEqual(max(codes), 2_100_000_000)
+        for version in ("21.0.0", "0.100.0", "0.0.100", "0.1.0-alpha.1000", "0.1.0-alpha.0",
+                        "01.1.0", "0.1.0-dev.1", "0.1.0+build", "0.1.0-alpha.01"):
+            with self.subTest(version=version), self.assertRaises(ValueError):
+                android_version_code(version)
+
+    def test_flatpak_pdfium_builds_the_pinned_release(self):
+        module = (SCRIPTS.parent / "packaging/flatpak/pdfium.yml").read_text()
+        # The Flatpaks build from source the PDFium branch that the other
+        # packages download, so every package previews PDFs the same way.
+        pinned = load_script("stage-pdfium")
+        self.assertIn(
+            "  - type: git\n    url: https://pdfium.googlesource.com/pdfium\n"
+            f"    # branch {pinned.RELEASE}\n    commit: ",
+            module,
+        )
+        self.assertIn(f"DEPS file of\n# the {pinned.RELEASE} branch", module)
+        self.assertIn("install -Dm0755 out/Release/libpdfium.so /app/lib/flectar-mail/libpdfium.so", module)
+        for manifest in ("packaging/flatpak/com.flectar.mail.yml", "packaging/flathub/com.flectar.mail.yml"):
+            text = (SCRIPTS.parent / manifest).read_text()
+            with self.subTest(manifest=manifest):
+                self.assertIn("\nmodules:\n  # PDFium built from source; the app checks the PDF preview against it below.\n  - pdfium.yml\n", text)
+                self.assertIn("      - python3 scripts/test-pdf-preview.py /app/bin/flectar-mail\n", text)
+
+    def test_flathub_manifest_follows_the_bundle(self):
+        bundle = (SCRIPTS.parent / "packaging/flatpak/com.flectar.mail.yml").read_text()
+        template = flathub.TEMPLATE.read_text()
+        # Permissions, runtime and cleanup must not drift between the two.
+        # Only the bundle may reach the keyring, to move older credentials.
+        keyring = (
+            "  # Versions before the Secret portal kept credentials in the keyring. This\n"
+            "  # bundle can still reach it, so they move into the sealed file as they are\n"
+            "  # used. Flathub's build leaves it out.\n"
+            "  - --talk-name=org.freedesktop.secrets\n"
+        )
+        self.assertIn(keyring, bundle)
+        self.assertNotIn("org.freedesktop.secrets", template)
+        self.assertEqual(
+            template.split("\nmodules:\n")[0],
+            bundle.split("\nmodules:\n")[0].replace(keyring, ""),
+        )
+
+        def commands(text):
+            block = text.split("    build-commands:\n")[1].split("    sources:\n")[0]
+            return [line for line in block.splitlines() if line.startswith("      - ")]
+
+        def environment(text):
+            names = set()
+            for line in text.split("      env:\n")[1].splitlines():
+                if not line.startswith("        "):
+                    return names
+                if not line.lstrip().startswith("#"):
+                    names.add(line.split(":")[0].strip())
+
+        # Both build the same modules the same way, PDFium included; Flathub
+        # only leaves out the GitHub update check.
+        def modules(text):
+            return [line for line in text.split("\nmodules:\n")[1].splitlines() if line.startswith("  - ")]
+
+        self.assertEqual(modules(template), ["  - pdfium.yml", "  - name: flectar-mail"])
+        self.assertEqual(modules(template), modules(bundle))
+        self.assertEqual(commands(template), commands(bundle))
+        self.assertEqual(environment(template), environment(bundle) - {"FLECTAR_UPDATE_CHECKS"})
+        # Flathub accepts only software built from source.
+        pdfium = flathub.PDFIUM_MODULE.read_text()
+        self.assertNotIn("type: archive", pdfium + bundle + template)
+        self.assertNotIn("pdfium-binaries", pdfium + bundle + template)
+        # Every file the module lists from beside it ships with the manifest.
+        local_files = re.findall(r"^    path: (\S+)$", pdfium, re.MULTILINE)
+        self.assertEqual(local_files, [path.name for path in flathub.PDFIUM_FILES])
+        self.assertNotIn("format=TEXT", pdfium)
+
+        commit = "0123456789abcdef0123456789abcdef01234567"
+        release = flathub.manifest(tag="v0.1.0-beta.1", commit=commit)
+        self.assertIn("        tag: 'v0.1.0-beta.1'\n        commit: '0123456789abcdef0123456789abcdef01234567'\n", release)
+        self.assertNotIn("@", release)
+        for tag, sha in (("0.1.0", commit), ("v0.1.0-beta", commit), ("v0.1.0", "abc123"), (None, commit)):
+            with self.subTest(tag=tag, commit=sha), self.assertRaises(ValueError):
+                flathub.manifest(tag=tag, commit=sha)
+        # Flathub's sandboxed builder only reads sources below the manifest.
+        local = flathub.manifest(local=True)
+        self.assertIn("      - type: dir\n        path: .\n        skip:\n          - .artifacts\n", local)
+        self.assertIn("          - .flathub-local.yml\n      - packaging/flatpak/cargo-sources.json\n", local)
+        self.assertIn("\nmodules:\n  # PDFium built from source; the app checks the PDF preview against it below.\n  - packaging/flatpak/pdfium.yml\n", local)
+        self.assertNotIn("type: git", local)
+        self.assertEqual(flathub.LOCAL_MANIFEST.parent, SCRIPTS.parent)
+        with tempfile.TemporaryDirectory() as directory:
+            flathub.write(Path(directory), tag="v0.1.0", commit=commit)
+            for name in ("cargo-sources.json", "pdfium.yml", "generate_shim_headers.py"):
+                self.assertEqual(
+                    (Path(directory) / name).read_bytes(),
+                    (SCRIPTS.parent / "packaging/flatpak" / name).read_bytes(),
+                )
+
+    def test_flatpak_cargo_sources_match_lockfile(self):
+        project = SCRIPTS.parent
+        packages = tomllib.loads((project / "Cargo.lock").read_text())["package"]
+        expected = {
+            f"cargo/vendor/{package['name']}-{package['version']}": package
+            for package in packages
+            if package.get("source", "").startswith("registry+")
+        }
+        # Git dependencies: one checkout per repository and commit, each of
+        # its crates copied into the vendor directory under its name.
+        git_packages = {
+            f"cargo/vendor/{package['name']}": package
+            for package in packages
+            if package.get("source", "").startswith("git+")
+        }
+        repositories = {}
+        for package in git_packages.values():
+            source = package["source"].removeprefix("git+")
+            url, _, commit = source.partition("#")
+            repository, _, query = url.partition("?")
+            repositories[(repository, commit)] = query
+        sources = json.loads(
+            (project / "packaging/flatpak/cargo-sources.json").read_text()
+        )
+        self.assertEqual(
+            len(sources),
+            len(expected) * 2 + len(repositories) + len(git_packages) * 3 + 1,
+        )
+
+        archives = {source["dest"]: source for source in sources if source["type"] == "archive"}
+        checksums = {
+            source["dest"]: json.loads(source["contents"])["package"]
+            for source in sources
+            if source["type"] == "inline" and source.get("dest-filename") == ".cargo-checksum.json"
+        }
+        self.assertEqual(set(archives), set(expected))
+        self.assertEqual(
+            checksums,
+            {destination: package["checksum"] for destination, package in expected.items()}
+            | {destination: None for destination in git_packages},
+        )
+        for destination, package in expected.items():
+            name = package["name"]
+            version = package["version"]
+            source = archives[destination]
+            self.assertEqual(source["archive-type"], "tar-gzip")
+            self.assertEqual(source["sha256"], package["checksum"])
+            self.assertEqual(
+                source["url"],
+                f"https://static.crates.io/crates/{name}/{name}-{version}.crate",
+            )
+
+        checkouts = {
+            (source["url"], source["commit"]): source["dest"]
+            for source in sources
+            if source["type"] == "git"
+        }
+        self.assertEqual(set(checkouts), set(repositories))
+        for (repository, commit), destination in checkouts.items():
+            name = repository.rstrip("/").rsplit("/", 1)[-1]
+            self.assertEqual(destination, f"flatpak-cargo/git/{name}-{commit[:7]}")
+        copies = [
+            command
+            for source in sources
+            if source["type"] == "shell"
+            for command in source["commands"]
+        ]
+        self.assertEqual(
+            sorted(command.rsplit(" ", 1)[-1].strip('"') for command in copies),
+            sorted(git_packages),
+        )
+        manifests = {
+            source["dest"]: tomllib.loads(source["contents"])
+            for source in sources
+            if source["type"] == "inline" and source.get("dest-filename") == "Cargo.toml"
+        }
+        self.assertEqual(set(manifests), set(git_packages))
+        for destination, package in git_packages.items():
+            # Written out without workspace settings, which the copied crate
+            # can no longer reach.
+            self.assertEqual(manifests[destination]["package"]["name"], package["name"])
+            self.assertEqual(manifests[destination]["package"]["version"], package["version"])
+            self.assertEqual(workspace_keys(manifests[destination]), [])
+
+        config = (
+            '[source.vendored-sources]\n'
+            'directory = "cargo/vendor"\n\n'
+            '[source.crates-io]\n'
+            'replace-with = "vendored-sources"\n'
+        )
+        for (repository, commit), query in sorted(repositories.items()):
+            key, _, value = query.partition("=")
+            config += (
+                f'\n[source."{repository}"]\n'
+                f'git = "{repository}"\n'
+                'replace-with = "vendored-sources"\n'
+                f'{key} = "{value}"\n'
+            )
+        self.assertEqual(
+            sources[-1],
+            {
+                "type": "inline",
+                "contents": config,
+                "dest": "cargo",
+                "dest-filename": "config",
+            },
+        )
+
+    def test_android_ci_output_and_oauth_fingerprints(self):
+        signing = (SCRIPTS / "fixtures/apksigner-v2.txt").read_text()
+        expected = "6f269ab047ca5d5eae7317758a265251e3d5645c5307633a5b92d192b8646280"
+        for output in (signing, signing.replace("V2 Signer:", "Signer #1")):
+            verify_android_signing(output, "test", expected)
+            verify_android_signing(output, "production", expected)
+            with self.assertRaises(ValueError):
+                verify_android_signing(output, "test", "00" * 32)
+            with self.assertRaises(ValueError):
+                verify_android_signing(output, "production")
+            self.assertEqual(android_signing.certificate_digest(output, "SHA-1"), "ce48c46e4aa046ef007c1f965f8797691ba40e9f")
+        with self.assertRaisesRegex(ValueError, "unsupported output format"):
+            verify_android_signing(signing.replace("V2 Signer:", "Unknown Signer:"), "test", expected)
+
+        # The subsequent OAuth identity-export step must support the same SDK
+        # format as APK verification, or a valid package would still fail CI.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            build_tools = root / "build-tools/36.0.0"
+            build_tools.mkdir(parents=True)
+            signer = build_tools / "apksigner"
+            signer.write_text(f"#!/usr/bin/env python3\nprint({signing!r})\n")
+            signer.chmod(0o755)
+            apk = root / "app.apk"
+            apk.write_bytes(b"fixture")
+            output = subprocess.check_output(
+                ["bash", str(SCRIPTS / "android-signing-identities.sh"), str(apk)],
+                env={**os.environ, "ANDROID_HOME": str(root)}, text=True,
+            )
+            self.assertIn("Google Android OAuth SHA-1: CE:48:C4:6E:4A:A0:46:EF:00:7C:1F:96:5F:87:97:69:1B:A4:0E:9F", output)
+            self.assertIn("Microsoft redirect URI: msauth://com.flectar.mail/", output)
+
+    def test_android_signing_uses_certificate_not_display_name(self):
+        digest = "ab" * 32
+        for subject in ("CN=Flectar Mail Test, O=Android, C=US", "C=US,O=Android,CN=Flectar Mail Test"):
+            signing = (
+                "Verified using v2 scheme (APK Signature Scheme v2): true\n"
+                "Number of signers: 1\n"
+                f"Signer #1 certificate DN: {subject}\n"
+                f"Signer #1 certificate SHA-256 digest: {digest}\n"
+            )
+            for mode in ("test", "production"):
+                with self.subTest(subject=subject, mode=mode):
+                    verify_android_signing(signing, mode, digest.upper())
+                    for expected in (None, "", "invalid", "cd" * 32):
+                        with self.assertRaises(ValueError):
+                            verify_android_signing(signing, mode, expected)
+                    with self.assertRaises(ValueError):
+                        verify_android_signing(signing.replace("signers: 1", "signers: 2"), mode, digest)
+                    with self.assertRaises(ValueError):
+                        verify_android_signing(signing.replace(": true", ": false"), mode, digest)
+        # A plausible release subject cannot make a replacement key trusted.
+        production = signing.replace("CN=Flectar Mail Test", "CN=Flectar").replace(digest, "cd" * 32)
+        with self.assertRaises(ValueError):
+            verify_android_signing(production, "production", digest)
+
+    def test_linux_metadata_versions(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "resources").mkdir()
+            for name in ("com.flectar.mail.desktop", "com.flectar.mail.metainfo.xml"):
+                shutil.copyfile(SCRIPTS.parent / "resources" / name, root / "resources" / name)
+            for version in ("0.2.0-alpha.1", "0.2.0-beta.2", "0.2.0-rc.3", "0.2.0"):
+                with self.subTest(version=version):
+                    (root / "Cargo.toml").write_text(f'[package]\nversion = "{version}"\n')
+                    destination = root / version
+                    with patch.dict(os.environ, {"SOURCE_DATE_EPOCH": "1767225600"}):
+                        stage_linux_metadata(root, destination, arch="aarch64")
+                    desktop = (destination / "usr/share/applications/com.flectar.mail.desktop").read_text()
+                    self.assertIn(f"X-AppImage-Version={version}\n", desktop)
+                    self.assertIn("X-AppImage-Arch=aarch64\n", desktop)
+                    release = ET.parse(destination / "usr/share/metainfo/com.flectar.mail.metainfo.xml").find("./releases/release")
+                    self.assertEqual(release.get("version"), version)
+                    self.assertEqual(release.get("date"), "2026-01-01")
+                    self.assertEqual(release.get("type"), "development" if "-" in version else "stable")
+                    # Repackaging the same source must produce identical metadata
+                    # without consulting the current date.
+                    repeated = root / f"{version}-repeated"
+                    with patch.dict(os.environ, {"SOURCE_DATE_EPOCH": "1767225600"}):
+                        with patch.object(linux_metadata, "datetime", wraps=linux_metadata.datetime) as clock:
+                            clock.now.side_effect = AssertionError("Metadata must use the source date")
+                            stage_linux_metadata(root, repeated, arch="aarch64")
+                    for path in destination.rglob("*"):
+                        if path.is_file():
+                            self.assertEqual(path.read_bytes(), (repeated / path.relative_to(destination)).read_bytes())
+                    # A rebuild of the current release keeps its listed date,
+                    # and the history keeps every published release.
+                    releases = ET.parse(destination / "usr/share/metainfo/com.flectar.mail.metainfo.xml").findall("./releases/release")
+                    self.assertEqual(
+                        [r.get("version") for r in releases[1:]],
+                        [r.get("version") for r in ET.parse(SCRIPTS.parent / "resources/com.flectar.mail.metainfo.xml").findall("./releases/release")],
+                    )
+                flatpak = root / f"{version}-flatpak"
+                with patch.dict(os.environ, {"SOURCE_DATE_EPOCH": "1767225600"}):
+                    stage_linux_metadata(root, flatpak, flatpak=True)
+                desktop = (flatpak / "usr/share/applications/com.flectar.mail.desktop").read_text()
+                self.assertNotIn("X-AppImage-", desktop)
+            listed = ET.parse(root / "resources/com.flectar.mail.metainfo.xml").find("./releases/release")
+            (root / "Cargo.toml").write_text(f'[package]\nversion = "{listed.get("version")}"\n')
+            with patch.dict(os.environ, {"SOURCE_DATE_EPOCH": "1767225600"}):
+                stage_linux_metadata(root, root / "listed", arch="x86_64")
+            releases = ET.parse(root / "listed/usr/share/metainfo/com.flectar.mail.metainfo.xml").findall("./releases/release")
+            self.assertEqual(releases[0].get("version"), listed.get("version"))
+            self.assertEqual(releases[0].get("date"), listed.get("date"))
+            self.assertEqual(len([r for r in releases if r.get("version") == listed.get("version")]), 1)
+            # Every other package names the architecture it was built for.
+            for arch in (None, "amd64", "arm64"):
+                with self.subTest(arch=arch), self.assertRaisesRegex(ValueError, "architecture"):
+                    stage_linux_metadata(root, root / "unnamed", arch=arch)
+            for name in ("com.flectar.mail.desktop", "com.flectar.mail.metainfo.xml"):
+                self.assertEqual((root / "resources" / name).read_bytes(), (SCRIPTS.parent / "resources" / name).read_bytes())
+
+    def test_appimage_integration_keeps_mail_link_arguments(self):
+        # The desktop entry receives mail links through %U and its New email
+        # action passes an empty one; integration only replaces the program.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            appdir = root / "Flectar Mail.AppDir"
+            stage_linux_metadata(SCRIPTS.parent, appdir, arch="x86_64")
+            for icon in (
+                "usr/share/icons/hicolor/512x512/apps/com.flectar.mail.png",
+                "usr/share/icons/hicolor/scalable/apps/com.flectar.mail.svg",
+            ):
+                (appdir / icon).parent.mkdir(parents=True, exist_ok=True)
+                (appdir / icon).write_text("icon")
+            shutil.copyfile(SCRIPTS.parent / "resources/AppRun", appdir / "AppRun")
+            appimage = root / "downloads/Flectar Mail.AppImage"
+            appimage.parent.mkdir()
+            appimage.write_text("appimage")
+            home = root / "home"
+            result = subprocess.run(
+                ["bash", str(appdir / "AppRun"), "--integrate"],
+                env={"PATH": os.environ["PATH"], "HOME": str(home), "APPIMAGE": str(appimage)},
+                capture_output=True, text=True,
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            installed = home / "Applications/flectar-mail.AppImage"
+            desktop = (home / ".local/share/applications/com.flectar.mail.desktop").read_text()
+            exec_lines = [line for line in desktop.splitlines() if line.startswith("Exec=")]
+            self.assertEqual(exec_lines, [f'Exec="{installed}" %U', f'Exec="{installed}" mailto:'])
+            self.assertIn("MimeType=x-scheme-handler/mailto;\n", desktop)
+
+    def test_windows_notifications_use_the_identity_the_app_knows(self):
+        # Clicks on toasts reach the app through the COM class each kind of
+        # copy registers, started with the argument the app recognizes, and
+        # the installed copy's Start menu shortcut names its app id.
+        root = SCRIPTS.parent
+        source = (root / "src/notifications/windows.rs").read_text()
+
+        def constant(name):
+            return re.search(rf'const {name}: &str = "([^"]+)"', source).group(1)
+
+        def class_id(name):
+            digits = re.search(rf"const {name}: GUID = GUID::from_u128\(0x([0-9A-F_]+)\)", source)
+            return digits.group(1).replace("_", "-")
+
+        argument = constant("ACTIVATION_ARGUMENT")
+        installed = class_id("INSTALLED_ACTIVATOR")
+        installer = (root / "platform/windows/installer.iss").read_text()
+        shortcut = next(line for line in installer.splitlines() if line.startswith('Name: "{userprograms}'))
+        self.assertIn(f'AppUserModelID: "{constant("INSTALLED_AUMID")}"', shortcut)
+        self.assertIn(f'AppUserModelToastActivatorCLSID: "{installed}"', shortcut)
+        self.assertIn(
+            rf'Subkey: "Software\Classes\CLSID\{{{{{installed}}}\LocalServer32"; ValueType: string; '
+            rf'ValueName: ""; ValueData: """{{app}}\flectar-mail.exe"" {argument}"',
+            installer,
+        )
+        manifest = ET.parse(root / "platform/windows/msix/AppxManifest.xml.in").getroot()
+        com = "{http://schemas.microsoft.com/appx/manifest/com/windows10}"
+        desktop = "{http://schemas.microsoft.com/appx/manifest/desktop/windows10}"
+        server = manifest.find(f".//{com}ExeServer")
+        activation = manifest.find(f".//{desktop}ToastNotificationActivation")
+        self.assertEqual(server.get("Arguments"), argument)
+        self.assertEqual(server.find(f"{com}Class").get("Id"), class_id("PACKAGED_ACTIVATOR"))
+        self.assertEqual(activation.get("ToastActivatorCLSID"), class_id("PACKAGED_ACTIVATOR"))
+        self.assertNotEqual(class_id("PACKAGED_ACTIVATOR"), installed)
+        self.assertNotEqual(class_id("PORTABLE_ACTIVATOR"), installed)
+
+    def test_windows_installer_registers_the_mail_link_handler_the_app_knows(self):
+        # The installer registers the installed copy; the app finds that
+        # registration, opens its Default apps page and writes the same
+        # layout for a portable copy.
+        root = SCRIPTS.parent
+        installer = (root / "platform/windows/installer.iss").read_text()
+        windows = (root / "src/default_email_app/windows.rs").read_text()
+        option = re.search(
+            r'MAILTO_OPTION: &str = "([^"]+)"', (root / "src/mailto_links.rs").read_text(),
+        ).group(1)
+        name, prog_id = re.search(
+            r'const INSTALLED: Registration = Registration \{\s*name: "([^"]+)",\s*prog_id: "([^"]+)"',
+            windows,
+        ).groups()
+        description = re.search(r'const DESCRIPTION: &str = "([^"]+)"', windows).group(1)
+        self.assertIn("\nChangesAssociations=yes\n", installer)
+        entries = {}
+        for line in installer.splitlines():
+            if not line.startswith("Root: HKA;"):
+                continue
+            fields = dict(
+                re.match(r'\s*(\w+): (?:"((?:[^"]|"")*)"|(\S+))', field).group(1, 2)
+                for field in line.split(";")[1:] if field.strip()
+            )
+            if "ValueName" in fields:
+                entries[(fields["Subkey"], fields["ValueName"])] = fields["ValueData"]
+        capabilities = rf"Software\Clients\Mail\{name}\Capabilities"
+        self.assertEqual(entries[(rf"Software\RegisteredApplications", name)], capabilities)
+        self.assertEqual(entries[(capabilities, "ApplicationName")], name)
+        self.assertEqual(entries[(capabilities, "ApplicationDescription")], description)
+        self.assertEqual(entries[(rf"{capabilities}\URLAssociations", "mailto")], prog_id)
+        self.assertEqual(
+            entries[(rf"Software\Classes\{prog_id}\shell\open\command", "")],
+            rf'""{{app}}\flectar-mail.exe"" {option} ""%1""',
+        )
+
+    def test_linux_package_metadata(self):
+        # Exercise the actual shell packagers and dpkg with a tiny existing ELF,
+        # so shell expansion bugs cannot hide behind Python-only asset tests.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            paths = (
+                "scripts/build-deb.sh", "scripts/build-appimage.sh",
+                "scripts/stage-linux-metadata.py", "resources/AppRun",
+                "LICENSE", "THIRD_PARTY_NOTICES.md",
+                "resources/com.flectar.mail.desktop", "resources/com.flectar.mail.metainfo.xml",
+                "resources/app-icon/flectar-mail-masked-512.png",
+                "resources/app-icon/flectar-mail-masked.svg",
+                "resources/fonts/google-sans-flex/OFL.txt",
+                "resources/fonts/google-sans-flex/README.md",
+                "resources/debian/source-control.in", "resources/debian/control.in",
+            )
+            for name in paths:
+                destination = root / name
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(SCRIPTS.parent / name, destination)
+            shutil.copytree(SCRIPTS.parent / "LICENSES", root / "LICENSES")
+            (root / "Cargo.toml").write_text('[package]\nversion = "0.1.0-alpha.1"\n')
+            (root / "target/release").mkdir(parents=True)
+            shutil.copyfile("/bin/true", root / "target/release/flectar-mail")
+            # This test checks package metadata using fixture ELFs. Stub only
+            # the download/renderer helpers in the disposable checkout; actual
+            # native PDF rendering is exercised by the dedicated smoke tests.
+            (root / "scripts/stage-pdfium.py").write_text(
+                "import pathlib, shutil, sys\n"
+                "with open('pdfium-targets.txt', 'a') as output:\n"
+                "    output.write(sys.argv[1] + '\\n')\n"
+                "destination = pathlib.Path(sys.argv[2])\n"
+                "destination.mkdir(parents=True, exist_ok=True)\n"
+                "shutil.copyfile('/bin/true', destination / 'libpdfium.so')\n"
+            )
+            (root / "scripts/test-pdf-preview.py").write_text(
+                "import pathlib, sys\n"
+                "assert pathlib.Path(sys.argv[1]).is_file()\n"
+            )
+            # The host's /bin/true stands in for each architecture's executable;
+            # test-pdf-packaging.py covers the real ELF helper.
+            (root / "scripts/linux-elf.py").write_text(
+                "import json, pathlib, sys\n"
+                "with open('linux-elf-calls.jsonl', 'a') as output:\n"
+                "    output.write(json.dumps(sys.argv[1:]) + '\\n')\n"
+                "if sys.argv[1] == 'arch':\n"
+                "    print(pathlib.Path('fixture-architecture').read_text())\n"
+            )
+            (root / "bin").mkdir()
+            cargo = root / "bin/cargo"
+            cargo.write_text(
+                "#!/usr/bin/env python3\n"
+                "import json, pathlib, sys\n"
+                "with pathlib.Path('cargo-args.jsonl').open('a') as output:\n"
+                "    output.write(json.dumps(sys.argv[1:]) + '\\n')\n"
+            )
+            cargo.chmod(0o755)
+            # Model the explicitly bundled X11 libraries without depending on
+            # the host's development packages or invoking real deployment tools.
+            libraries = root / "fixture-libs"
+            libraries.mkdir()
+            for name in ("libxkbcommon-x11.so.0", "libxkbcommon.so.0"):
+                shutil.copyfile("/bin/true", libraries / name)
+            pkg_config = root / "bin/pkg-config"
+            pkg_config.write_text(
+                "#!/usr/bin/env python3\n"
+                "import sys\n"
+                "assert sys.argv[1:] == ['--variable=libdir', 'xkbcommon-x11']\n"
+                f"print({str(libraries)!r})\n"
+            )
+            pkg_config.chmod(0o755)
+            # The fixture ELFs carry no RUNPATH; report the one linuxdeploy sets.
+            readelf = root / "bin/readelf"
+            readelf.write_text(
+                "#!/usr/bin/env python3\n"
+                "import sys\n"
+                "assert sys.argv[1] == '-d'\n"
+                "runpath = '$ORIGIN/../lib' if sys.argv[2].endswith('/usr/bin/flectar-mail') else '$ORIGIN'\n"
+                "print(f' 0x000000000000001d (RUNPATH)            Library runpath: [{runpath}]')\n"
+            )
+            readelf.chmod(0o755)
+            environment = {
+                **os.environ, "PATH": f"{root / 'bin'}:{os.environ['PATH']}", "VERSION": "stale",
+                "FLECTAR_SKIP_BUILD": "0", "FLECTAR_APP_FEATURES": "",
+            }
+            for machine, debian, pdfium in (
+                ("x86_64", "amd64", "linux-x64"), ("aarch64", "arm64", "linux-arm64"),
+            ):
+                with self.subTest(machine=machine):
+                    (root / "fixture-architecture").write_text(f"{machine} {debian} {pdfium}")
+                    for name in ("pdfium-targets.txt", "linux-elf-calls.jsonl"):
+                        (root / name).unlink(missing_ok=True)
+                    result = subprocess.run(
+                        ["bash", str(root / "scripts/build-deb.sh")], cwd=root,
+                        env=environment, capture_output=True, text=True,
+                    )
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    package = root / f"target/deb/flectar-mail_0.1.0~alpha.1_{debian}.deb"
+                    self.assertTrue(package.is_file())
+                    for field, expected in (("Version", "0.1.0~alpha.1"), ("Architecture", debian)):
+                        value = subprocess.check_output(["dpkg-deb", "--field", str(package), field], text=True)
+                        self.assertEqual(value.strip(), expected)
+                    extracted = root / f"extracted-{machine}"
+                    subprocess.run(["dpkg-deb", "--extract", str(package), str(extracted)], check=True)
+                    desktop_path = "usr/share/applications/com.flectar.mail.desktop"
+                    metainfo_path = "usr/share/metainfo/com.flectar.mail.metainfo.xml"
+                    desktop = (extracted / desktop_path).read_text()
+                    self.assertIn("X-AppImage-Version=0.1.0-alpha.1\n", desktop)
+                    self.assertIn(f"X-AppImage-Arch={machine}\n", desktop)
+                    release = ET.parse(extracted / metainfo_path).find("./releases/release")
+                    self.assertEqual(release.get("version"), "0.1.0-alpha.1")
+                    self.assertEqual(release.get("type"), "development")
+
+                    # Exercise the AppImage shell packager up to its tool boundary,
+                    # without downloading deployment tools or compiling the
+                    # application. The tools sit where the packager caches the
+                    # downloads for this architecture.
+                    tools = root / "target/appimage/tools"
+                    tools.mkdir(parents=True, exist_ok=True)
+                    deploy = tools / f"linuxdeploy-{machine}.AppImage"
+                    deploy.write_text('''#!/usr/bin/env python3
+import pathlib, shutil, sys
+appdir = pathlib.Path(sys.argv[sys.argv.index("--appdir") + 1])
+library = pathlib.Path(sys.argv[sys.argv.index("--library") + 1])
+assert library.name == "libxkbcommon-x11.so.0"
+for name in ("libxkbcommon-x11.so.0", "libxkbcommon.so.0"):
+    shutil.copyfile(library.parent / name, appdir / "usr/lib" / name)
+(appdir / "com.flectar.mail.desktop").symlink_to("usr/share/applications/com.flectar.mail.desktop")
+''')
+                    pack = tools / f"appimagetool-{machine}.AppImage"
+                    pack.write_text('''#!/usr/bin/env python3
+import json, os, pathlib, sys
+appdir = pathlib.Path(sys.argv[1])
+pathlib.Path(sys.argv[2]).write_text(json.dumps({
+    "version": os.environ.get("VERSION"),
+    "desktop": (appdir / "com.flectar.mail.desktop").read_text(),
+    "metainfo": (appdir / "usr/share/metainfo/com.flectar.mail.metainfo.xml").read_text(),
+}))
+''')
+                    deploy.chmod(0o755)
+                    pack.chmod(0o755)
+                    result = subprocess.run(
+                        ["bash", str(root / "scripts/build-appimage.sh")], cwd=root,
+                        env=environment, capture_output=True, text=True,
+                    )
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    packaged = json.loads((root / "target/appimage/flectar-mail.AppImage").read_text())
+                    self.assertEqual(packaged["version"], "0.1.0-alpha.1")
+                    self.assertIn("X-AppImage-Version=0.1.0-alpha.1\n", packaged["desktop"])
+                    self.assertIn(f"X-AppImage-Arch={machine}\n", packaged["desktop"])
+                    release = ET.fromstring(packaged["metainfo"]).find("./releases/release")
+                    self.assertEqual(release.get("version"), "0.1.0-alpha.1")
+                    self.assertEqual(release.get("type"), "development")
+
+                    # Both packages carry this architecture's PDFium, and every
+                    # staged ELF file is checked for the machine's page sizes.
+                    self.assertEqual((root / "pdfium-targets.txt").read_text().split(), [pdfium, pdfium])
+                    calls = [
+                        json.loads(line)
+                        for line in (root / "linux-elf-calls.jsonl").read_text().splitlines()
+                    ]
+                    executable = str(root / "target/release/flectar-mail")
+                    self.assertEqual(calls, [
+                        ["arch", executable],
+                        ["verify", str(root / "target/deb/debian/flectar-mail")],
+                        ["arch", executable],
+                        ["verify", str(root / "target/appimage/flectar-mail.AppDir")],
+                        ["verify", str(root / "target/appimage/.flectar-mail.AppImage.new")],
+                    ])
+
+            # Both normal package commands must include the optional runtime
+            # choice, even though their builds disable Cargo's default features.
+            invocations = [
+                json.loads(line)
+                for line in (root / "cargo-args.jsonl").read_text().splitlines()
+            ]
+            self.assertEqual(len(invocations), 4)
+            for args in invocations:
+                enabled = {
+                    feature
+                    for index, arg in enumerate(args)
+                    if arg == "--features"
+                    for feature in args[index + 1].split(",")
+                }
+                self.assertTrue({"remote-content", "gpu-renderer"} <= enabled)
+
+    def test_versions_and_tags(self):
+        for version in ("0.1.0", "1.2.3-alpha.1", "1.2.3-beta.2", "1.2.3-rc.3"):
+            with self.subTest(version=version):
+                result = metadata(version, f"v{version}")
+                self.assertEqual(result["prerelease"], str("-" in version).lower())
+                self.assertEqual(result["native_version"], version.split("-")[0])
+        for version, tag in (
+            ("0.1.0", "v0.2.0"), ("0.1.0-beta.1", "v0.1.0"),
+            ("0.1.0-beta.01", None), ("0.1.0-beta.0", None),
+            ("01.2.3", None), ("1.2.3-nightly", None), ("1.2.3+build", None),
+        ):
+            with self.subTest(version=version, tag=tag), self.assertRaises(ValueError):
+                metadata(version, tag)
+
+    def test_store_versions_order_like_android_version_codes(self):
+        versions = (
+            "0.1.0-alpha.8", "0.1.0-alpha.999", "0.1.0-beta.1", "0.1.0-beta.999",
+            "0.1.0-rc.1", "0.1.0-rc.999", "0.1.0", "0.1.1-alpha.1", "0.1.1",
+            "0.2.0-alpha.1", "0.99.99", "1.0.0-alpha.1", "20.99.99",
+        )
+        store = [tuple(map(int, metadata(version)["msix_version"].split("."))) for version in versions]
+        self.assertEqual(store, sorted(set(store)))
+        self.assertEqual(
+            sorted(versions, key=android_version_code),
+            sorted(versions, key=lambda version: tuple(map(int, metadata(version)["msix_version"].split(".")))),
+        )
+        # The Store reserves the last part and rejects a zero first part.
+        for parts in store:
+            self.assertEqual(len(parts), 4)
+            self.assertGreater(parts[0], 0)
+            self.assertEqual(parts[3], 0)
+            self.assertTrue(all(part <= 65535 for part in parts))
+        self.assertEqual(metadata("0.1.0-alpha.8")["msix_version"], "1.100.8.0")
+        self.assertEqual(metadata("0.1.0")["msix_version"], "1.100.9999.0")
+        for version in ("21.0.0", "0.100.0", "0.0.100", "0.1.0-alpha.1000"):
+            with self.subTest(version=version), self.assertRaises(ValueError):
+                metadata(version)
+
+    def test_store_package_layout_and_manifest(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            layout = root / "package/windows"
+            (layout / "LICENSES").mkdir(parents=True)
+            for name in ("flectar-mail.exe", "pdfium.dll", "LICENSE", "LICENSES/MIT.txt"):
+                (layout / name).write_text(name)
+            # Stand-ins for the Windows SDK tools record their arguments and
+            # keep what they would have packaged.
+            tools = root / "tools"
+            tools.mkdir()
+            calls = root / "calls.jsonl"
+            for name, body in (
+                ("makepri", """
+if sys.argv[1] == "createconfig":
+    path = Path(sys.argv[sys.argv.index("/cf") + 1])
+    path.write_text('<resources targetOsVersion="10.0.0" majorVersion="1"><index root="\\\\" startIndexAt="\\\\"/>'
+                    '<packaging><autoResourcePackage qualifier="Scale"/></packaging></resources>')
+else:
+    indexed = Path(sys.argv[sys.argv.index("/pr") + 1])
+    config = Path(sys.argv[sys.argv.index("/cf") + 1]).read_text()
+    Path(sys.argv[sys.argv.index("/of") + 1]).write_text(json.dumps({
+        "indexed": sorted(str(path.relative_to(indexed)) for path in indexed.rglob("*") if path.is_file()),
+        "config": config,
+    }))
+"""),
+                ("makeappx", """
+if sys.argv[1] == "pack":
+    source = Path(sys.argv[sys.argv.index("/d") + 1])
+    keep = Path(os.environ["KEEP"]) / Path(sys.argv[sys.argv.index("/p") + 1]).name
+    shutil.copytree(source, keep)
+    Path(sys.argv[sys.argv.index("/p") + 1]).write_text("msix")
+else:
+    source = Path(sys.argv[sys.argv.index("/d") + 1])
+    Path(sys.argv[sys.argv.index("/p") + 1]).write_text(json.dumps(sorted(path.name for path in source.iterdir())))
+"""),
+            ):
+                tool = tools / name
+                tool.write_text(
+                    "#!/usr/bin/env python3\n"
+                    "import json, os, shutil, sys\nfrom pathlib import Path\n"
+                    f"with open({str(calls)!r}, 'a') as output:\n"
+                    f"    output.write(json.dumps([{name!r}, *sys.argv[1:]]) + '\\n')\n" + body
+                )
+                tool.chmod(0o755)
+            keep = root / "kept"
+            keep.mkdir()
+            environment = {**os.environ, "MAKEAPPX": str(tools / "makeappx"),
+                           "MAKEPRI": str(tools / "makepri"), "KEEP": str(keep), "GITHUB_ACTIONS": ""}
+            build = [sys.executable, str(SCRIPTS / "build-msix.py")]
+            for arch in ("x64", "arm64"):
+                result = subprocess.run(
+                    [*build, "pack", "--arch", arch, "--version", "1.100.8.0", str(layout),
+                     str(root / f"out/flectar-mail-{arch}.msix")],
+                    env=environment, capture_output=True, text=True,
+                )
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn("placeholder identity", result.stdout)
+                packaged = keep / f"flectar-mail-{arch}.msix"
+                self.assertEqual((packaged / "flectar-mail.exe").read_text(), "flectar-mail.exe")
+                self.assertTrue((packaged / "LICENSES/MIT.txt").is_file())
+                manifest = ET.parse(packaged / "AppxManifest.xml").getroot()
+                ns = {
+                    "m": "http://schemas.microsoft.com/appx/manifest/foundation/windows10",
+                    "uap": "http://schemas.microsoft.com/appx/manifest/uap/windows10",
+                    "uap3": "http://schemas.microsoft.com/appx/manifest/uap/windows10/3",
+                    "uap5": "http://schemas.microsoft.com/appx/manifest/uap/windows10/5",
+                }
+                identity = manifest.find("m:Identity", ns)
+                self.assertEqual(identity.get("Version"), "1.100.8.0")
+                self.assertEqual(identity.get("ProcessorArchitecture"), arch)
+                # Every logo the manifest names resolves to packaged variants.
+                visuals = manifest.find("m:Applications/m:Application/uap:VisualElements", ns)
+                logos = [manifest.find("m:Properties/m:Logo", ns).text,
+                         visuals.get("Square150x150Logo"), visuals.get("Square44x44Logo")]
+                for logo in logos:
+                    stem = Path(logo.replace("\\", "/"))
+                    variants = list((packaged / stem.parent).glob(f"{stem.stem}.*.png"))
+                    self.assertTrue(variants, logo)
+                # resources.pri indexes only the logos, without split resource packages.
+                pri = json.loads((packaged / "resources.pri").read_text())
+                self.assertTrue(pri["indexed"])
+                self.assertTrue(all(name.startswith("Assets/") for name in pri["indexed"]))
+                self.assertNotIn("packaging", pri["config"])
+                # Mail links arrive the way the app accepts them, as the
+                # whole command line after its option, with a packaged logo.
+                protocol = manifest.find(
+                    "m:Applications/m:Application/m:Extensions/uap3:Extension/uap3:Protocol", ns,
+                )
+                self.assertEqual(protocol.get("Name"), "mailto")
+                option, link = protocol.get("Parameters").split(" ")
+                self.assertIn(
+                    f'MAILTO_OPTION: &str = "{option}"',
+                    (SCRIPTS.parent / "src/mailto_links.rs").read_text(),
+                )
+                self.assertEqual(link, '"%1"')
+                logo = Path(protocol.find("uap:Logo", ns).text.replace("\\", "/"))
+                self.assertTrue(list((packaged / logo.parent).glob(f"{logo.stem}.*.png")), logo)
+            # The startup task is the one the app enables, and its launch
+            # starts in the background like the other sign-in entries.
+            autostart = (SCRIPTS.parent / "src/autostart.rs").read_text()
+            extension = manifest.find("m:Applications/m:Application/m:Extensions/uap5:Extension", ns)
+            self.assertEqual(extension.get("Category"), "windows.startupTask")
+            self.assertEqual(extension.get("Executable"), "flectar-mail.exe")
+            task = extension.find("uap5:StartupTask", ns).get("TaskId")
+            self.assertIn(f'h!("{task}")', autostart)
+            parameters = extension.get("{http://schemas.microsoft.com/appx/manifest/uap/windows10/10}Parameters")
+            self.assertIn(f'BACKGROUND_ARGUMENT: &str = "{parameters}"', autostart)
+
+            result = subprocess.run(
+                [*build, "bundle", "--version", "1.100.8.0", str(root / "out/flectar-mail.msixbundle"),
+                 str(root / "out/flectar-mail-x64.msix"), str(root / "out/flectar-mail-arm64.msix")],
+                env=environment, capture_output=True, text=True,
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(json.loads((root / "out/flectar-mail.msixbundle").read_text()),
+                             ["flectar-mail-arm64.msix", "flectar-mail-x64.msix"])
+            bundled = [json.loads(line) for line in calls.read_text().splitlines()][-1]
+            self.assertEqual(bundled[:5], ["makeappx", "bundle", "/o", "/bv", "1.100.8.0"])
+
+            # The Store rejects a zero first part, a nonzero last part and parts over 65535.
+            for version in ("0.100.8.0", "1.100.8.1", "1.70000.8.0", "1.100.8"):
+                with self.subTest(version=version):
+                    result = subprocess.run(
+                        [*build, "pack", "--arch", "x64", "--version", version, str(layout),
+                         str(root / "out/rejected.msix")],
+                        env=environment, capture_output=True, text=True,
+                    )
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn("Major.Minor.Build.0", result.stderr)
+            (layout / "pdfium.dll").unlink()
+            result = subprocess.run(
+                [*build, "pack", "--arch", "x64", "--version", "1.100.8.0", str(layout),
+                 str(root / "out/incomplete.msix")],
+                env=environment, capture_output=True, text=True,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("pdfium.dll is missing", result.stderr)
+
+    def test_ios_app_packages_into_an_unsigned_ipa(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            app = root / "FlectarMail.app"
+            (app / "Frameworks/PDFium.framework").mkdir(parents=True)
+            (app / "Licenses/Flectar Mail").mkdir(parents=True)
+            info = {
+                "CFBundleExecutable": "FlectarMail",
+                "CFBundleIdentifier": "com.flectar.mail",
+                "CFBundleShortVersionString": "0.1.0",
+                "CFBundleVersion": "1000008",
+                "MinimumOSVersion": "17.0",
+            }
+            # Xcode writes the built Info.plist in binary form.
+            (app / "Info.plist").write_bytes(plistlib.dumps(info, fmt=plistlib.FMT_BINARY))
+            for name, mode in (
+                ("FlectarMail", 0o755),
+                ("Frameworks/PDFium.framework/PDFium", 0o755),
+                ("Licenses/Flectar Mail/LICENSE", 0o644),
+            ):
+                (app / name).write_bytes(name.encode())
+                (app / name).chmod(mode)
+            ipa = root / "app.ipa"
+            with patch.dict(os.environ, {"SOURCE_DATE_EPOCH": "1767225600"}):
+                ios_release.write_ipa(app, ipa, "0.1.0", "1000008")
+                first = ipa.read_bytes()
+                (app / "FlectarMail").touch()
+                ios_release.write_ipa(app, ipa, "0.1.0", "1000008")
+            # The same app always packages into the same IPA.
+            self.assertEqual(ipa.read_bytes(), first)
+            self.assertEqual(list(root.glob("*.partial")), [])
+            with zipfile.ZipFile(ipa) as archive:
+                entries = {entry.filename: entry for entry in archive.infolist()}
+                self.assertEqual(plistlib.loads(archive.read("Payload/FlectarMail.app/Info.plist")), info)
+            self.assertEqual(sorted(entries), [
+                "Payload/",
+                "Payload/FlectarMail.app/",
+                "Payload/FlectarMail.app/FlectarMail",
+                "Payload/FlectarMail.app/Frameworks/",
+                "Payload/FlectarMail.app/Frameworks/PDFium.framework/",
+                "Payload/FlectarMail.app/Frameworks/PDFium.framework/PDFium",
+                "Payload/FlectarMail.app/Info.plist",
+                "Payload/FlectarMail.app/Licenses/",
+                "Payload/FlectarMail.app/Licenses/Flectar Mail/",
+                "Payload/FlectarMail.app/Licenses/Flectar Mail/LICENSE",
+            ])
+            # Executables stay executable.
+            for name, mode in (
+                ("FlectarMail", 0o755),
+                ("Frameworks/PDFium.framework/PDFium", 0o755),
+                ("Licenses/Flectar Mail/LICENSE", 0o644),
+            ):
+                self.assertEqual(entries[f"Payload/FlectarMail.app/{name}"].external_attr >> 16 & 0o777, mode)
+            self.assertEqual({entry.date_time for entry in entries.values()}, {(2026, 1, 1, 0, 0, 0)})
+
+            # Another identity or version, or a missing executable, is refused.
+            for key, value in (
+                ("CFBundleIdentifier", "com.example.mail"),
+                ("CFBundleShortVersionString", "1.0"),
+                ("CFBundleVersion", "1"),
+                ("MinimumOSVersion", None),
+                ("CFBundleExecutable", "Missing"),
+                ("CFBundleExecutable", None),
+            ):
+                with self.subTest(key=key, value=value):
+                    changed = {**info, key: value}
+                    (app / "Info.plist").write_bytes(plistlib.dumps({k: v for k, v in changed.items() if v is not None}))
+                    with self.assertRaises(ValueError):
+                        ios_release.write_ipa(app, root / "refused.ipa", "0.1.0", "1000008")
+            (app / "Info.plist").write_bytes(plistlib.dumps(info))
+            (app / "FlectarMail").chmod(0o644)
+            with self.assertRaises(ValueError):
+                ios_release.write_ipa(app, root / "refused.ipa", "0.1.0", "1000008")
+            (app / "FlectarMail").chmod(0o755)
+            # Sideloading tools sign the app; signing material and symbolic
+            # links would not survive that.
+            for name in ("_CodeSignature", "Frameworks/PDFium.framework/_CodeSignature", "embedded.mobileprovision"):
+                with self.subTest(name=name):
+                    (app / name).mkdir()
+                    with self.assertRaisesRegex(ValueError, "unsigned"):
+                        ios_release.write_ipa(app, root / "refused.ipa", "0.1.0", "1000008")
+                    (app / name).rmdir()
+            (app / "Frameworks/link").symlink_to("../FlectarMail")
+            with self.assertRaisesRegex(ValueError, "symbolic link"):
+                ios_release.write_ipa(app, root / "refused.ipa", "0.1.0", "1000008")
+            (app / "Frameworks/link").unlink()
+            self.assertFalse((root / "refused.ipa").exists())
+            ios_release.write_ipa(app, root / "accepted.ipa", "0.1.0", "1000008")
+
+    def test_ios_packaging_stamps_the_release_version(self):
+        # Run the real script with stand-ins for the Xcode tools, which only
+        # exist on macOS.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "scripts").mkdir()
+            for name in ("package-ios.sh", "ios-release.py", "android-version-code.py"):
+                shutil.copyfile(SCRIPTS / name, root / "scripts" / name)
+            (root / "Cargo.toml").write_text('[package]\nname = "flectar-mail"\nversion = "0.1.0-alpha.8"\n')
+            tools = root / "bin"
+            tools.mkdir()
+            calls = root / "calls.log"
+            (tools / "xcodegen").write_text(f'#!/bin/sh\necho "xcodegen $*" >> "{calls}"\n')
+            # Build an app the way Xcode would with the given settings.
+            (tools / "xcodebuild").write_text(f"""#!/usr/bin/env python3
+import os, plistlib, sys
+from pathlib import Path
+with open({str(calls)!r}, "a") as log:
+    log.write("xcodebuild " + " ".join(sys.argv[1:]) + "\\n")
+arguments = sys.argv[1:]
+settings = dict(argument.split("=", 1) for argument in arguments if "=" in argument)
+app = Path(arguments[arguments.index("-archivePath") + 1], "Products/Applications/FlectarMail.app")
+(app / "Frameworks/PDFium.framework").mkdir(parents=True)
+for name in ("FlectarMail", "Frameworks/PDFium.framework/PDFium"):
+    (app / name).write_bytes(b"binary")
+    (app / name).chmod(0o755)
+(app / "Info.plist").write_bytes(plistlib.dumps({{
+    "CFBundleExecutable": "FlectarMail",
+    "CFBundleIdentifier": "com.flectar.mail",
+    "CFBundleShortVersionString": settings["MARKETING_VERSION"],
+    "CFBundleVersion": settings["CURRENT_PROJECT_VERSION"],
+    "MinimumOSVersion": "17.0",
+}}, fmt=plistlib.FMT_BINARY))
+""")
+            # `codesign --display` fails for unsigned code.
+            (tools / "codesign").write_text('#!/bin/sh\n[ "${FAKE_SIGNED:-}" = 1 ]\n')
+            for tool in tools.iterdir():
+                tool.chmod(0o755)
+            environment = {**os.environ, "PATH": f"{tools}:{os.environ['PATH']}"}
+            environment.pop("SOURCE_DATE_EPOCH", None)
+            result = subprocess.run(
+                ["bash", "scripts/package-ios.sh", "out"], cwd=root, env=environment,
+                capture_output=True, text=True,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            with zipfile.ZipFile(root / "out/flectar-mail-ios-arm64.ipa") as archive:
+                info = plistlib.loads(archive.read("Payload/FlectarMail.app/Info.plist"))
+            # Prereleases share the numeric version; the build number orders them.
+            self.assertEqual(info["CFBundleShortVersionString"], "0.1.0")
+            self.assertEqual(info["CFBundleVersion"], str(android_version_code("0.1.0-alpha.8")))
+            log = calls.read_text()
+            self.assertIn(f"xcodegen generate --spec {root}/platform/ios/project.yml", log)
+            self.assertIn("CODE_SIGNING_ALLOWED=NO", log)
+            self.assertIn(f"-archivePath {root}/out/FlectarMail.xcarchive", log)
+
+            result = subprocess.run(
+                ["bash", "scripts/package-ios.sh", "signed"], cwd=root,
+                env={**environment, "FAKE_SIGNED": "1"}, capture_output=True, text=True,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("must be unsigned", result.stderr)
+            self.assertFalse((root / "signed/flectar-mail-ios-arm64.ipa").exists())
+
+    @staticmethod
+    def write_ios_ipa(path, version, **changes):
+        """A minimal IPA of `version`, as scripts/package-ios.sh stamps it."""
+        info = {
+            "CFBundleExecutable": "FlectarMail",
+            "CFBundleIdentifier": "com.flectar.mail",
+            "CFBundleShortVersionString": version.split("-")[0],
+            "CFBundleVersion": str(android_version_code(version)),
+            "MinimumOSVersion": "17.0",
+            "NSLocalNetworkUsageDescription": "Flectar Mail connects to mail servers on your local network.",
+            "UILaunchScreen": {},
+            **changes,
+        }
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with zipfile.ZipFile(path, "w") as archive:
+            archive.writestr("Payload/FlectarMail.app/Info.plist", plistlib.dumps(info, fmt=plistlib.FMT_BINARY))
+            # A framework's Info.plist is not the app's.
+            archive.writestr(
+                "Payload/FlectarMail.app/Frameworks/PDFium.framework/Info.plist",
+                plistlib.dumps({"CFBundleIdentifier": "org.pdfium"}),
+            )
+        return path
+
+    def test_ios_source_describes_the_release_ipa(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ipa = self.write_ios_ipa(Path(directory) / "app.ipa", "0.1.0-beta.1")
+            document = ios_release.source(ipa, "0.1.0-beta.1", "flectar/mail", "2026-11-20T10:00:00Z")
+            app = document["apps"][0]
+            self.assertEqual(app["versions"], [{
+                "version": "0.1.0",
+                "buildVersion": str(android_version_code("0.1.0-beta.1")),
+                "marketingVersion": "0.1.0-beta.1",
+                "date": "2026-11-20T10:00:00Z",
+                "localizedDescription": "Release notes: https://github.com/flectar/mail/releases/tag/v0.1.0-beta.1",
+                "downloadURL": "https://github.com/flectar/mail/releases/download/v0.1.0-beta.1/flectar-mail-0.1.0-beta.1-ios-arm64.ipa",
+                "size": ipa.stat().st_size,
+                "sha256": hashlib.sha256(ipa.read_bytes()).hexdigest(),
+                "minOSVersion": "17.0",
+            }])
+            self.assertEqual(app["bundleIdentifier"], "com.flectar.mail")
+            # The address people add once; the latest release always has it.
+            self.assertEqual(
+                document["sourceURL"],
+                "https://github.com/flectar/mail/releases/latest/download/flectar-mail-altstore-source.json",
+            )
+            # AltStore and SideStore refuse apps that ask for a permission
+            # their source does not list.
+            self.assertEqual(app["appPermissions"], {
+                "entitlements": [],
+                "privacy": {"NSLocalNetworkUsageDescription": "Flectar Mail connects to mail servers on your local network."},
+            })
+            # Releases that predate version lists read the newest version here.
+            latest = app["versions"][0]
+            for key, field in (("version", "version"), ("versionDate", "date"), ("downloadURL", "downloadURL"), ("size", "size")):
+                self.assertEqual(app[key], latest[field])
+            # Images come from the release's tag, and exist there.
+            prefix = "https://raw.githubusercontent.com/flectar/mail/v0.1.0-beta.1/"
+            shots = [shot for device in app["screenshots"].values() for shot in device]
+            self.assertTrue(app["screenshots"]["ipad"])
+            for address in (document["iconURL"], app["iconURL"], *(shot["imageURL"] for shot in shots), *app["screenshotURLs"]):
+                self.assertTrue(address.startswith(prefix), address)
+                self.assertTrue((SCRIPTS.parent / address.removeprefix(prefix)).is_file(), address)
+            for shot in shots:
+                self.assertGreater(shot["width"], 0)
+                self.assertGreater(shot["height"], 0)
+
+            # The IPA must belong to the release it is published with.
+            for change in ({"CFBundleVersion": "1"}, {"CFBundleShortVersionString": "0.2.0"}, {"CFBundleIdentifier": "com.example"}):
+                with self.subTest(change=change):
+                    self.write_ios_ipa(ipa, "0.1.0-beta.1", **change)
+                    with self.assertRaises(ValueError):
+                        ios_release.source(ipa, "0.1.0-beta.1", "flectar/mail", "2026-11-20T10:00:00Z")
+
+    def test_staging_and_checksums(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "assets"
+            source.mkdir()
+            # Workflow artifacts unpack into folders named after the artifact.
+            names = (
+                "flectar-mail-linux-x64/appimage/flectar-mail.AppImage",
+                "flectar-mail-linux-x64/deb/flectar-mail_0.1.0~beta.1_amd64.deb",
+                "flectar-mail-linux-arm64/appimage/flectar-mail.AppImage",
+                "flectar-mail-linux-arm64/deb/flectar-mail_0.1.0~beta.1_arm64.deb",
+                "flectar-mail-rpm-x64/flectar-mail.rpm",
+                "flectar-mail-rpm-arm64/flectar-mail.rpm",
+                "flectar-mail-flatpak-x64/flectar-mail.flatpak",
+                "flectar-mail-flatpak-arm64/flectar-mail.flatpak",
+                "flectar-mail-windows-x64/flectar-mail-windows-x64.zip",
+                "flectar-mail-windows-x64/flectar-mail-windows-x64-setup.exe",
+                "flectar-mail-windows-arm64/flectar-mail-windows-arm64.zip",
+                "flectar-mail-windows-arm64/flectar-mail-windows-arm64-setup.exe",
+                "flectar-mail-macos-arm64/flectar-mail-macos-arm64.zip",
+                "flectar-mail-macos-arm64/flectar-mail-macos-arm64.dmg",
+                "flectar-mail-macos-x64/flectar-mail-macos-x64.zip",
+                "flectar-mail-macos-x64/flectar-mail-macos-x64.dmg",
+                "flectar-mail-ios-arm64/flectar-mail-ios-arm64.ipa",
+                "flectar-mail-android-signed-arm64/flectar-mail.apk",
+            )
+            for name in names:
+                path = source / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(name.encode())
+            ipa = self.write_ios_ipa(source / "flectar-mail-ios-arm64/flectar-mail-ios-arm64.ipa", "0.1.0-beta.1")
+            (source / "flectar-mail-linux-x64/startup-benchmark/benchmark.json").parent.mkdir()
+            (source / "flectar-mail-linux-x64/startup-benchmark/benchmark.json").write_text("{}")
+            dist = root / "dist"
+            prepare(source, dist, "0.1.0-beta.1", "flectar/mail", "2026-11-20T10:00:00Z")
+            self.assertEqual(len(list(dist.iterdir())), 20)
+            self.assertTrue((dist / "flectar-mail-0.1.0-beta.1-android-arm64.apk").is_file())
+            self.assertEqual((dist / ios_release.ipa_name("0.1.0-beta.1")).read_bytes(), ipa.read_bytes())
+            # The AltStore source describes the staged IPA and is checksummed
+            # like every other download.
+            altstore = json.loads((dist / ios_release.SOURCE_NAME).read_text(encoding="utf-8"))
+            self.assertEqual(altstore["apps"][0]["versions"][0]["sha256"], hashlib.sha256(ipa.read_bytes()).hexdigest())
+            self.assertIn(f"  {ios_release.SOURCE_NAME}\n", (dist / "SHA256SUMS").read_text())
+            # Each download comes from its own architecture's artifact.
+            for download, name in (
+                ("flectar-mail-0.1.0-beta.1-linux-x64.AppImage", names[0]),
+                ("flectar-mail-0.1.0-beta.1-linux-arm64.AppImage", names[2]),
+                ("flectar-mail-0.1.0-beta.1-linux-x64.rpm", names[4]),
+                ("flectar-mail-0.1.0-beta.1-linux-arm64.rpm", names[5]),
+                ("flectar-mail-0.1.0-beta.1-linux-x64.flatpak", names[6]),
+                ("flectar-mail-0.1.0-beta.1-linux-arm64.flatpak", names[7]),
+                # GitHub must not rewrite a download name after we checksum it.
+                ("flectar-mail_0.1.0.beta.1_amd64.deb", names[1]),
+                ("flectar-mail_0.1.0.beta.1_arm64.deb", names[3]),
+                ("flectar-mail-0.1.0-beta.1-windows-arm64.zip", names[10]),
+                ("flectar-mail-0.1.0-beta.1-windows-arm64-setup.exe", names[11]),
+            ):
+                self.assertEqual((dist / download).read_bytes(), name.encode())
+            for path in dist.iterdir():
+                self.assertRegex(path.name, r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+            result = subprocess.run(
+                ["sha256sum", "--check", "SHA256SUMS"], cwd=dist,
+                capture_output=True, text=True,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            missing = source / names[-1]
+            missing.unlink()
+            with self.assertRaises(ValueError):
+                prepare(source, root / "missing", "0.1.0-beta.1", "flectar/mail", "2026-11-20T10:00:00Z")
+            self.assertFalse((root / "missing").exists())
+            missing.write_bytes(b"")
+            with self.assertRaises(ValueError):
+                prepare(source, root / "empty", "0.1.0-beta.1", "flectar/mail", "2026-11-20T10:00:00Z")
+            missing.write_bytes(b"apk")
+            (missing.parent / "copy").mkdir()
+            (missing.parent / "copy" / missing.name).write_bytes(b"duplicate")
+            with self.assertRaises(ValueError):
+                prepare(source, root / "duplicate", "0.1.0-beta.1", "flectar/mail", "2026-11-20T10:00:00Z")
+            shutil.rmtree(missing.parent / "copy")
+
+            # A package in another architecture's artifact does not count.
+            arm_rpm = source / "flectar-mail-rpm-arm64/flectar-mail.rpm"
+            arm_rpm.rename(source / "flectar-mail-rpm-x64/arm64.rpm")
+            with self.assertRaisesRegex(ValueError, "flectar-mail-rpm-arm64/flectar-mail.rpm"):
+                prepare(source, root / "wrong-artifact", "0.1.0-beta.1", "flectar/mail", "2026-11-20T10:00:00Z")
+            (source / "flectar-mail-rpm-x64/arm64.rpm").rename(arm_rpm)
+
+            # An IPA built for another version stops the release before
+            # anything is staged.
+            self.write_ios_ipa(ipa, "0.1.0-beta.2")
+            with self.assertRaisesRegex(ValueError, "CFBundleVersion"):
+                prepare(source, root / "other-ipa", "0.1.0-beta.1", "flectar/mail", "2026-11-20T10:00:00Z")
+            self.assertFalse((root / "other-ipa").exists())
+
+            # Stable releases also require exactly one signed Android APK.
+            for artifact, arch in (("flectar-mail-linux-x64", "amd64"), ("flectar-mail-linux-arm64", "arm64")):
+                folder = source / artifact / "deb"
+                (folder / f"flectar-mail_0.1.0~beta.1_{arch}.deb").rename(folder / f"flectar-mail_0.1.0_{arch}.deb")
+            self.write_ios_ipa(source / "flectar-mail-ios-arm64/flectar-mail-ios-arm64.ipa", "0.1.0")
+            stable_dist = root / "stable"
+            prepare(source, stable_dist, "0.1.0", "flectar/mail", "2026-11-20T10:00:00Z")
+            self.assertEqual(len(list(stable_dist.iterdir())), 20)
+            self.assertTrue((stable_dist / "flectar-mail_0.1.0_amd64.deb").is_file())
+            self.assertTrue((stable_dist / "flectar-mail_0.1.0_arm64.deb").is_file())
+            self.assertTrue((stable_dist / "flectar-mail-0.1.0-android-arm64.apk").is_file())
+            missing.unlink()
+            with self.assertRaises(ValueError):
+                prepare(source, root / "missing-stable", "0.1.0", "flectar/mail", "2026-11-20T10:00:00Z")
+
+    def test_notes_distinguish_android_preview(self):
+        for version in ("0.1.0-beta.1", "0.1.0"):
+            self.assertIn("previews and stable releases share one signing", release_assets.release_notes(version))
+        self.assertIn("does not receive Flathub updates", release_assets.release_notes("0.1.0-beta.1"))
+        self.assertIn("build-provenance attestations", release_assets.release_notes("0.1.0-beta.1"))
+        self.assertIn("Apple silicon and Intel", release_assets.release_notes("0.1.0-beta.1"))
+        self.assertIn("Linux and Windows on x64 and arm64", release_assets.release_notes("0.1.0-beta.1"))
+        self.assertIn("-linux-arm64.rpm", release_assets.release_notes("0.1.0-beta.1"))
+        self.assertIn("Sideload it with AltStore", release_assets.release_notes("0.1.0-beta.1"))
+        self.assertIn(ios_release.source_address("flectar/mail"), release_assets.release_notes("0.1.0-beta.1"))
+
+    def test_metadata_rejects_stale_android_lockfile(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "platform/android").mkdir(parents=True)
+            (root / "Cargo.toml").write_text('[package]\nversion = "0.2.0-beta.1"\n')
+            lock = '[[package]]\nname = "flectar-mail"\nversion = "0.2.0-beta.1"\n'
+            (root / "Cargo.lock").write_text(lock)
+            android_lock = root / "platform/android/Cargo.lock"
+            android_lock.write_text(lock.replace("0.2.0-beta.1", "0.1.0"))
+            command = [sys.executable, str(SCRIPTS / "release-metadata.py"), "--tag", "v0.2.0-beta.1"]
+            result = subprocess.run(command, cwd=root, capture_output=True, text=True)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("platform/android/Cargo.lock", result.stderr)
+            android_lock.write_text(lock)
+            # A tag must head the AppStream release history, which keeps its date.
+            metainfo = root / "resources/com.flectar.mail.metainfo.xml"
+            metainfo.parent.mkdir()
+            listing = '<component><releases>{}<release version="0.1.0" date="2026-01-01"/></releases></component>'
+            for releases in ("", '<release version="0.2.0-alpha.1" date="2026-02-01"/>'):
+                metainfo.write_text(listing.format(releases))
+                result = subprocess.run(command, cwd=root, capture_output=True, text=True)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("Add a 0.2.0-beta.1 release", result.stderr)
+            metainfo.write_text(listing.format('<release version="0.2.0-beta.1" date="2026-03-01"/>'))
+            result = subprocess.run(command, cwd=root, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("prerelease=true", result.stdout)
+
+    def publish(self, *, tag="v0.1.0-beta.1", existing="missing", fail_upload=False):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "dist").mkdir()
+            (root / "dist" / "package.zip").write_bytes(b"package")
+            (root / "release-notes.md").write_text("Notes")
+            gh = root / "gh"
+            gh.write_text('''#!/usr/bin/env python3
+import json, os, sys
+with open("calls.jsonl", "a") as stream:
+    stream.write(json.dumps(sys.argv[1:]) + "\\n")
+command = sys.argv[2]
+if command == "view":
+    existing = os.environ["EXISTING"]
+    if existing == "missing":
+        sys.exit(1)
+    print(existing)
+if command == "upload" and os.environ["FAIL_UPLOAD"] == "true":
+    sys.exit(1)
+''')
+            gh.chmod(0o755)
+            result = subprocess.run(
+                ["bash", str(SCRIPTS / "publish-release.sh")], cwd=root,
+                env={**os.environ, "PATH": f"{root}:{os.environ['PATH']}",
+                     "GITHUB_REF_NAME": tag, "EXISTING": existing,
+                     "FAIL_UPLOAD": str(fail_upload).lower()},
+                capture_output=True, text=True,
+            )
+            calls = [json.loads(line) for line in (root / "calls.jsonl").read_text().splitlines()]
+            return result, calls
+
+    def test_previews_and_stable_releases_publish_as_the_latest(self):
+        # The latest-download links, such as the AltStore source's address,
+        # must reach every new release.
+        for tag in ("v0.1.0-beta.1", "v0.1.0"):
+            with self.subTest(tag=tag):
+                result, calls = self.publish(tag=tag)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual([c[1] for c in calls], ["view", "create", "upload", "edit"])
+                self.assertIn("--draft", calls[1])
+                self.assertFalse(any(argument.startswith("--prerelease") for argument in calls[1]))
+                self.assertIn("--prerelease=false", calls[-1])
+                self.assertIn("--latest=true", calls[-1])
+                self.assertIn("--draft=false", calls[-1])
+
+    def test_failed_upload_does_not_publish(self):
+        result, calls = self.publish(fail_upload=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn("edit", [c[1] for c in calls])
+
+    def test_resume_draft_and_reject_published_replacement(self):
+        result, calls = self.publish(existing="true")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual([c[1] for c in calls], ["view", "upload", "edit"])
+        result, calls = self.publish(existing="false")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual([c[1] for c in calls], ["view"])
+
+
+if __name__ == "__main__":
+    unittest.main()

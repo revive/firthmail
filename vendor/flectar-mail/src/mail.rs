@@ -1,0 +1,6282 @@
+use crate::favicon::domain_from_address;
+use crate::mail_scope::{LabelKind, Scope, StandardMailbox};
+use flectar_mail_core::{
+    Core,
+    config::Paths,
+    events::CoreEvent,
+    models::{
+        Account, AccountConfig, ActionKind, ActionParams, ActionTarget, AddPasswordAccountArgs,
+        Address, BlockOffer, BlockResult, CalendarConnection, CalendarEvent, CardDavConnection,
+        ConnectCaldavArgs, ConnectCardDavArgs, ContactRecordCursor, ContactRecordPage,
+        CreateEventArgs, CustomTheme, DraftAttachmentIn, FolderInfo, ForwardedMessage, Importance,
+        InvitationCard, Label, ListOrder, ListOwner, MailGrouping, MailHistory, MailProfile,
+        MailProtocol, MailRule, MailboxBadgeCounts, MessageCursor, MessageDetail,
+        MessageSearchCursor, MessageSummary, PerformActionArgs, PortableAccountConfig, Provider,
+        QueueSendArgs, QueueSendResult, RsvpEventArgs, SaveDraftArgs, ScheduledSend, SearchCursor,
+        SenderIdentity, ServerRules, ServerRulesAnswer, ServerSearchCursor, Settings, Snippet,
+        ThreadCursor, ThreadSummary, UnsubscribeOffer, UnsubscribeOutcome, View,
+        normalized_workspace_list_pane_width, roles,
+    },
+};
+#[cfg(test)]
+use pulldown_cmark::{Event, Tag, TagEnd};
+use pulldown_cmark::{Options, Parser, html};
+use std::sync::Arc;
+use std::time::Duration;
+
+/// How long opening a reply or forward waits for the original's own images
+/// to download, so they go along with it; the thread's copy serves after.
+const COMPOSE_IMAGES_WAIT: Duration = Duration::from_secs(3);
+
+#[cfg(test)]
+#[derive(serde::Deserialize)]
+pub struct EmailFixture {
+    pub id: i32,
+    pub account: String,
+    pub folder: String,
+    pub sender: String,
+    pub address: String,
+    pub initials: String,
+    pub subject: String,
+    pub preview: String,
+    #[serde(default)]
+    pub to: String,
+    #[serde(rename = "label_summary")]
+    pub label: String,
+    pub unread: bool,
+    pub starred: bool,
+    pub has_attachments: bool,
+    #[serde(default)]
+    pub has_replied: bool,
+    #[serde(default)]
+    pub high_importance: bool,
+    #[serde(skip)]
+    pub html: String,
+}
+
+/// A read receipt the open message asks for, and which message that is.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReceiptAsk {
+    pub message_id: i64,
+    pub request: flectar_mail_core::models::ReceiptRequest,
+}
+
+/// Owned view data used by the Slint shell.
+#[derive(Clone, Debug)]
+pub struct MailMessage {
+    pub id: i32,
+    pub thread_id: Option<i64>,
+    /// The message this row shows on its own, in mail lists without
+    /// conversations; `None` for a conversation's row.
+    pub message_id: Option<i64>,
+    pub account_id: i64,
+    pub account: String,
+    pub folder: String,
+    pub sender: String,
+    pub address: String,
+    pub domain: String,
+    pub initials: String,
+    pub subject: String,
+    pub preview: String,
+    /// Milliseconds since the Unix epoch. Views format it when they project
+    /// the message, so the text follows the current language.
+    pub date_ms: i64,
+    /// When a snoozed conversation comes back, in ms since the epoch.
+    pub snoozed_until: Option<i64>,
+    /// When a scheduled draft goes out, in ms since the epoch.
+    pub send_at: Option<i64>,
+    /// Why a scheduled draft could not go out.
+    pub send_error: Option<String>,
+    /// Its send may have gone out: the mail server never confirmed it, so
+    /// it isn't sent again by itself.
+    pub send_uncertain: bool,
+    /// When the user asked to be reminded unless someone replies.
+    pub reply_reminder_at: Option<i64>,
+    /// That time came with no reply.
+    pub reply_reminder_due: bool,
+    /// Everyone the message went to, on one line: see [`recipients_line`].
+    pub to: String,
+    /// Its To and Cc recipients, as the message names them, for the
+    /// reader's details. Mail-list pages know only the To recipients.
+    pub to_people: Vec<Address>,
+    pub cc_people: Vec<Address>,
+    pub label: String,
+    pub unread: bool,
+    pub starred: bool,
+    pub has_attachments: bool,
+    pub message_count: i64,
+    pub attachments: Vec<flectar_mail_core::models::AttachmentMeta>,
+    pub has_replied: bool,
+    pub high_importance: bool,
+    pub is_outgoing: bool,
+    pub labels: Vec<i64>,
+    pub html: Option<String>,
+    pub text: Option<String>,
+    /// The row is showing its snippet while the core fetches the real MIME
+    /// body. The shell uses this to retry a missed/late MailUpdated event.
+    pub body_pending: bool,
+    /// Empty, or the strongest receiver-reported authentication kind:
+    /// domain, microsoft, bimi, or brand.
+    pub sender_verification: String,
+    /// The message names a way to leave the mailing list it came from, and
+    /// is neither one's own nor in the spam folder.
+    pub can_unsubscribe: bool,
+    /// Someone else sent the message, from an address that can be blocked.
+    pub can_block: bool,
+    /// Its sender is blocked: their mail goes to Spam.
+    pub sender_blocked: bool,
+    /// The calendar the message carries, as the card above it shows it
+    /// (#228). Loaded with the message's body.
+    pub invitation: Option<flectar_mail_core::models::InvitationCard>,
+    /// The read receipt it asks for, when one may still be sent (RFC 8098).
+    pub receipt: Option<ReceiptAsk>,
+    /// For a message the user sent, the read receipts that came back.
+    pub returned_receipts: Vec<flectar_mail_core::models::ReturnedReceipt>,
+    /// The one-time code the message asks its reader to enter.
+    pub verification_code: Option<String>,
+    /// Gmail labels are tags; other accounts file labels like folders.
+    pub account_uses_labels: bool,
+    /// The conversation's first file and how many files it holds, for the
+    /// list; `attachments` holds the open message's files.
+    pub first_attachment: Option<flectar_mail_core::models::AttachmentMeta>,
+    pub attachment_total: i64,
+}
+
+impl MailMessage {
+    #[cfg(test)]
+    pub fn from_fixture(email: EmailFixture) -> Self {
+        Self {
+            id: email.id,
+            thread_id: None,
+            message_id: None,
+            account_id: -1,
+            account: email.account.to_owned(),
+            folder: email.folder.to_owned(),
+            sender: email.sender.to_owned(),
+            address: email.address.to_owned(),
+            domain: domain_from_address(&email.address).unwrap_or_default(),
+            initials: email.initials.to_owned(),
+            subject: email.subject.to_owned(),
+            preview: email.preview.to_owned(),
+            date_ms: (chrono::Local::now() - chrono::Duration::days(i64::from(email.id - 1)))
+                .timestamp_millis(),
+            snoozed_until: None,
+            send_at: None,
+            send_error: None,
+            send_uncertain: false,
+            reply_reminder_at: None,
+            reply_reminder_due: false,
+            to: email.to.to_owned(),
+            to_people: Vec::new(),
+            cc_people: Vec::new(),
+            label: email.label.to_owned(),
+            unread: email.unread,
+            starred: email.starred,
+            has_attachments: email.has_attachments,
+            message_count: 1,
+            attachments: Vec::new(),
+            has_replied: email.has_replied,
+            high_importance: email.high_importance,
+            is_outgoing: false,
+            labels: Vec::new(),
+            html: Some(email.html.to_owned()),
+            text: None,
+            body_pending: false,
+            sender_verification: String::new(),
+            can_unsubscribe: false,
+            can_block: false,
+            sender_blocked: false,
+            invitation: None,
+            receipt: None,
+            returned_receipts: Vec::new(),
+            verification_code: None,
+            account_uses_labels: false,
+            first_attachment: None,
+            attachment_total: 0,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct MailboxEntry {
+    pub account_id: i64,
+    pub folder_id: i64,
+    pub parent_folder_id: i64,
+    pub depth: usize,
+    pub has_children: bool,
+    pub is_standard: bool,
+    pub is_selectable: bool,
+    pub can_create_children: bool,
+    pub can_rename: bool,
+    pub can_delete: bool,
+    pub label: String,
+    /// Absent for account headings, which are not navigation targets.
+    pub scope: Option<Scope>,
+    pub context: String,
+    pub detail: String,
+    pub avatar: String,
+    pub is_account: bool,
+    /// The badge: unread conversations or messages of the list the row opens,
+    /// or every draft for Drafts. Zero shows none.
+    pub count: u32,
+}
+
+/// Badges of the sidebar rows that are not mailboxes: labels, categories and
+/// the inbox's Important and Other halves, for the shown accounts.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SidebarBadges {
+    /// Unread per label id.
+    pub labels: std::collections::HashMap<i64, u32>,
+    pub important: u32,
+    pub other: u32,
+}
+
+/// Borrowed compose fields passed together so draft and send operations share
+/// one validated input shape without a long, error-prone positional argument
+/// list.
+pub struct ComposeMessage<'a> {
+    pub draft_id: Option<i64>,
+    pub account_id: i64,
+    pub sender_email: Option<&'a str>,
+    pub to: &'a str,
+    pub cc: &'a str,
+    pub bcc: &'a str,
+    pub subject: &'a str,
+    pub body: &'a str,
+    pub body_html: Option<&'a str>,
+    pub attachments: &'a [DraftAttachmentIn],
+    pub mode: &'a str,
+    pub in_reply_to_message_id: Option<i64>,
+    /// The Message-ID answered when that message is not stored here.
+    pub in_reply_to_header: Option<&'a str>,
+    /// The message asks for a read receipt.
+    pub request_read_receipt: bool,
+    pub importance: Importance,
+}
+
+/// The latest concrete message in a selected thread, with the addressing data
+/// needed to start a reply or forward without teaching the Slint view about
+/// provider/thread internals.
+#[derive(Clone, Debug)]
+pub struct ComposeSource {
+    pub message_id: i64,
+    pub account_id: i64,
+    pub account_email: String,
+    pub sender_identities: Vec<flectar_mail_core::models::SenderIdentity>,
+    pub default_sender_email: String,
+    pub from: Address,
+    pub to: Vec<Address>,
+    pub cc: Vec<Address>,
+    pub subject: String,
+    pub date: i64,
+    pub text_body: String,
+    /// The HTML the reader shows, inline images as `data:` URIs, which a
+    /// reply quotes and a forward carries.
+    pub html_body: Option<String>,
+    /// The message's files, for a forward or an edited copy to carry along.
+    pub attachments: Vec<flectar_mail_core::models::AttachmentMeta>,
+}
+
+#[derive(Clone, Debug)]
+pub struct MailPage {
+    pub account_revision: u64,
+    /// The order the rows are in. Search results are newest first.
+    pub order: ListOrder,
+    /// Where the rows start: after this cursor, or at the list's start.
+    pub start: Option<MailCursor>,
+    pub messages: Vec<MailMessage>,
+    pub labels: Vec<Label>,
+    pub mailboxes: Vec<MailboxEntry>,
+    pub next_cursor: Option<MailCursor>,
+    pub account_count: usize,
+    pub unified_mailboxes: Vec<MailboxEntry>,
+}
+
+/// What a search of the servers found, for the mail list.
+pub struct ServerFound {
+    /// The list rows it found: conversations, or messages in a list without
+    /// them.
+    pub rows: Vec<i32>,
+    /// Where each account's search goes on from. An account that found all
+    /// its server has isn't here.
+    pub cursors: Vec<(i64, ServerSearchCursor)>,
+    /// The accounts whose search failed, with why.
+    pub failed: Vec<(i64, String)>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MailCursor {
+    Thread(ThreadCursor),
+    Search(SearchCursor),
+    Message(MessageCursor),
+    MessageSearch(MessageSearchCursor),
+}
+
+/// What an action on a mail-list row applies to: its conversation, or the one
+/// message the row shows. Tab routing and snooze are a conversation's either way.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum MailTarget {
+    Thread(i64),
+    Message { id: i64, thread_id: i64 },
+}
+
+impl MailTarget {
+    /// The target of a row, when it is backed by the mail core.
+    pub fn of(row: &MailMessage) -> Option<Self> {
+        let thread_id = row.thread_id?;
+        Some(match row.message_id {
+            Some(id) => Self::Message { id, thread_id },
+            None => Self::Thread(thread_id),
+        })
+    }
+
+    pub fn thread_id(self) -> i64 {
+        match self {
+            Self::Thread(thread_id) | Self::Message { thread_id, .. } => thread_id,
+        }
+    }
+
+    fn action_target(self) -> ActionTarget {
+        match self {
+            Self::Thread(thread_id) => ActionTarget::Threads(vec![thread_id]),
+            Self::Message { id, .. } => ActionTarget::Messages(vec![id]),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct MailConversation {
+    pub messages: Vec<MailMessage>,
+}
+
+#[derive(Clone, Debug)]
+pub struct MailMetadata {
+    pub account_revision: u64,
+    pub scope: Scope,
+    pub inbox_count: usize,
+    pub mailboxes: Vec<MailboxEntry>,
+    pub unified_mailboxes: Vec<MailboxEntry>,
+    pub sidebar_badges: SidebarBadges,
+    pub saved_searches: Vec<SavedSearchEntry>,
+    /// The account of local mail, which an import creates.
+    pub local_mail: Option<i64>,
+    /// Unread mail of `scope` older than the mail history this device
+    /// keeps, which only the server has.
+    pub server_only_unread: u32,
+}
+
+/// A search kept in the sidebar, with the unread mail it finds here.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SavedSearchEntry {
+    pub id: i64,
+    pub name: String,
+    pub query: String,
+    pub profile_id: Option<String>,
+    pub unread: i64,
+}
+
+struct PageLoadContext<'a> {
+    scope: Scope,
+    query: &'a str,
+    cursor: Option<MailCursor>,
+    limit: i64,
+    /// Read toward the list's start from `cursor`, for the rows before the
+    /// ones shown. The page still lists them in the list's order.
+    backward: bool,
+    include_counts: bool,
+    /// The accounts and folders the mail view shows.
+    accounts: &'a [Account],
+    folders: &'a [FolderInfo],
+    /// The account of local mail, if there is any.
+    local_mail: Option<i64>,
+    /// The active profile's accounts, if one is set.
+    profile: Option<&'a [i64]>,
+    /// Every connected account, shown or not.
+    account_count: usize,
+}
+
+/// Whether the mail view shows `account_id`: every account does unless a
+/// profile, given by its sorted accounts, is active.
+fn profile_shows(profile: Option<&[i64]>, account_id: i64) -> bool {
+    profile.is_none_or(|accounts| accounts.binary_search(&account_id).is_ok())
+}
+
+/// Local mail belongs to no account, so every profile shows it.
+fn with_local_mail(profile: Option<Arc<[i64]>>, local_mail: Option<i64>) -> Option<Arc<[i64]>> {
+    match (profile, local_mail) {
+        (Some(accounts), Some(local)) => match accounts.binary_search(&local) {
+            Ok(_) => Some(accounts),
+            Err(position) => {
+                let mut accounts = accounts.to_vec();
+                accounts.insert(position, local);
+                Some(accounts.into())
+            }
+        },
+        (profile, _) => profile,
+    }
+}
+
+/// Keep the accounts and folders the mail view shows with `profile`.
+fn retain_profile_accounts(
+    profile: Option<&[i64]>,
+    accounts: &mut Vec<Account>,
+    folders: &mut Vec<FolderInfo>,
+) {
+    accounts.retain(|account| profile_shows(profile, account.id));
+    folders.retain(|folder| profile_shows(profile, folder.account_id));
+}
+
+/// Keep shared labels and the labels of accounts shown with `profile`.
+fn retain_profile_labels(profile: Option<&[i64]>, labels: &mut Vec<Label>) {
+    labels.retain(|label| {
+        label
+            .owner_account_id
+            .is_none_or(|owner| profile_shows(profile, owner))
+    });
+}
+
+/// Keep empty snippets explicit in both the mailbox row and the temporary
+/// body shown while a message has no readable MIME content.
+pub fn display_preview(preview: &str) -> String {
+    if preview.trim().is_empty() {
+        "(No content)".to_owned()
+    } else {
+        preview.to_owned()
+    }
+}
+
+/// Thin native host adapter over the existing offline-first mail core.
+/// Authentication, synchronization, persistence, folder discovery, draft
+/// saving, and sending remain owned by flectar-mail-core rather than being
+/// copied
+/// into the Slint application.
+#[derive(Clone)]
+pub struct CoreMailSource {
+    core: Arc<Core>,
+    account_revision: Arc<std::sync::atomic::AtomicU64>,
+    /// The active profile's accounts, sorted; the mail view shows only these.
+    /// `None` shows every account.
+    profile_accounts: Arc<std::sync::Mutex<Option<Arc<[i64]>>>>,
+    /// Whether mail lists show conversations or each message on its own.
+    grouping: Arc<std::sync::Mutex<MailGrouping>>,
+    /// The lists shown oldest first; every other list is newest first.
+    oldest_first: Arc<std::sync::Mutex<std::collections::HashSet<Scope>>>,
+}
+
+/// Accounts changed outside the window, such as on another device through
+/// Flectar Mail Sync.
+#[derive(Clone)]
+pub(crate) struct AccountChangeNotice(Arc<std::sync::atomic::AtomicU64>);
+
+impl AccountChangeNotice {
+    /// Snapshots of the accounts read before must not be applied.
+    pub(crate) fn note(&self) {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
+pub struct AccountSnapshot {
+    pub revision: u64,
+    pub accounts: Vec<Account>,
+    pub configs: Vec<AccountConfig>,
+}
+
+impl CoreMailSource {
+    pub fn account_revision(&self) -> u64 {
+        self.account_revision
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Show only these accounts in the mail view, or every account with
+    /// `None`. Returns whether that changed; pages and counts loaded for the
+    /// previous accounts are then out of date.
+    pub fn set_profile_accounts(&self, accounts: Option<Vec<i64>>) -> bool {
+        let accounts = accounts.map(|mut accounts| {
+            accounts.sort_unstable();
+            accounts.dedup();
+            Arc::<[i64]>::from(accounts)
+        });
+        {
+            let mut current = self
+                .profile_accounts
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if *current == accounts {
+                return false;
+            }
+            *current = accounts;
+        }
+        // After the new accounts are in place: a load that reads the new
+        // revision also reads them.
+        self.account_revision
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        true
+    }
+
+    /// Show conversations, or each message on its own. Returns whether that
+    /// changed; pages and counts loaded in the other grouping are then out of
+    /// date.
+    pub fn set_grouping(&self, grouping: MailGrouping) -> bool {
+        {
+            let mut current = self
+                .grouping
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if *current == grouping {
+                return false;
+            }
+            *current = grouping;
+        }
+        // After the new grouping is in place: a load that reads the new
+        // revision also reads it.
+        self.account_revision
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        true
+    }
+
+    pub fn grouping(&self) -> MailGrouping {
+        *self
+            .grouping
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// The order `scope` lists its mail in.
+    pub fn order(&self, scope: Scope) -> ListOrder {
+        let oldest_first = self
+            .oldest_first
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if oldest_first.contains(&scope) {
+            ListOrder::OldestFirst
+        } else {
+            ListOrder::NewestFirst
+        }
+    }
+
+    /// List `scope` in `order` from now on. Returns whether that changed;
+    /// pages loaded in the other order are then out of date. `save_order`
+    /// keeps it for later sessions.
+    pub fn set_order(&self, scope: Scope, order: ListOrder) -> bool {
+        {
+            let mut oldest_first = self
+                .oldest_first
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let changed = match order {
+                ListOrder::OldestFirst => oldest_first.insert(scope),
+                ListOrder::NewestFirst => oldest_first.remove(&scope),
+            };
+            if !changed {
+                return false;
+            }
+        }
+        // After the new order is in place: a load that reads the new
+        // revision also reads it.
+        self.account_revision
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        true
+    }
+
+    /// Keep `scope` in `order` for later sessions. Fails for a list whose
+    /// folder, label or account is gone.
+    pub async fn save_order(&self, scope: Scope, order: ListOrder) -> Result<(), String> {
+        self.core
+            .set_list_order(scope.to_string(), list_owner(scope), order)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    fn profile_accounts(&self) -> Option<Arc<[i64]>> {
+        self.profile_accounts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    pub async fn load_local_mail(
+        &self,
+    ) -> Result<Option<flectar_mail_core::models::LocalMail>, String> {
+        self.core
+            .local_mail()
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    async fn load_local_mail_account(&self) -> Result<Option<i64>, String> {
+        self.core
+            .local_mail_account()
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    pub async fn load_account_snapshot(&self) -> Result<AccountSnapshot, String> {
+        let revision = self.account_revision();
+        let (accounts, configs) =
+            tokio::try_join!(self.load_accounts(), self.load_account_configs())?;
+        Ok(AccountSnapshot {
+            revision,
+            accounts,
+            configs,
+        })
+    }
+
+    pub(crate) fn account_preferences_core(&self) -> Arc<Core> {
+        Arc::clone(&self.core)
+    }
+
+    pub(crate) fn file_core(&self) -> Arc<Core> {
+        Arc::clone(&self.core)
+    }
+
+    /// Flectar Mail Sync's settings call the core directly.
+    pub(crate) fn device_sync_core(&self) -> Arc<Core> {
+        Arc::clone(&self.core)
+    }
+
+    /// A way to say accounts changed outside this window, which doesn't keep
+    /// the core alive.
+    pub(crate) fn account_change_notice(&self) -> AccountChangeNotice {
+        AccountChangeNotice(Arc::clone(&self.account_revision))
+    }
+    pub async fn start(
+        paths: Paths,
+        credentials: flectar_mail_core::accounts::credentials::CredentialStoreHandle,
+        oauth_redirects: flectar_mail_core::oauth::redirect::OAuthRedirectBrokerHandle,
+    ) -> Result<Self, String> {
+        let core = Core::start_mail_ui_with_platform(paths, credentials, oauth_redirects)
+            .await
+            .map_err(|error| error.to_string())?;
+        // A list whose saved order can't be read is newest first, as before
+        // it was turned around.
+        let oldest_first =
+            oldest_first_scopes(core.oldest_first_lists().await.unwrap_or_else(|error| {
+                tracing::warn!(%error, "mail list orders could not be read");
+                Vec::new()
+            }));
+        Ok(Self {
+            core: Arc::new(core),
+            account_revision: Arc::default(),
+            profile_accounts: Arc::default(),
+            grouping: Arc::default(),
+            oldest_first: Arc::new(std::sync::Mutex::new(oldest_first)),
+        })
+    }
+
+    /// Release background synchronization only after Slint has accepted the
+    /// startup snapshot. This keeps migrations and sync from competing with
+    /// the first visible frame.
+    pub fn notify_ui_ready(&self) {
+        self.core.notify_ui_ready();
+    }
+
+    /// Searches the servers of `accounts` for `query`, past the mail kept
+    /// here, going on from `cursors`. The list's search shows what they find
+    /// from then on.
+    pub async fn search_server(
+        &self,
+        query: String,
+        accounts: Vec<i64>,
+        cursors: Vec<(i64, ServerSearchCursor)>,
+    ) -> Result<ServerFound, String> {
+        let page = self
+            .core
+            .search_server(query, accounts, cursors, crate::server_search::PAGE)
+            .await
+            .map_err(|error| error.to_string())?;
+        let rows = match self.grouping() {
+            MailGrouping::Conversations => page
+                .threads
+                .iter()
+                .filter_map(|thread| i32::try_from(thread.id).ok())
+                .collect(),
+            MailGrouping::Messages => page
+                .messages
+                .iter()
+                .filter_map(|message| i32::try_from(message.id).ok())
+                .collect(),
+        };
+        Ok(ServerFound {
+            rows,
+            cursors: page.cursors,
+            failed: page.failed,
+        })
+    }
+
+    pub async fn load_page(
+        &self,
+        scope: Scope,
+        query: &str,
+        cursor: Option<MailCursor>,
+        limit: i64,
+        include_counts: bool,
+    ) -> Result<MailPage, String> {
+        self.read_page(scope, query, cursor, limit, include_counts, false)
+            .await
+    }
+
+    /// The rows of `scope` before the shown ones, which start with the row
+    /// whose own cursor is `first`, in the list's order. The page's
+    /// `next_cursor` reads on toward the list's start, and is None once that
+    /// is reached.
+    pub async fn load_earlier(
+        &self,
+        scope: Scope,
+        first: MailCursor,
+        limit: i64,
+    ) -> Result<MailPage, String> {
+        self.read_page(scope, "", Some(first), limit, false, true)
+            .await
+    }
+
+    /// The rows of `scope` from list row `row` on, for a row further down
+    /// than one read goes. A row that is gone gives the list's start.
+    pub async fn load_page_from_row(
+        &self,
+        scope: Scope,
+        row: i32,
+        limit: i64,
+    ) -> Result<MailPage, String> {
+        let grouping = self.grouping();
+        let start = self
+            .core
+            .row_time(grouping, i64::from(row))
+            .await
+            .map_err(|error| error.to_string())?
+            .map(|time| cursor_before(grouping, time, i64::from(row), self.order(scope)));
+        self.load_page(scope, "", start, limit, false).await
+    }
+
+    async fn read_page(
+        &self,
+        scope: Scope,
+        query: &str,
+        cursor: Option<MailCursor>,
+        limit: i64,
+        include_counts: bool,
+        backward: bool,
+    ) -> Result<MailPage, String> {
+        let revision = self.account_revision();
+        let profile = self.profile_accounts();
+        let mut accounts = self
+            .core
+            .list_accounts()
+            .await
+            .map_err(|error| error.to_string())?;
+        let mut folders = self
+            .core
+            .list_folders(None)
+            .await
+            .map_err(|error| error.to_string())?;
+        let local_mail = self.load_local_mail_account().await?;
+        let profile = with_local_mail(profile, local_mail);
+        let account_count = accounts.len();
+        retain_profile_accounts(profile.as_deref(), &mut accounts, &mut folders);
+        self.load_page_with_context(PageLoadContext {
+            scope,
+            query,
+            cursor,
+            limit,
+            backward,
+            include_counts,
+            accounts: &accounts,
+            folders: &folders,
+            local_mail,
+            profile: profile.as_deref(),
+            account_count,
+        })
+        .await
+        .map(|mut page| {
+            page.account_revision = revision;
+            page
+        })
+    }
+
+    /// Mark everything `scope` lists as read (#234): a whole mailbox on its
+    /// server too, part of one as ordinary read actions. The list is the one
+    /// [`Self::load_page`] shows for the scope.
+    pub async fn mark_all_read(&self, scope: Scope) -> Result<(), String> {
+        let profile = self.profile_accounts();
+        let mut accounts = self
+            .core
+            .list_accounts()
+            .await
+            .map_err(|error| error.to_string())?;
+        let mut folders = self
+            .core
+            .list_folders(None)
+            .await
+            .map_err(|error| error.to_string())?;
+        let local_mail = self.load_local_mail_account().await?;
+        let profile = with_local_mail(profile, local_mail);
+        retain_profile_accounts(profile.as_deref(), &mut accounts, &mut folders);
+        let mut labels = self
+            .core
+            .list_labels()
+            .await
+            .map_err(|error| error.to_string())?;
+        retain_profile_labels(profile.as_deref(), &mut labels);
+        let mut resolved = resolve_scope(scope, &folders, &labels);
+        if resolved
+            .account_id
+            .is_some_and(|account_id| !profile_shows(profile.as_deref(), account_id))
+        {
+            resolved = resolve_scope(Scope::UNIFIED_INBOX, &folders, &labels);
+        }
+        let profile_accounts = profile
+            .as_deref()
+            .filter(|_| resolved.account_id.is_none())
+            .map(<[i64]>::to_vec);
+        self.core
+            .mark_all_read(
+                resolved.view,
+                resolved.split_id,
+                resolved.account_id,
+                profile_accounts,
+                resolved.label_id,
+                resolved.folder_id,
+            )
+            .await
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+
+    /// Startup needs the account list and first page together. Loading them in
+    /// one adapter call avoids querying accounts a second time while retaining
+    /// the account list if folder/page projection happens to fail.
+    pub async fn load_startup_page(
+        &self,
+        preferred_scope: Scope,
+        limit: i64,
+    ) -> Result<(Vec<Account>, Scope, Option<MailPage>), String> {
+        let profile = self.profile_accounts();
+        let accounts = self
+            .core
+            .list_accounts()
+            .await
+            .map_err(|error| error.to_string())?;
+        let mut shown = accounts.clone();
+        let local_mail = self.load_local_mail_account().await?;
+        let profile = with_local_mail(profile, local_mail);
+        let (scope, page) = match self.core.list_folders(None).await {
+            Ok(mut folders) => {
+                retain_profile_accounts(profile.as_deref(), &mut shown, &mut folders);
+                let mut labels = self.core.list_labels().await.unwrap_or_default();
+                retain_profile_labels(profile.as_deref(), &mut labels);
+                let scope =
+                    validated_startup_scope(preferred_scope, &shown, &folders, local_mail, &labels);
+                let page = self
+                    .load_page_with_context(PageLoadContext {
+                        scope,
+                        query: "",
+                        cursor: None,
+                        limit,
+                        backward: false,
+                        include_counts: false,
+                        accounts: &shown,
+                        folders: &folders,
+                        local_mail,
+                        profile: profile.as_deref(),
+                        account_count: accounts.len(),
+                    })
+                    .await
+                    .ok();
+                (scope, page)
+            }
+            Err(_) => {
+                shown.retain(|account| profile_shows(profile.as_deref(), account.id));
+                (Scope::UNIFIED_INBOX.visible_for(&shown), None)
+            }
+        };
+        Ok((accounts, scope, page))
+    }
+
+    /// Load exact sidebar badges independently of the latency-sensitive message
+    /// page. Core events can therefore update counters live without delaying
+    /// list rendering.
+    pub async fn load_mail_metadata(&self, scope: Scope) -> Result<MailMetadata, String> {
+        let revision = self.account_revision();
+        let profile = self.profile_accounts();
+        let mut accounts = self
+            .core
+            .list_accounts()
+            .await
+            .map_err(|error| error.to_string())?;
+        let mut folders = self
+            .core
+            .list_folders(None)
+            .await
+            .map_err(|error| error.to_string())?;
+        let local_mail = self.load_local_mail_account().await?;
+        let profile = with_local_mail(profile, local_mail);
+        retain_profile_accounts(profile.as_deref(), &mut accounts, &mut folders);
+        self.load_mail_metadata_with_context(
+            scope,
+            &accounts,
+            &folders,
+            local_mail,
+            profile.as_deref(),
+        )
+        .await
+        .map(|mut metadata| {
+            metadata.account_revision = revision;
+            metadata
+        })
+    }
+
+    /// The saved searches the sidebar shows with the profile in view, each
+    /// with its unread mail.
+    pub async fn saved_searches(&self) -> Result<Vec<SavedSearchEntry>, String> {
+        let local_mail = self.load_local_mail_account().await?;
+        let shown = with_local_mail(self.profile_accounts(), local_mail);
+        self.saved_searches_for(shown.as_deref()).await
+    }
+
+    /// The saved searches of the profile in view and those of every profile,
+    /// counted in `shown`, the accounts the view shows, or every account.
+    async fn saved_searches_for(
+        &self,
+        shown: Option<&[i64]>,
+    ) -> Result<Vec<SavedSearchEntry>, String> {
+        let settings = self
+            .core
+            .get_settings()
+            .await
+            .map_err(|error| error.to_string())?;
+        if settings.saved_searches.is_empty() {
+            return Ok(Vec::new());
+        }
+        let counts = self
+            .core
+            .saved_search_counts(
+                self.grouping() == MailGrouping::Conversations,
+                shown.map(<[i64]>::to_vec),
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        let active = settings.active_mail_profile;
+        Ok(settings
+            .saved_searches
+            .into_iter()
+            .filter(|saved| saved.profile_id.is_none() || saved.profile_id == active)
+            .map(|saved| SavedSearchEntry {
+                unread: counts
+                    .iter()
+                    .find(|(id, _)| *id == saved.id)
+                    .map_or(0, |(_, unread)| *unread),
+                id: saved.id,
+                name: saved.name,
+                query: saved.query,
+                profile_id: saved.profile_id,
+            })
+            .collect())
+    }
+
+    /// Keeps a search in the sidebar, or changes one kept there.
+    pub async fn save_search(
+        &self,
+        id: Option<i64>,
+        name: String,
+        query: String,
+        profile_id: Option<String>,
+    ) -> Result<(), String> {
+        self.core
+            .save_search(id, name, query, profile_id)
+            .await
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+
+    /// Takes a search out of the sidebar. Its mail stays where it is.
+    pub async fn delete_saved_search(&self, id: i64) -> Result<(), String> {
+        self.core
+            .delete_saved_search(id)
+            .await
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+
+    /// Moves a saved search to `index` in the sidebar's order.
+    pub async fn move_saved_search(&self, id: i64, index: usize) -> Result<(), String> {
+        self.core
+            .move_saved_search(id, index)
+            .await
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+
+    async fn load_mail_metadata_with_context(
+        &self,
+        scope: Scope,
+        accounts: &[Account],
+        folders: &[FolderInfo],
+        local_mail: Option<i64>,
+        profile: Option<&[i64]>,
+    ) -> Result<MailMetadata, String> {
+        let mut badges = self
+            .core
+            .mailbox_badge_counts(self.grouping())
+            .await
+            .map_err(|error| error.to_string())?;
+        // Unified totals add up the shown accounts only.
+        badges.retain(|counts| profile_shows(profile, counts.account_id));
+        let server_only = server_only_folders(scope, folders);
+        let server_only_unread = if server_only.is_empty() {
+            0
+        } else {
+            self.core
+                .server_only_unread(server_only)
+                .await
+                .map_err(|error| error.to_string())?
+                .map_or(0, badge)
+        };
+        let saved_searches = self.saved_searches_for(profile).await?;
+        Ok(MailMetadata {
+            account_revision: self.account_revision(),
+            scope,
+            saved_searches,
+            inbox_count: badges
+                .iter()
+                .map(|counts| counts.inbox.max(0) as usize)
+                .sum(),
+            mailboxes: mailbox_entries_with_counts(accounts, folders, local_mail, &badges),
+            unified_mailboxes: unified_mailbox_entries(&badges),
+            sidebar_badges: sidebar_badges(&badges),
+            local_mail,
+            server_only_unread,
+        })
+    }
+
+    async fn load_page_with_context(
+        &self,
+        context: PageLoadContext<'_>,
+    ) -> Result<MailPage, String> {
+        let PageLoadContext {
+            scope,
+            query,
+            cursor,
+            limit,
+            backward,
+            include_counts,
+            accounts,
+            folders,
+            local_mail,
+            profile,
+            account_count,
+        } = context;
+        let mut labels = self
+            .core
+            .list_labels()
+            .await
+            .map_err(|error| error.to_string())?;
+        retain_profile_labels(profile, &mut labels);
+        let metadata = if include_counts {
+            Some(
+                self.load_mail_metadata_with_context(scope, accounts, folders, local_mail, profile)
+                    .await?,
+            )
+        } else {
+            None
+        };
+        let mailboxes = metadata
+            .as_ref()
+            .map(|metadata| metadata.mailboxes.clone())
+            .unwrap_or_else(|| mailbox_entries(accounts, folders, local_mail));
+        let mut resolved = resolve_scope(scope, folders, &labels);
+        // The mailbox of an account the profile leaves out shows the
+        // profile's inbox instead.
+        if resolved
+            .account_id
+            .is_some_and(|account_id| !profile_shows(profile, account_id))
+        {
+            resolved = resolve_scope(Scope::UNIFIED_INBOX, folders, &labels);
+        }
+        // Unified mailboxes, categories and shared labels cover the profile's
+        // accounts; an account's own mailboxes need no more than its id.
+        let profile_accounts = profile.filter(|_| resolved.account_id.is_none());
+        // Search results span folders, so they keep to newest first.
+        let order = if query.trim().is_empty() {
+            self.order(scope)
+        } else {
+            ListOrder::NewestFirst
+        };
+        // Rows before the shown ones come nearest first from the other order.
+        let read_order = if backward { order.reversed() } else { order };
+        let start = (!backward).then_some(cursor).flatten();
+
+        // The Scheduled view shows when each draft goes out.
+        let sends = if resolved.view == View::Scheduled {
+            self.core
+                .scheduled_sends()
+                .await
+                .map_err(|error| error.to_string())?
+        } else {
+            Vec::new()
+        };
+        if self.grouping() == MailGrouping::Messages {
+            let (rows, next_cursor) = self
+                .load_message_rows(
+                    &resolved,
+                    profile_accounts,
+                    query,
+                    cursor,
+                    limit,
+                    read_order,
+                )
+                .await?;
+            let mut messages = rows
+                .into_iter()
+                .filter_map(|row| {
+                    message_summary_to_message(row, accounts, resolved.title.as_str())
+                })
+                .map(|message| shown_times(message, resolved.view, &sends))
+                .collect::<Vec<_>>();
+            if backward {
+                messages.reverse();
+            }
+            return Ok(MailPage {
+                account_revision: self.account_revision(),
+                order,
+                start,
+                messages,
+                labels,
+                mailboxes,
+                next_cursor,
+                account_count,
+                unified_mailboxes: metadata
+                    .map(|metadata| metadata.unified_mailboxes)
+                    .unwrap_or_default(),
+            });
+        }
+
+        let (threads, next_cursor) = if query.trim().is_empty() {
+            let cursor = match cursor {
+                None => None,
+                Some(MailCursor::Thread(cursor)) => Some(cursor),
+                Some(_) => return Err("this cursor belongs to another list".into()),
+            };
+            let page = flectar_mail_core::ThreadPageRequest {
+                cursor,
+                limit,
+                order: read_order,
+            };
+            let page = match profile_accounts {
+                Some(accounts) => {
+                    self.core
+                        .list_threads_for_accounts(
+                            resolved.view,
+                            resolved.split_id,
+                            accounts.to_vec(),
+                            resolved.label_id,
+                            resolved.folder_id,
+                            page,
+                        )
+                        .await
+                }
+                None => {
+                    self.core
+                        .list_threads(
+                            resolved.view,
+                            resolved.split_id,
+                            resolved.account_id,
+                            resolved.label_id,
+                            resolved.folder_id,
+                            page,
+                        )
+                        .await
+                }
+            }
+            .map_err(|error| error.to_string())?;
+            (page.threads, page.next_cursor.map(MailCursor::Thread))
+        } else {
+            // The mail list is a timeline: search narrows it, then presents
+            // the newest matching threads first. Relevance-ranked retrieval
+            // remains available to non-UI core consumers.
+            let cursor = match cursor {
+                None => None,
+                Some(MailCursor::Search(cursor)) => Some(cursor),
+                Some(_) => return Err("this cursor belongs to another list".into()),
+            };
+            let query = query.trim().to_owned();
+            let page = match profile_accounts {
+                Some(accounts) => {
+                    self.core
+                        .search_chronological_page_for_accounts(
+                            query,
+                            accounts.to_vec(),
+                            cursor,
+                            limit,
+                        )
+                        .await
+                }
+                None => {
+                    self.core
+                        .search_chronological_page(query, resolved.account_id, cursor, limit)
+                        .await
+                }
+            }
+            .map_err(|error| error.to_string())?;
+            (page.threads, page.next_cursor.map(MailCursor::Search))
+        };
+
+        let mut messages = threads
+            .into_iter()
+            .filter_map(|thread| summary_to_message(thread, accounts, resolved.title.as_str()))
+            .map(|message| shown_times(message, resolved.view, &sends))
+            .collect::<Vec<_>>();
+        if backward {
+            messages.reverse();
+        }
+
+        Ok(MailPage {
+            account_revision: self.account_revision(),
+            order,
+            start,
+            messages,
+            labels,
+            mailboxes,
+            next_cursor,
+            account_count,
+            unified_mailboxes: metadata
+                .map(|metadata| metadata.unified_mailboxes)
+                .unwrap_or_default(),
+        })
+    }
+
+    /// One page of the mailbox or search as single messages, for mail lists
+    /// without conversations.
+    async fn load_message_rows(
+        &self,
+        resolved: &ScopeResolution,
+        profile_accounts: Option<&[i64]>,
+        query: &str,
+        cursor: Option<MailCursor>,
+        limit: i64,
+        order: ListOrder,
+    ) -> Result<(Vec<MessageSummary>, Option<MailCursor>), String> {
+        if query.trim().is_empty() {
+            let cursor = match cursor {
+                None => None,
+                Some(MailCursor::Message(cursor)) => Some(cursor),
+                Some(_) => return Err("this cursor belongs to another list".into()),
+            };
+            let page = flectar_mail_core::MessagePageRequest {
+                cursor,
+                limit,
+                order,
+            };
+            let page = match profile_accounts {
+                Some(accounts) => {
+                    self.core
+                        .list_messages_for_accounts(
+                            resolved.view,
+                            resolved.split_id,
+                            accounts.to_vec(),
+                            resolved.label_id,
+                            resolved.folder_id,
+                            page,
+                        )
+                        .await
+                }
+                None => {
+                    self.core
+                        .list_messages(
+                            resolved.view,
+                            resolved.split_id,
+                            resolved.account_id,
+                            resolved.label_id,
+                            resolved.folder_id,
+                            page,
+                        )
+                        .await
+                }
+            }
+            .map_err(|error| error.to_string())?;
+            return Ok((page.messages, page.next_cursor.map(MailCursor::Message)));
+        }
+        let cursor = match cursor {
+            None => None,
+            Some(MailCursor::MessageSearch(cursor)) => Some(cursor),
+            Some(_) => return Err("this cursor belongs to another list".into()),
+        };
+        let query = query.trim().to_owned();
+        let page = match profile_accounts {
+            Some(accounts) => {
+                self.core
+                    .search_messages_page_for_accounts(query, accounts.to_vec(), cursor, limit)
+                    .await
+            }
+            None => {
+                self.core
+                    .search_messages_page(query, resolved.account_id, cursor, limit)
+                    .await
+            }
+        }
+        .map_err(|error| error.to_string())?;
+        Ok((
+            page.messages,
+            page.next_cursor.map(MailCursor::MessageSearch),
+        ))
+    }
+
+    /// Load the selected thread as independent messages. Bodies are still
+    /// fetched lazily by the core and the UI expands only one message at a
+    /// time, so opening a long conversation does not create a renderer per
+    /// message.
+    pub async fn load_conversation(
+        &self,
+        row: &MailMessage,
+        selected_message_id: Option<i64>,
+    ) -> Result<MailConversation, String> {
+        // A row of a list without conversations opens only its message.
+        if let Some(message_id) = row.message_id {
+            let message = self
+                .core
+                .get_body(message_id)
+                .await
+                .map_err(|error| error.to_string())?;
+            let mut message = detail_to_conversation_message(row, &message, true)
+                .ok_or_else(|| "message id is out of range".to_owned())?;
+            message.invitation = self.invitation_card(message_id).await;
+            return Ok(MailConversation {
+                messages: vec![message],
+            });
+        }
+        let thread_id = row
+            .thread_id
+            .ok_or_else(|| "message is not backed by a core thread".to_owned())?;
+        let mut thread = self
+            .core
+            .get_thread_outline(thread_id)
+            .await
+            .map_err(|error| error.to_string())?;
+        let selected_message_id = selected_message_id
+            .filter(|id| thread.messages.iter().any(|message| message.id == *id))
+            .or_else(|| thread.messages.last().map(|message| message.id))
+            .ok_or_else(|| "thread has no messages".to_owned())?;
+        let selected = self
+            .core
+            .get_body(selected_message_id)
+            .await
+            .map_err(|error| error.to_string())?;
+        if let Some(message) = thread
+            .messages
+            .iter_mut()
+            .find(|message| message.id == selected_message_id)
+        {
+            *message = selected;
+        }
+        let mut messages = thread
+            .messages
+            .iter()
+            .filter_map(|message| {
+                detail_to_conversation_message(row, message, message.id == selected_message_id)
+            })
+            .collect::<Vec<_>>();
+        if messages.is_empty() {
+            return Err("thread has no messages".to_owned());
+        }
+        // The open message's card comes with its body, so the message
+        // doesn't move down when the card arrives.
+        let card = self.invitation_card(selected_message_id).await;
+        if let Some(message) = messages
+            .iter_mut()
+            .find(|message| i64::from(message.id) == selected_message_id)
+        {
+            message.invitation = card;
+        }
+        Ok(MailConversation { messages })
+    }
+
+    pub async fn load_compose_source(
+        &self,
+        row: &MailMessage,
+        message_id: Option<i64>,
+    ) -> Result<ComposeSource, String> {
+        // A single message's row answers that message.
+        let message_id = message_id.or(row.message_id);
+        let thread_id = row
+            .thread_id
+            .ok_or_else(|| "message is not backed by a core thread".to_owned())?;
+        let thread = self
+            .core
+            .get_thread(thread_id)
+            .await
+            .map_err(|error| error.to_string())?;
+        let message = thread
+            .messages
+            .iter()
+            .find(|message| Some(message.id) == message_id)
+            .or_else(|| thread.messages.last())
+            .ok_or_else(|| "thread has no messages".to_owned())?;
+        let (account, sender_identities, default_sender_email) =
+            self.answering_account(message).await?;
+        // The original's own images come inline, fetched now if they weren't
+        // yet: the thread leaves those still downloading as cid: links, which
+        // a reply or forward could not carry.
+        let html_body =
+            match tokio::time::timeout(COMPOSE_IMAGES_WAIT, self.core.get_body(message.id)).await {
+                Ok(Ok(detail)) => detail.html_body,
+                _ => None,
+            }
+            .or_else(|| message.html_body.clone())
+            .filter(|html| !html.trim().is_empty());
+
+        Ok(ComposeSource {
+            message_id: message.id,
+            account_id: account.id,
+            account_email: account.email,
+            sender_identities,
+            default_sender_email,
+            from: message.from.clone(),
+            to: message.to.clone(),
+            cc: message.cc.clone(),
+            subject: message.subject.clone(),
+            date: message.date,
+            text_body: message
+                .text_body
+                .clone()
+                .filter(|body| !body.trim().is_empty())
+                .unwrap_or_else(|| message.snippet.clone()),
+            html_body,
+            // Images shown in the text are part of it, not files.
+            attachments: message
+                .attachments
+                .iter()
+                .filter(|attachment| !attachment.is_inline)
+                .cloned()
+                .collect(),
+        })
+    }
+
+    /// Where a message's file is kept here, downloading it first if needed.
+    pub async fn attachment_path(&self, attachment_id: i64) -> Result<String, String> {
+        self.core
+            .get_attachment(attachment_id)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    /// The messages of `target` to forward as attachments, with their subjects.
+    pub async fn forwarded_messages(
+        &self,
+        target: ActionTarget,
+    ) -> Result<Vec<ForwardedMessage>, String> {
+        self.core
+            .forwarded_messages(target)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    /// The scheduled send of a row's draft, if it waits for one.
+    pub async fn scheduled_send_of(
+        &self,
+        row: &MailMessage,
+    ) -> Result<Option<ScheduledSend>, String> {
+        let sends = self
+            .core
+            .scheduled_sends()
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok(sends
+            .into_iter()
+            .filter(|send| match row.message_id {
+                Some(draft) => send.draft_id == draft,
+                None => send.thread_id.is_some() && send.thread_id == row.thread_id,
+            })
+            .min_by_key(|send| send.send_at))
+    }
+
+    /// Stop a row's scheduled send; its draft stays. Returns whether one
+    /// waited.
+    pub async fn cancel_scheduled_row(&self, row: &MailMessage) -> Result<bool, String> {
+        let Some(send) = self.scheduled_send_of(row).await? else {
+            return Ok(false);
+        };
+        self.core
+            .cancel_scheduled_send(send.draft_id)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    /// Send a row's scheduled draft now. Returns whether one waited.
+    pub async fn send_scheduled_row_now(&self, row: &MailMessage) -> Result<bool, String> {
+        let Some(send) = self.scheduled_send_of(row).await? else {
+            return Ok(false);
+        };
+        self.core
+            .send_now(send.action_id)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    /// Move a row's scheduled draft to `send_at`.
+    pub async fn reschedule_row(&self, row: &MailMessage, send_at: i64) -> Result<(), String> {
+        let send = self
+            .scheduled_send_of(row)
+            .await?
+            .ok_or_else(|| "this message is not scheduled".to_owned())?;
+        self.core
+            .reschedule_send(send.action_id, send.draft_id, send_at)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    /// The storage services files go by link from.
+    pub async fn link_services(
+        &self,
+    ) -> Result<Vec<flectar_mail_core::links::LinkService>, String> {
+        self.core
+            .link_services()
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    /// Starts signing in to a storage service in the browser.
+    pub async fn start_link_service_login(
+        &self,
+        server_url: String,
+    ) -> Result<flectar_mail_core::links::LinkLogin, String> {
+        self.core
+            .start_link_service_login(&server_url)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    /// Waits for a sign-in in the browser to finish, and keeps the service.
+    pub async fn finish_link_service_login(
+        &self,
+        login: flectar_mail_core::links::LinkLogin,
+    ) -> Result<flectar_mail_core::links::LinkService, String> {
+        self.core
+            .finish_link_service_login(login)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    /// Keeps a storage service signed in with an app password.
+    pub async fn add_link_service(
+        &self,
+        server_url: String,
+        login_name: String,
+        app_password: String,
+    ) -> Result<flectar_mail_core::links::LinkService, String> {
+        self.core
+            .add_link_service(&server_url, &login_name, &app_password)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    /// The storage service a message from the account with id `account_id` sends files by
+    /// link from: the account's own when that's on, else the Nextcloud or ownCloud server.
+    pub async fn link_service_for_account(
+        &self,
+        account_id: i64,
+    ) -> Result<Option<flectar_mail_core::links::LinkService>, String> {
+        self.core
+            .link_service_for_account(account_id)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    /// Turns on sending files by link from the account's Google Drive or OneDrive, widening
+    /// its sign-in in the browser, which `open_url` opens.
+    pub async fn add_cloud_link_service<F>(
+        &self,
+        account_id: i64,
+        open_url: F,
+    ) -> Result<flectar_mail_core::links::LinkService, String>
+    where
+        F: FnOnce(String) -> Result<(), String> + Send + 'static,
+    {
+        self.core
+            .add_cloud_link_service(account_id, open_url)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    pub async fn remove_link_service(&self, id: i64) -> Result<(), String> {
+        self.core
+            .remove_link_service(id)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    /// Uploads a file and shares it by link.
+    pub async fn share_by_link(
+        &self,
+        service_id: i64,
+        path: std::path::PathBuf,
+        name: String,
+    ) -> Result<flectar_mail_core::links::SharedLink, String> {
+        self.core
+            .share_by_link(service_id, &path, &name)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    /// Takes back a link and the file it shares.
+    pub async fn unshare_link(
+        &self,
+        link: flectar_mail_core::links::SharedLink,
+    ) -> Result<(), String> {
+        self.core
+            .unshare_link(&link)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    /// The originals of `message_ids` in files of their own to attach, which go when their
+    /// paths are dropped, or why they couldn't be fetched.
+    pub async fn forwarded_originals(
+        &self,
+        message_ids: Vec<i64>,
+    ) -> Vec<(i64, Result<tempfile::TempPath, String>)> {
+        self.core
+            .forwarded_originals(message_ids)
+            .await
+            .into_iter()
+            .map(|(id, file)| (id, file.map_err(|error| error.to_string())))
+            .collect()
+    }
+
+    /// The account a reply or forward of `message` goes from, with its sender identities and
+    /// the address it sends from by default: the message's own account, and for local mail,
+    /// the one [`Self::reply_account`] finds.
+    async fn answering_account(
+        &self,
+        message: &MessageDetail,
+    ) -> Result<(Account, Vec<SenderIdentity>, String), String> {
+        let accounts = self
+            .core
+            .list_accounts()
+            .await
+            .map_err(|error| error.to_string())?;
+        let configs = self
+            .core
+            .list_account_configs()
+            .await
+            .map_err(|error| error.to_string())?;
+        let sending: Vec<Account> = accounts
+            .iter()
+            .filter(|account| {
+                configs
+                    .iter()
+                    .any(|config| config.id == account.id && config.sends_mail())
+            })
+            .cloned()
+            .collect();
+        let account = match sending
+            .iter()
+            .find(|account| account.id == message.account_id)
+        {
+            Some(account) => account.clone(),
+            // Local mail, and mail of an account that only receives (#252),
+            // is answered from an account that sends.
+            None => {
+                if !accounts
+                    .iter()
+                    .any(|account| account.id == message.account_id)
+                    && self.load_local_mail_account().await? != Some(message.account_id)
+                {
+                    return Err("message account is no longer connected".to_owned());
+                }
+                self.reply_account(&sending, message).await?
+            }
+        };
+        let sender_identities = self
+            .core
+            .list_sender_identities(account.id)
+            .await
+            .map_err(|error| error.to_string())?;
+        let default_sender_email = self
+            .core
+            .default_sender_identity(account.id)
+            .await
+            .map_err(|error| error.to_string())?
+            .email;
+        Ok((account, sender_identities, default_sender_email))
+    }
+
+    /// The account a forward of `message` goes from, and the address: the one the message
+    /// reached, as a forward that quotes it would.
+    pub async fn forward_sender(
+        &self,
+        message: &ForwardedMessage,
+    ) -> Result<(Account, String), String> {
+        let thread_id = message
+            .thread_id
+            .ok_or_else(|| "message is not backed by a core thread".to_owned())?;
+        let thread = self
+            .core
+            .get_thread_outline(thread_id)
+            .await
+            .map_err(|error| error.to_string())?;
+        let detail = thread
+            .messages
+            .iter()
+            .find(|detail| detail.id == message.message_id)
+            .ok_or_else(|| "message not found".to_owned())?;
+        let (account, identities, default_sender_email) = self.answering_account(detail).await?;
+        let sender = flectar_mail_core::sender_identities::reply_sender(
+            &identities,
+            detail.to.iter().chain(detail.cc.iter()),
+        )
+        .unwrap_or(default_sender_email);
+        Ok((account, sender))
+    }
+
+    /// The account of `accounts` that answers mail whose own account doesn't
+    /// send, such as local mail. It's the one with an address the message
+    /// was sent to or from, or else the first.
+    async fn reply_account(
+        &self,
+        accounts: &[Account],
+        message: &flectar_mail_core::models::MessageDetail,
+    ) -> Result<Account, String> {
+        for account in accounts {
+            let identities = self
+                .core
+                .list_sender_identities(account.id)
+                .await
+                .map_err(|error| error.to_string())?;
+            let addressed = message
+                .to
+                .iter()
+                .chain(&message.cc)
+                .chain(std::iter::once(&message.from))
+                .any(|address| {
+                    identities
+                        .iter()
+                        .any(|identity| identity.email.eq_ignore_ascii_case(&address.email))
+                });
+            if addressed {
+                return Ok(account.clone());
+            }
+        }
+        accounts
+            .first()
+            .cloned()
+            .ok_or_else(|| "no account can send mail".to_owned())
+    }
+
+    pub async fn load_draft(&self, row: &MailMessage) -> Result<SaveDraftArgs, String> {
+        // A draft listed on its own is the one to edit.
+        if let Some(draft_id) = row.message_id {
+            return self
+                .core
+                .get_draft(draft_id)
+                .await
+                .map_err(|error| error.to_string());
+        }
+        let thread_id = row
+            .thread_id
+            .ok_or_else(|| "draft is not backed by a core thread".to_owned())?;
+        let thread = self
+            .core
+            .get_thread(thread_id)
+            .await
+            .map_err(|error| error.to_string())?;
+        let draft_id = thread
+            .messages
+            .iter()
+            .rev()
+            .find(|message| message.is_draft)
+            .map(|message| message.id)
+            .ok_or_else(|| "thread has no editable draft".to_owned())?;
+        self.core
+            .get_draft(draft_id)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    /// Subscribe before opening a message so the native shell can replace the
+    /// temporary header/snippet view as soon as the asynchronously fetched
+    /// body is committed by the sync engine.
+    pub fn subscribe_events(&self) -> tokio::sync::broadcast::Receiver<CoreEvent> {
+        self.core.bus.subscribe()
+    }
+
+    pub async fn set_load_remote_images(&self, enabled: bool) -> Result<(), String> {
+        let mut settings = self
+            .core
+            .get_settings()
+            .await
+            .map_err(|error| error.to_string())?;
+        settings.load_remote_images = enabled;
+        self.core
+            .set_settings(settings)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    pub async fn load_accounts(&self) -> Result<Vec<Account>, String> {
+        self.core
+            .list_accounts()
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    pub async fn create_folder(
+        &self,
+        account_id: i64,
+        parent_folder_id: Option<i64>,
+        name: String,
+    ) -> Result<(), String> {
+        self.core
+            .create_folder(account_id, parent_folder_id, name)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    pub async fn rename_folder(&self, folder_id: i64, name: String) -> Result<(), String> {
+        self.core
+            .rename_folder(folder_id, name)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    pub async fn delete_folder(&self, folder_id: i64) -> Result<(), String> {
+        self.core
+            .delete_folder(folder_id)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    pub async fn load_account_configs(&self) -> Result<Vec<AccountConfig>, String> {
+        self.core
+            .list_account_configs()
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    pub async fn import_account_configs(
+        &self,
+        configs: Vec<PortableAccountConfig>,
+    ) -> Result<usize, String> {
+        self.core
+            .import_account_configs(configs)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    pub async fn import_accounts(
+        &self,
+        drafts: Vec<flectar_mail_core::migration::AccountDraft>,
+    ) -> Result<flectar_mail_core::migration::AccountImportReport, String> {
+        self.core
+            .import_accounts(drafts)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    pub async fn import_mail(
+        &self,
+        request: flectar_mail_core::mail_import::MailImportRequest,
+        progress: tokio::sync::watch::Sender<flectar_mail_core::mail_import::MailImportProgress>,
+        stop: Arc<std::sync::atomic::AtomicBool>,
+    ) -> Result<flectar_mail_core::mail_import::MailImportReport, String> {
+        self.core
+            .import_mail(request, progress, stop)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    pub async fn save_settings(&self, settings: Settings) -> Result<(), String> {
+        self.core
+            .set_settings(settings)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    pub async fn delete_all_local_data(&self) -> Result<(), String> {
+        self.core
+            .delete_all_local_data()
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    pub async fn create_database_snapshot(
+        &self,
+        destination: std::path::PathBuf,
+    ) -> Result<flectar_mail_core::DatabaseSnapshotManifest, String> {
+        self.core
+            .create_database_snapshot(destination)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    pub async fn export_account_mail(
+        &self,
+        account_id: i64,
+        destination: std::path::PathBuf,
+    ) -> Result<flectar_mail_core::models::MailExport, String> {
+        self.core
+            .export_account_mail(account_id, destination)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    pub async fn load_settings(&self) -> Result<Settings, String> {
+        self.core
+            .get_settings()
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    pub async fn set_notification_settings(
+        &self,
+        notifications_enabled: bool,
+        sound_enabled: bool,
+        notification_scope: &str,
+    ) -> Result<(), String> {
+        let mut settings = self.load_settings().await?;
+        settings.notifications_enabled = notifications_enabled;
+        settings.sound_enabled = sound_enabled;
+        settings.notification_scope = match notification_scope {
+            "all" => "all",
+            _ => "important",
+        }
+        .to_owned();
+        self.core
+            .set_settings(settings)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    pub async fn set_unread_badge(&self, enabled: bool) -> Result<(), String> {
+        let mut settings = self.load_settings().await?;
+        settings.unread_badge_enabled = enabled;
+        self.core
+            .set_settings(settings)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    pub async fn set_check_for_updates(&self, enabled: bool) -> Result<(), String> {
+        let mut settings = self.load_settings().await?;
+        settings.check_for_updates = enabled;
+        self.core
+            .set_settings(settings)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    pub async fn set_sync_interval_minutes(&self, minutes: i64) -> Result<(), String> {
+        self.core
+            .set_sync_interval_minutes(minutes)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    pub async fn set_account_mail_history(
+        &self,
+        account_id: i64,
+        value: &str,
+    ) -> Result<(), String> {
+        let mail_history = MailHistory::from_storage(value)
+            .ok_or_else(|| format!("unsupported mail history window: {value}"))?;
+        self.core
+            .set_account_mail_history(account_id, mail_history)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    pub async fn set_account_keep_on_server(
+        &self,
+        account_id: i64,
+        value: &str,
+    ) -> Result<(), String> {
+        let keep = flectar_mail_core::models::KeepOnServer::from_storage(value)
+            .ok_or_else(|| format!("unsupported choice for mail on the server: {value}"))?;
+        self.core
+            .set_account_keep_on_server(account_id, keep)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    pub async fn set_account_subscribed_folders_only(
+        &self,
+        account_id: i64,
+        enabled: bool,
+    ) -> Result<(), String> {
+        self.core
+            .set_account_subscribed_folders_only(account_id, enabled)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    pub async fn set_account_check_interval(
+        &self,
+        account_id: i64,
+        interval: flectar_mail_core::models::CheckInterval,
+    ) -> Result<(), String> {
+        self.core
+            .set_account_check_interval(account_id, interval)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    pub async fn set_account_push(&self, account_id: i64, push: bool) -> Result<(), String> {
+        self.core
+            .set_account_push(account_id, push)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    pub async fn set_account_download(&self, account_id: i64, value: &str) -> Result<(), String> {
+        let download = flectar_mail_core::models::DownloadPolicy::from_storage(value)
+            .ok_or_else(|| format!("unsupported download setting: {value}"))?;
+        self.core
+            .set_account_download(account_id, download)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    pub async fn set_account_server_timeout(
+        &self,
+        account_id: i64,
+        seconds: u32,
+    ) -> Result<(), String> {
+        self.core
+            .set_account_server_timeout(account_id, seconds)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    pub async fn account_folder_roles(
+        &self,
+        account_id: i64,
+    ) -> Result<flectar_mail_core::models::AccountFolderRoles, String> {
+        self.core
+            .account_folder_roles(account_id)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    pub async fn set_account_folder_role(
+        &self,
+        account_id: i64,
+        role: String,
+        folder_id: Option<i64>,
+    ) -> Result<(), String> {
+        self.core
+            .set_account_folder_role(account_id, role, folder_id)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    pub async fn set_account_name(&self, account_id: i64, name: &str) -> Result<(), String> {
+        self.core
+            .set_account_name(account_id, name)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    pub async fn set_account_sent_copy_policy(
+        &self,
+        account_id: i64,
+        value: &str,
+    ) -> Result<(), String> {
+        let policy = flectar_mail_core::models::SentCopyPolicy::from_storage(value)
+            .ok_or_else(|| format!("unsupported Sent copy policy: {value}"))?;
+        self.core
+            .set_account_sent_copy_policy(account_id, policy)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    pub async fn set_mark_read(
+        &self,
+        choice: flectar_mail_core::models::MarkRead,
+    ) -> Result<(), String> {
+        let mut settings = self.load_settings().await?;
+        settings.mark_read = choice;
+        self.core
+            .set_settings(settings)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    pub async fn set_contact_discovery_settings(
+        &self,
+        collect_outgoing: bool,
+        collect_incoming: bool,
+        suggest_all_accounts: bool,
+        suggest_learned: bool,
+    ) -> Result<(), String> {
+        let mut settings = self.load_settings().await?;
+        settings.collect_outgoing_contacts = collect_outgoing;
+        settings.collect_incoming_contacts = collect_incoming;
+        settings.contact_suggest_all_accounts = suggest_all_accounts;
+        settings.suggest_learned_contacts = suggest_learned;
+        self.core
+            .set_settings(settings)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    pub async fn clear_contact_suggestions(&self) -> Result<usize, String> {
+        self.core
+            .clear_contact_suggestions()
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    pub async fn set_theme(&self, theme: &str) -> Result<(), String> {
+        let mut settings = self.load_settings().await?;
+        settings.theme = match theme {
+            "dark" => "carbon",
+            "light" => "snow",
+            _ => "system",
+        }
+        .to_owned();
+        self.core
+            .set_settings(settings)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    pub async fn set_theme_preset(&self, preset: &str) -> Result<(), String> {
+        let mut settings = self.load_settings().await?;
+        settings.theme_preset = match preset {
+            "teal" | "green" | "purple" | "custom" => preset,
+            _ => "default",
+        }
+        .to_owned();
+        self.core
+            .set_settings(settings)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    /// Stores the directory desktop save dialogs open in. The path is not
+    /// checked here: a location can be unavailable later, such as an unmounted
+    /// network share, and downloads fall back to the platform default instead
+    /// of failing.
+    #[cfg(desktop)]
+    pub async fn set_download_directory(&self, directory: &str) -> Result<(), String> {
+        let mut settings = self.load_settings().await?;
+        settings.download_directory = directory.trim().to_owned();
+        self.core
+            .set_settings(settings)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    pub async fn set_message_appearance(&self, preference: &str) -> Result<(), String> {
+        let preference = flectar_mail_core::models::MessageAppearance::parse(preference)
+            .ok_or("Unknown message appearance")?;
+        let mut settings = self.load_settings().await?;
+        settings.message_appearance = preference;
+        self.core
+            .set_settings(settings)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    pub async fn answer_read_receipt(
+        &self,
+        message_id: i64,
+        answer: flectar_mail_core::models::ReceiptAnswer,
+    ) -> Result<(), String> {
+        self.core
+            .answer_read_receipt(message_id, answer)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    pub async fn set_read_receipts(&self, policy: &str) -> Result<(), String> {
+        let policy = flectar_mail_core::models::ReadReceiptPolicy::parse(policy)
+            .ok_or("Unknown read receipt preference")?;
+        let mut settings = self.load_settings().await?;
+        settings.read_receipts = policy;
+        self.core
+            .set_settings(settings)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    pub async fn set_interface_text_size(&self, size: &str) -> Result<(), String> {
+        let size = flectar_mail_core::models::InterfaceTextSize::parse(size)
+            .ok_or("Unknown interface text size")?;
+        let mut settings = self.load_settings().await?;
+        settings.interface_text_size = size;
+        self.core
+            .set_settings(settings)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    pub async fn set_reduce_motion(&self, preference: &str) -> Result<(), String> {
+        let preference = flectar_mail_core::models::ReduceMotion::parse(preference)
+            .ok_or("Unknown reduce motion preference")?;
+        let mut settings = self.load_settings().await?;
+        settings.reduce_motion = preference;
+        self.core
+            .set_settings(settings)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    /// Which invitations found in mail join the calendar before an answer:
+    /// "everyone", "known" or "answered".
+    pub async fn set_add_invitations(&self, choice: &str) -> Result<(), String> {
+        let choice = flectar_mail_core::models::AddInvitations::parse(choice)
+            .ok_or("Unknown invitations choice")?;
+        let mut settings = self.load_settings().await?;
+        settings.add_invitations = choice;
+        self.core
+            .set_settings(settings)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    pub async fn set_custom_theme(&self, custom_theme: CustomTheme) -> Result<(), String> {
+        let mut settings = self.load_settings().await?;
+        settings.custom_theme = custom_theme;
+        self.core
+            .set_settings(settings)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    pub async fn set_language(&self, language: &str) -> Result<(), String> {
+        let mut settings = self.load_settings().await?;
+        settings.language = crate::normalized_language_preference(language).to_owned();
+        self.core
+            .set_settings(settings)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    pub async fn set_app_icon(
+        &self,
+        icon: flectar_mail_core::models::AppIcon,
+    ) -> Result<(), String> {
+        let mut settings = self.load_settings().await?;
+        settings.app_icon = icon;
+        self.core
+            .set_settings(settings)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    pub async fn set_monochrome_sidebar_icons(&self, enabled: bool) -> Result<(), String> {
+        let mut settings = self.load_settings().await?;
+        settings.monochrome_sidebar_icons = enabled;
+        self.core
+            .set_settings(settings)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    pub async fn set_show_avatars(&self, enabled: bool) -> Result<(), String> {
+        let mut settings = self.load_settings().await?;
+        settings.show_avatars = enabled;
+        self.core
+            .set_settings(settings)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    /// How tightly the mail list packs its rows, and how many lines of each
+    /// message's text they show.
+    pub async fn set_list_rows(
+        &self,
+        density: flectar_mail_core::models::ListDensity,
+        preview_lines: u8,
+    ) -> Result<(), String> {
+        let mut settings = self.load_settings().await?;
+        settings.list_density = density;
+        settings.preview_lines = preview_lines.min(flectar_mail_core::models::MAX_PREVIEW_LINES);
+        self.core
+            .set_settings(settings)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    pub async fn set_spelling(
+        &self,
+        enabled: bool,
+        languages: Option<Vec<String>>,
+    ) -> Result<(), String> {
+        let mut settings = self.load_settings().await?;
+        settings.spelling_enabled = enabled;
+        settings.spelling_languages = languages;
+        self.core
+            .set_settings(settings)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    pub async fn set_show_tabs(&self, enabled: bool) -> Result<(), String> {
+        let mut settings = self.load_settings().await?;
+        settings.show_tabs = enabled;
+        self.core
+            .set_settings(settings)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    pub async fn set_conversation_view(&self, enabled: bool) -> Result<(), String> {
+        let mut settings = self.load_settings().await?;
+        settings.conversation_view = enabled;
+        self.core
+            .set_settings(settings)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    pub async fn set_group_mail_by_date(&self, enabled: bool) -> Result<(), String> {
+        self.core
+            .set_group_mail_by_date(enabled)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    pub async fn set_time_format(
+        &self,
+        format: flectar_mail_core::models::TimeFormat,
+    ) -> Result<(), String> {
+        self.core
+            .set_time_format(format)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    pub async fn set_workspace_layout(&self, layout: &str) -> Result<(), String> {
+        let mut settings = self.load_settings().await?;
+        settings.workspace_layout = match layout {
+            "minimal" => "minimal",
+            _ => "default",
+        }
+        .to_owned();
+        self.core
+            .set_settings(settings)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    pub async fn set_workspace_list_pane_width(&self, width: i64) -> Result<(), String> {
+        let mut settings = self.load_settings().await?;
+        settings.workspace_list_pane_width = normalized_workspace_list_pane_width(width);
+        self.core
+            .set_settings(settings)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    pub async fn save_mail_profile(
+        &self,
+        profile_id: Option<String>,
+        name: String,
+        color: String,
+    ) -> Result<(Settings, MailProfile), String> {
+        self.core
+            .save_mail_profile(profile_id, name, color)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    pub async fn assign_account_profile(
+        &self,
+        account_id: i64,
+        profile_id: Option<String>,
+    ) -> Result<Settings, String> {
+        self.core
+            .assign_account_profile(account_id, profile_id)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    pub async fn delete_mail_profile(&self, profile_id: String) -> Result<Settings, String> {
+        self.core
+            .delete_mail_profile(profile_id)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    pub async fn set_active_mail_profile(
+        &self,
+        profile_id: Option<String>,
+    ) -> Result<Settings, String> {
+        self.core
+            .set_active_mail_profile(profile_id)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    pub async fn set_show_account_badges(&self, enabled: bool) -> Result<Settings, String> {
+        self.core
+            .set_show_account_badges(enabled)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    pub async fn set_account_color(
+        &self,
+        account_id: i64,
+        color: Option<String>,
+    ) -> Result<Settings, String> {
+        self.core
+            .set_account_color(account_id, color)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    pub async fn set_close_to_tray(&self, enabled: bool) -> Result<(), String> {
+        let mut settings = self.load_settings().await?;
+        settings.close_to_tray = enabled;
+        self.core
+            .set_settings(settings)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    pub async fn set_window_frame(&self, frame: &str) -> Result<(), String> {
+        let mut settings = self.load_settings().await?;
+        settings.window_frame = frame.to_owned();
+        self.core
+            .set_settings(settings)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    pub async fn reorder_account(
+        &self,
+        source_id: i64,
+        target_id: i64,
+        after: bool,
+    ) -> Result<(), String> {
+        self.core
+            .reorder_account(source_id, target_id, after)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    pub async fn remove_account(&self, account_id: i64) -> Result<(), String> {
+        let result = self
+            .core
+            .remove_account(account_id)
+            .await
+            .map_err(|error| error.to_string());
+        // Includes partial failures: snapshots read before the cross-store
+        // operation finished must never restore deleted account data.
+        self.account_revision
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        result
+    }
+
+    pub async fn list_contacts(
+        &self,
+        prefix: String,
+        account_id: Option<i64>,
+        limit: i64,
+    ) -> Result<Vec<Address>, String> {
+        self.core
+            .list_contacts(prefix, account_id, limit)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    pub async fn list_email_templates(&self) -> Result<Vec<Snippet>, String> {
+        self.core
+            .list_snippets()
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    pub async fn save_email_template(
+        &self,
+        id: Option<i64>,
+        name: String,
+        shortcut: Option<String>,
+        subject: Option<String>,
+        body: String,
+    ) -> Result<Snippet, String> {
+        self.core
+            .save_snippet(id, name, shortcut, subject, body)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    pub async fn delete_email_template(&self, id: i64) -> Result<(), String> {
+        self.core
+            .delete_snippet(id)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    pub async fn use_email_template(&self, id: i64) -> Result<(), String> {
+        self.core
+            .use_snippet(id)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    pub async fn load_contact_page(
+        &self,
+        scope: String,
+        query: String,
+        cursor: Option<ContactRecordCursor>,
+        limit: i64,
+    ) -> Result<ContactRecordPage, String> {
+        let favorites_only = scope == "Favorites";
+        let suggestions_only = scope == "Suggestions";
+        let account_id = scope
+            .strip_prefix("Account:")
+            .and_then(|value| value.parse().ok());
+        self.core
+            .list_contact_record_page(
+                query,
+                account_id,
+                favorites_only,
+                suggestions_only,
+                cursor,
+                limit,
+            )
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    pub async fn preview_contact_import(
+        &self,
+        file: Vec<u8>,
+    ) -> Result<flectar_mail_core::models::ContactImportPreview, String> {
+        self.core
+            .preview_contact_import(file)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    pub async fn import_contacts(
+        &self,
+        file: Vec<u8>,
+        account_id: Option<i64>,
+        duplicates: flectar_mail_core::models::ImportedDuplicates,
+    ) -> Result<flectar_mail_core::models::ContactImportOutcome, String> {
+        self.core
+            .import_contacts(file, account_id, duplicates)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    pub async fn export_contacts(&self) -> Result<(String, usize), String> {
+        self.core
+            .export_contacts()
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    pub async fn contact_destination(&self, account_id: i64) -> Result<Option<String>, String> {
+        self.core
+            .list_addressbooks(Some(account_id))
+            .await
+            .map(|books| {
+                books
+                    .into_iter()
+                    .find(|book| book.enabled && !book.read_only)
+                    .map(|book| book.display_name.unwrap_or(book.url))
+            })
+            .map_err(|e| e.to_string())
+    }
+
+    pub async fn contact_photo(&self, hash: String) -> Result<Option<Vec<u8>>, String> {
+        self.core
+            .contact_photo(hash)
+            .await
+            .map_err(|e| e.to_string())
+    }
+    pub async fn resolve_contact_conflict(
+        &self,
+        id: i64,
+        revision: i64,
+        keep_local: bool,
+    ) -> Result<(), String> {
+        self.core
+            .resolve_contact_conflict(id, revision, keep_local)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    pub async fn save_contact(
+        &self,
+        contact: flectar_mail_core::models::ContactRecord,
+    ) -> Result<flectar_mail_core::models::ContactRecord, String> {
+        self.core
+            .save_contact(contact)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    pub async fn delete_contact(&self, id: i64, revision: i64) -> Result<(), String> {
+        self.core
+            .delete_contact(id, revision)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    pub async fn connect_carddav(
+        &self,
+        account_id: i64,
+        url: String,
+        username: String,
+        password: String,
+    ) -> Result<(), String> {
+        self.core
+            .connect_carddav(ConnectCardDavArgs {
+                account_id,
+                url,
+                username,
+                password,
+            })
+            .await
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+
+    pub async fn load_carddav_connections(&self) -> Result<Vec<CardDavConnection>, String> {
+        self.core
+            .list_carddav_connections()
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    pub async fn set_account_carddav_enabled(
+        &self,
+        account_id: i64,
+        enabled: bool,
+    ) -> Result<(), String> {
+        self.core
+            .set_account_carddav_enabled(account_id, enabled)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    pub async fn disconnect_carddav(&self, account_id: i64) -> Result<(), String> {
+        self.core
+            .disconnect_carddav(account_id)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    /// Act on mail, returning the actions queued for it, which
+    /// [`Self::undo_actions`] can take back.
+    pub async fn perform_message_action(
+        &self,
+        target: MailTarget,
+        action: &str,
+    ) -> Result<Vec<i64>, String> {
+        let kind = ActionKind::parse(action)
+            .ok_or_else(|| format!("unsupported message action: {action}"))?;
+        self.core
+            .perform_action(PerformActionArgs {
+                kind,
+                target: target.action_target(),
+                params: None,
+            })
+            .await
+            .map(|result| result.action_ids)
+            .map_err(|error| error.to_string())
+    }
+
+    /// The message a row leaves its mailing list from: the message itself,
+    /// or the newest of a conversation's that names a way to.
+    pub async fn unsubscribe_message_of(&self, target: MailTarget) -> Result<Option<i64>, String> {
+        match target {
+            MailTarget::Message { id, .. } => Ok(Some(id)),
+            MailTarget::Thread(thread_id) => self
+                .core
+                .thread_unsubscribe_message(thread_id)
+                .await
+                .map_err(|error| error.to_string()),
+        }
+    }
+
+    pub async fn unsubscribe_offer(
+        &self,
+        message_id: i64,
+    ) -> Result<Option<UnsubscribeOffer>, String> {
+        self.core
+            .unsubscribe_offer(message_id)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    pub async fn unsubscribe(&self, message_id: i64) -> Result<UnsubscribeOutcome, String> {
+        self.core
+            .unsubscribe_message(message_id)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    /// The inbox messages from the list `message_id` came from.
+    pub async fn list_inbox_messages(&self, message_id: i64) -> Result<Vec<i64>, String> {
+        self.core
+            .list_inbox_messages(message_id)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    /// Archive or delete these messages; the ids of the actions, for Undo.
+    pub async fn act_on_messages(
+        &self,
+        message_ids: Vec<i64>,
+        action: &str,
+    ) -> Result<Vec<i64>, String> {
+        let kind = ActionKind::parse(action)
+            .ok_or_else(|| format!("unsupported message action: {action}"))?;
+        self.core
+            .perform_action(PerformActionArgs {
+                kind,
+                target: ActionTarget::Messages(message_ids),
+                params: None,
+            })
+            .await
+            .map(|result| result.action_ids)
+            .map_err(|error| error.to_string())
+    }
+
+    /// `address` as it would be blocked, for the confirmation first.
+    pub async fn block_offer(&self, address: &str) -> Result<Option<BlockOffer>, String> {
+        self.core
+            .block_offer(address)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    /// Block `address`; what moved to Spam, for Undo.
+    pub async fn block_sender(&self, address: &str) -> Result<BlockResult, String> {
+        self.core
+            .block_sender(address)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    pub async fn unblock_sender(&self, address: &str) -> Result<(), String> {
+        self.core
+            .unblock_sender(address)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    /// Every blocked address, alphabetically.
+    pub async fn blocked_addresses(&self) -> Result<Vec<String>, String> {
+        self.core
+            .blocked_senders()
+            .await
+            .map(|senders| senders.into_iter().map(|sender| sender.address).collect())
+            .map_err(|error| error.to_string())
+    }
+
+    /// Every rule that sorts new mail, in order (#238).
+    pub async fn mail_rules(&self) -> Result<Vec<MailRule>, String> {
+        self.core
+            .mail_rules()
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    /// What a rule can name: the accounts, their folders and the labels.
+    pub async fn rule_choices(
+        &self,
+    ) -> Result<(Vec<Account>, Vec<FolderInfo>, Vec<Label>), String> {
+        let accounts = self
+            .core
+            .list_accounts()
+            .await
+            .map_err(|error| error.to_string())?;
+        let folders = self
+            .core
+            .list_folders(None)
+            .await
+            .map_err(|error| error.to_string())?;
+        let labels = self
+            .core
+            .list_labels()
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok((accounts, folders, labels))
+    }
+
+    pub async fn save_mail_rule(&self, rule: MailRule) -> Result<MailRule, String> {
+        self.core
+            .save_mail_rule(rule)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    pub async fn delete_mail_rule(&self, id: i64) -> Result<(), String> {
+        self.core
+            .delete_mail_rule(id)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    pub async fn set_mail_rule_enabled(&self, id: i64, enabled: bool) -> Result<(), String> {
+        self.core
+            .set_mail_rule_enabled(id, enabled)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    pub async fn reorder_mail_rules(&self, ids: Vec<i64>) -> Result<(), String> {
+        self.core
+            .reorder_mail_rules(ids)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    /// The Inbox mail `rule` matches now.
+    pub async fn mail_rule_matches(
+        &self,
+        rule: MailRule,
+    ) -> Result<flectar_mail_core::rules::InboxMatches, String> {
+        self.core
+            .mail_rule_matches(rule)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    /// Run `rule` on the Inbox mail it matches now: the actions, for Undo.
+    pub async fn run_mail_rule(&self, rule: MailRule) -> Result<Vec<i64>, String> {
+        self.core
+            .run_mail_rule(rule)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    /// A new rule for mail like `target`'s.
+    pub async fn rule_from(&self, target: MailTarget) -> Result<MailRule, String> {
+        match target {
+            MailTarget::Message { id, .. } => self.core.rule_from_message(id).await,
+            MailTarget::Thread(thread_id) => self.core.rule_from_thread(thread_id).await,
+        }
+        .map_err(|error| error.to_string())
+    }
+
+    /// Keep mail in Trash and Junk for these days, 0 for ever, and empty
+    /// them of older mail now.
+    pub async fn set_folder_cleanup(&self, trash_days: u32, junk_days: u32) -> Result<(), String> {
+        self.core
+            .set_folder_cleanup(trash_days, junk_days)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    /// Where each account's rules run, as last checked.
+    pub async fn server_rules(&self) -> Result<Vec<ServerRules>, String> {
+        self.core
+            .server_rules()
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    /// Put account `account_id`'s rules on its server now, with the user's
+    /// `answer` to what the last try asked.
+    pub async fn put_rules_on_server(
+        &self,
+        account_id: i64,
+        answer: Option<ServerRulesAnswer>,
+    ) -> Result<(), String> {
+        self.core
+            .put_rules_on_server(account_id, answer)
+            .await
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+
+    /// Take back the actions of one gesture. False when none could be.
+    pub async fn undo_actions(&self, action_ids: Vec<i64>) -> Result<bool, String> {
+        self.core
+            .undo_actions(action_ids)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    pub async fn empty_trash(&self, account_id: Option<i64>) -> Result<(), String> {
+        self.core
+            .empty_trash(account_id)
+            .await
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+
+    pub async fn perform_label_action(
+        &self,
+        target: MailTarget,
+        label_id: i64,
+        add: bool,
+    ) -> Result<(), String> {
+        self.core
+            .perform_action(PerformActionArgs {
+                kind: if add {
+                    ActionKind::AddLabel
+                } else {
+                    ActionKind::RemoveLabel
+                },
+                target: target.action_target(),
+                params: Some(ActionParams {
+                    wake_at: None,
+                    target_folder_id: None,
+                    label_id: Some(label_id),
+                }),
+            })
+            .await
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+
+    /// Remind the user at `remind_at` (ms since the epoch) unless someone
+    /// replies to what they sent in a row's conversation, on every device
+    /// with Flectar Mail Sync.
+    pub async fn set_reply_reminder(
+        &self,
+        row: &MailMessage,
+        remind_at: i64,
+    ) -> Result<(), String> {
+        let thread_id = row
+            .thread_id
+            .ok_or_else(|| "this message is not in a conversation".to_owned())?;
+        // A message listed on its own waits for replies to itself.
+        let message_id = row.message_id.filter(|_| row.is_outgoing);
+        self.core
+            .set_reply_reminder(thread_id, message_id, remind_at)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    /// End the reply reminders of a row's conversation.
+    pub async fn dismiss_reply_reminder(&self, row: &MailMessage) -> Result<(), String> {
+        let thread_id = row
+            .thread_id
+            .ok_or_else(|| "this message is not in a conversation".to_owned())?;
+        self.core
+            .dismiss_reply_reminder(thread_id)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    /// Snooze the conversation until `wake_at` (ms since the epoch), on
+    /// every device with Flectar Mail Sync; `None` ends its snooze.
+    pub async fn snooze(&self, target: MailTarget, wake_at: Option<i64>) -> Result<(), String> {
+        self.core
+            .perform_action(PerformActionArgs {
+                kind: if wake_at.is_some() {
+                    ActionKind::Snooze
+                } else {
+                    ActionKind::Unsnooze
+                },
+                target: target.action_target(),
+                params: wake_at.map(|wake_at| ActionParams {
+                    wake_at: Some(wake_at),
+                    target_folder_id: None,
+                    label_id: None,
+                }),
+            })
+            .await
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+
+    /// Move mail to a folder of its own account, returning the actions
+    /// queued for it.
+    pub async fn move_to_folder(
+        &self,
+        target: MailTarget,
+        target_folder_id: i64,
+    ) -> Result<Vec<i64>, String> {
+        self.core
+            .perform_action(PerformActionArgs {
+                kind: ActionKind::Move,
+                target: target.action_target(),
+                params: Some(ActionParams {
+                    wake_at: None,
+                    target_folder_id: Some(target_folder_id),
+                    label_id: None,
+                }),
+            })
+            .await
+            .map(|result| result.action_ids)
+            .map_err(|error| error.to_string())
+    }
+
+    /// The folders mail was moved or copied into most recently, of every
+    /// account, newest first.
+    pub async fn recent_move_targets(&self, limit: usize) -> Result<Vec<i64>, String> {
+        self.core
+            .recent_move_targets(limit)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    /// Copies or moves mail to a folder of another account. The original of
+    /// a move goes once the copy is in place.
+    pub async fn transfer_to_folder(
+        &self,
+        target: MailTarget,
+        folder_id: i64,
+        is_move: bool,
+    ) -> Result<(), String> {
+        self.core
+            .transfer_mail(target.action_target(), folder_id, is_move)
+            .await
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+
+    /// Files mail in one more folder of its JMAP account.
+    pub async fn copy_to_folder(&self, target: MailTarget, folder_id: i64) -> Result<(), String> {
+        self.core
+            .perform_action(PerformActionArgs {
+                kind: ActionKind::Copy,
+                target: target.action_target(),
+                params: Some(ActionParams {
+                    wake_at: None,
+                    target_folder_id: Some(folder_id),
+                    label_id: None,
+                }),
+            })
+            .await
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+
+    /// Inbox tabs route conversations, so a message's routes its conversation.
+    pub async fn route_to_tab(&self, target: MailTarget, tab: String) -> Result<(), String> {
+        self.core
+            .route_thread_to_tab(target.thread_id(), tab)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    pub async fn save_label(
+        &self,
+        id: Option<i64>,
+        name: &str,
+        color: &str,
+        owner_account_id: Option<i64>,
+    ) -> Result<Label, String> {
+        let name = name.trim();
+        if name.is_empty() {
+            return Err("enter a label name".to_owned());
+        }
+        let labels = self
+            .core
+            .list_labels()
+            .await
+            .map_err(|error| error.to_string())?;
+        let position = match id {
+            Some(id) => labels
+                .iter()
+                .find(|label| label.id == id)
+                .map(|label| label.position)
+                .ok_or_else(|| "label no longer exists".to_owned())?,
+            None => labels
+                .iter()
+                .filter(|label| !label.is_auto && label.owner_account_id == owner_account_id)
+                .map(|label| label.position)
+                .max()
+                .unwrap_or(-1)
+                .saturating_add(1),
+        };
+        self.core
+            .save_label(
+                id,
+                name.to_owned(),
+                color.to_owned(),
+                position,
+                owner_account_id,
+            )
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    pub async fn delete_label(&self, id: i64) -> Result<(), String> {
+        self.core
+            .delete_label(id)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    /// Checks these accounts for new mail, or every account with `None`.
+    pub async fn sync_accounts(&self, account_ids: Option<&[i64]>) -> Result<(), String> {
+        self.core
+            .sync_accounts(account_ids)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    pub async fn add_password_account(
+        &self,
+        args: AddPasswordAccountArgs,
+    ) -> Result<Account, String> {
+        self.core
+            .add_account_password(args)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    pub async fn start_oauth_with_calendar<F>(
+        &self,
+        provider: Provider,
+        connect_calendar: bool,
+        open_url: F,
+    ) -> Result<Account, String>
+    where
+        F: Fn(String) -> Result<(), String> + Clone + Send + 'static,
+    {
+        self.core
+            .start_oauth_with_calendar(provider, connect_calendar, open_url)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    pub async fn load_events(
+        &self,
+        start_ms: i64,
+        end_ms: i64,
+    ) -> Result<Vec<CalendarEvent>, String> {
+        self.core
+            .list_events(start_ms, end_ms)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    pub async fn create_event(&self, args: CreateEventArgs) -> Result<CalendarEvent, String> {
+        self.core
+            .create_event(args)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    pub async fn update_event(
+        &self,
+        args: flectar_mail_core::models::UpdateEventArgs,
+    ) -> Result<CalendarEvent, String> {
+        self.core
+            .update_event(args)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    /// The card above a message that carries a calendar. One that can't be
+    /// read leaves the message without a card.
+    pub async fn invitation_card(&self, message_id: i64) -> Option<InvitationCard> {
+        self.core
+            .invitation_card(message_id)
+            .await
+            .unwrap_or_else(|error| {
+                eprintln!("invitation card for message {message_id} unavailable: {error}");
+                None
+            })
+    }
+
+    /// Answer the invitation a message carries, or with `occurrence` one
+    /// occurrence of it, adding it to the calendar when it isn't there yet.
+    pub async fn answer_invitation(
+        &self,
+        message_id: i64,
+        response: &str,
+        occurrence: Option<i64>,
+    ) -> Result<(), String> {
+        self.core
+            .answer_invitation(message_id, response, occurrence)
+            .await
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+
+    /// Add the event a message carries to the calendar without answering it.
+    pub async fn add_invitation(&self, message_id: i64) -> Result<(), String> {
+        self.core
+            .add_invitation(message_id)
+            .await
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+
+    /// Answer an invitation, or with `occurrence` (a RECURRENCE-ID) one
+    /// occurrence of it; the core tells its organizer.
+    pub async fn rsvp_event(
+        &self,
+        event_id: i64,
+        response: &str,
+        occurrence: Option<i64>,
+    ) -> Result<(), String> {
+        self.core
+            .rsvp_event(RsvpEventArgs {
+                event_id,
+                response: response.to_owned(),
+                comment: None,
+                notify: true,
+                occurrence,
+            })
+            .await
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+
+    pub async fn delete_event(&self, event_id: i64) -> Result<(), String> {
+        self.core
+            .delete_event(event_id, false)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    pub async fn load_calendar_connections(&self) -> Result<Vec<CalendarConnection>, String> {
+        self.core
+            .list_calendar_connections()
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    pub async fn load_calendars(
+        &self,
+        account_id: Option<i64>,
+    ) -> Result<Vec<flectar_mail_core::models::Calendar>, String> {
+        self.core
+            .list_calendars(account_id)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    pub async fn connect_provider_calendar<F>(
+        &self,
+        account_id: i64,
+        provider: Provider,
+        open_url: F,
+    ) -> Result<(), String>
+    where
+        F: FnOnce(String) -> Result<(), String> + Send + 'static,
+    {
+        match provider {
+            Provider::Gmail => self
+                .core
+                .connect_google_calendar(account_id, open_url)
+                .await
+                .map_err(|error| error.to_string())?,
+            Provider::Microsoft => self
+                .core
+                .connect_microsoft_calendar(account_id, open_url)
+                .await
+                .map_err(|error| error.to_string())?,
+            Provider::Generic => return Err("add a CalDAV calendar for this account".into()),
+        };
+        Ok(())
+    }
+
+    /// Add a CalDAV server to the account, or change the connection with
+    /// `connection_id`; an empty password keeps the one saved for it.
+    pub async fn connect_caldav(
+        &self,
+        account_id: i64,
+        connection_id: Option<i64>,
+        url: String,
+        username: String,
+        password: String,
+    ) -> Result<(), String> {
+        self.core
+            .connect_caldav(ConnectCaldavArgs {
+                account_id,
+                connection_id,
+                url,
+                username,
+                password: Some(password),
+            })
+            .await
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+
+    pub async fn set_calendar_connection_enabled(
+        &self,
+        connection_id: i64,
+        enabled: bool,
+    ) -> Result<(), String> {
+        self.core
+            .set_calendar_connection_enabled(connection_id, enabled)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    pub async fn remove_calendar_connection(&self, connection_id: i64) -> Result<(), String> {
+        self.core
+            .remove_calendar_connection(connection_id)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    pub async fn set_calendar_enabled(
+        &self,
+        calendar_id: i64,
+        enabled: bool,
+    ) -> Result<(), String> {
+        self.core
+            .set_calendar_enabled(calendar_id, enabled)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    pub fn cancel_oauth(&self) {
+        self.core.cancel_oauth();
+    }
+
+    pub async fn set_oauth_apps(
+        &self,
+        google: Option<(String, String)>,
+        microsoft: Option<String>,
+    ) -> Result<flectar_mail_core::models::Settings, String> {
+        self.core
+            .set_oauth_apps(google, microsoft)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    pub async fn reauth_account<F>(&self, account_id: i64, open_url: F) -> Result<Account, String>
+    where
+        F: FnOnce(String) -> Result<(), String> + Send + 'static,
+    {
+        self.core
+            .reauth_account(account_id, open_url)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    pub async fn save_draft(&self, args: SaveDraftArgs) -> Result<i64, String> {
+        self.core
+            .save_draft(args)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    pub async fn queue_send(&self, args: QueueSendArgs) -> Result<QueueSendResult, String> {
+        self.core
+            .queue_send(args)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    pub async fn message_by_header_id(
+        &self,
+        account_id: i64,
+        message_id: &str,
+    ) -> Result<Option<i64>, String> {
+        self.core
+            .message_by_header_id(account_id, message_id)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    pub async fn save_new_draft(&self, message: ComposeMessage<'_>) -> Result<i64, String> {
+        self.save_draft(compose_args(message, false)?).await
+    }
+
+    /// Save the composer's message and send it at `send_at`; `remind_at`
+    /// reminds the user unless someone replies by then.
+    pub async fn schedule_new_message(
+        &self,
+        message: ComposeMessage<'_>,
+        send_at: i64,
+        remind_at: Option<i64>,
+    ) -> Result<QueueSendResult, String> {
+        let draft_id = self.save_draft(compose_args(message, true)?).await?;
+        self.queue_send(QueueSendArgs {
+            draft_id,
+            send_at: Some(send_at),
+            remind_at,
+        })
+        .await
+    }
+
+    /// Save the message and queue it to leave once the user's undo delay
+    /// has passed (`dispatch_at`), which is at once when it is off;
+    /// `remind_at` reminds the user unless someone replies by then.
+    pub async fn send_new_message(
+        &self,
+        message: ComposeMessage<'_>,
+        remind_at: Option<i64>,
+    ) -> Result<QueueSendResult, String> {
+        let draft_id = self.save_draft(compose_args(message, true)?).await?;
+        self.queue_send(QueueSendArgs {
+            draft_id,
+            send_at: None,
+            remind_at,
+        })
+        .await
+    }
+
+    /// Send a queued message without waiting for the rest of its delay.
+    pub async fn send_now(&self, action_id: i64) -> Result<bool, String> {
+        self.core
+            .send_now(action_id)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    /// Take back a queued message before it leaves. False when it is already
+    /// on its way, or gone.
+    pub async fn cancel_send(&self, action_id: i64) -> Result<bool, String> {
+        self.core
+            .cancel_send(action_id)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    pub async fn get_draft(&self, draft_id: i64) -> Result<SaveDraftArgs, String> {
+        self.core
+            .get_draft(draft_id)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    pub async fn set_compose_text_style(&self, font: String, size: String) -> Result<(), String> {
+        let mut settings = self.load_settings().await?;
+        settings.compose_font = font;
+        settings.compose_text_size = size;
+        self.core
+            .set_settings(settings)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    /// How many days links to files sent by link work, 0 for as long as the file is kept, and
+    /// whether they ask for a password.
+    pub async fn set_link_preferences(
+        &self,
+        expiry_days: u32,
+        password: bool,
+    ) -> Result<(), String> {
+        let mut settings = self.load_settings().await?;
+        settings.link_expiry_days = expiry_days;
+        settings.link_password = password;
+        self.core
+            .set_settings(settings)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    pub async fn set_undo_send_seconds(&self, seconds: i64) -> Result<(), String> {
+        let mut settings = self.load_settings().await?;
+        settings.undo_send_seconds = seconds;
+        self.core
+            .set_settings(settings)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    pub async fn wait_for_send(&self, action_id: i64) -> Result<(), String> {
+        self.core
+            .wait_for_send(action_id)
+            .await
+            .map_err(|error| error.to_string())
+    }
+}
+
+fn compose_args(
+    message: ComposeMessage<'_>,
+    require_recipient: bool,
+) -> Result<SaveDraftArgs, String> {
+    let recipients = parse_recipients(message.to)?;
+    if require_recipient && recipients.is_empty() {
+        return Err("enter at least one recipient".to_owned());
+    }
+    let body_text = message.body.to_owned();
+    let body_html = message
+        .body_html
+        .map(str::to_owned)
+        .or_else(|| (!message.body.trim().is_empty()).then(|| markdown_to_html(message.body)));
+    Ok(SaveDraftArgs {
+        draft_id: message.draft_id,
+        account_id: message.account_id,
+        from: message.sender_email.map(|email| Address {
+            name: None,
+            email: email.to_owned(),
+        }),
+        to: recipients,
+        cc: parse_recipients(message.cc)?,
+        bcc: parse_recipients(message.bcc)?,
+        subject: message.subject.trim().to_owned(),
+        body_text,
+        body_html,
+        mode: message.mode.to_owned(),
+        in_reply_to_message_id: message.in_reply_to_message_id,
+        in_reply_to_header: message.in_reply_to_header.map(str::to_owned),
+        attachments: message.attachments.to_vec(),
+        request_read_receipt: message.request_read_receipt,
+        importance: message.importance,
+    })
+}
+
+fn parse_recipients(value: &str) -> Result<Vec<Address>, String> {
+    recipient_entries(value).map(parse_address).collect()
+}
+
+/// The entries of a recipient field. Commas, semicolons and line breaks
+/// separate them: rows wrap onto several lines, and pasted lists often put
+/// one address per line. A separator inside a quoted name, as in
+/// `"Doe, Jane" <jane@example.com>` (RFC 5322 section 3.2.4), doesn't.
+pub(crate) fn recipient_entries(field: &str) -> impl Iterator<Item = &str> {
+    let mut entries = Vec::new();
+    let (mut start, mut quoted, mut escaped) = (0, false, false);
+    for (index, character) in field.char_indices() {
+        match character {
+            _ if escaped => escaped = false,
+            '\\' if quoted => escaped = true,
+            '"' => quoted = !quoted,
+            ',' | ';' | '\n' if !quoted => {
+                entries.push(&field[start..index]);
+                start = index + character.len_utf8();
+            }
+            _ => {}
+        }
+    }
+    entries.push(&field[start..]);
+    entries
+        .into_iter()
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+}
+
+pub(crate) fn parse_address(value: &str) -> Result<Address, String> {
+    let (name, email) = value
+        .rsplit_once('<')
+        .and_then(|(name, email)| email.strip_suffix('>').map(|email| (Some(name), email)))
+        .unwrap_or((None, value));
+    let email = email.trim();
+    // Multiline/pasted input must never smuggle a header break into an
+    // address: reject any surviving control characters.
+    if email.contains(['\r', '\n']) || !email.contains('@') {
+        return Err(format!("invalid recipient: {value}"));
+    }
+    Ok(Address {
+        name: name
+            .map(str::trim)
+            .map(unquoted_name)
+            .filter(|name| !name.is_empty()),
+        email: email.to_owned(),
+    })
+}
+
+/// A display name without the quotes and backslashes a header puts around
+/// it, as copied from a message: `"Doe, Jane"` is `Doe, Jane`.
+fn unquoted_name(name: &str) -> String {
+    let Some(inner) = name
+        .strip_prefix('"')
+        .and_then(|name| name.strip_suffix('"'))
+    else {
+        return name.to_owned();
+    };
+    let mut unquoted = String::with_capacity(inner.len());
+    let mut characters = inner.chars();
+    while let Some(character) = characters.next() {
+        match character {
+            '\\' => unquoted.extend(characters.next()),
+            _ => unquoted.push(character),
+        }
+    }
+    unquoted.trim().to_owned()
+}
+
+const fn standard_mailbox_view(mailbox: StandardMailbox) -> View {
+    match mailbox {
+        StandardMailbox::Inbox => View::Inbox,
+        StandardMailbox::Starred => View::Starred,
+        StandardMailbox::Sent => View::Sent,
+        StandardMailbox::Archive => View::Done,
+        StandardMailbox::Spam => View::Spam,
+        StandardMailbox::Trash => View::Trash,
+        StandardMailbox::Drafts => View::Drafts,
+    }
+}
+
+/// Provider folder role backing a standard mailbox. Starred is a flag, not a
+/// folder.
+const fn standard_mailbox_role(mailbox: StandardMailbox) -> Option<&'static str> {
+    match mailbox {
+        StandardMailbox::Inbox => Some("inbox"),
+        StandardMailbox::Starred => None,
+        StandardMailbox::Sent => Some("sent"),
+        StandardMailbox::Archive => Some("archive"),
+        StandardMailbox::Spam => Some("spam"),
+        StandardMailbox::Trash => Some("trash"),
+        StandardMailbox::Drafts => Some("drafts"),
+    }
+}
+
+fn is_standard_folder(folder: &FolderInfo) -> bool {
+    matches!(
+        folder.role.as_deref(),
+        Some("inbox" | "sent" | "archive" | "spam" | "trash" | "drafts")
+    )
+}
+
+#[derive(Clone, Copy)]
+struct FolderTreeRoot<'a> {
+    folder: &'a FolderInfo,
+    depth: usize,
+    parent_folder_id: i64,
+    standard_mailbox: Option<StandardMailbox>,
+}
+
+fn append_folder_tree<'a>(
+    entries: &mut Vec<MailboxEntry>,
+    root: FolderTreeRoot<'a>,
+    account_label: &str,
+    children: &std::collections::HashMap<i64, Vec<&'a FolderInfo>>,
+    visited: &mut std::collections::HashSet<i64>,
+) {
+    let mut pending = vec![root];
+    while let Some(FolderTreeRoot {
+        folder,
+        depth,
+        parent_folder_id,
+        standard_mailbox,
+    }) = pending.pop()
+    {
+        if !visited.insert(folder.id) {
+            continue;
+        }
+        let descendants = children.get(&folder.id);
+        let has_children = descendants.is_some_and(|descendants| {
+            descendants
+                .iter()
+                .any(|descendant| !visited.contains(&descendant.id))
+        });
+        let is_standard = standard_mailbox.is_some();
+        let label = standard_mailbox
+            .map(|mailbox| mailbox.label().to_owned())
+            .unwrap_or_else(|| folder_label(folder));
+        entries.push(MailboxEntry {
+            account_id: folder.account_id,
+            folder_id: folder.id,
+            parent_folder_id,
+            depth,
+            has_children,
+            is_standard,
+            is_selectable: folder.selectable,
+            can_create_children: folder.can_create_children,
+            can_rename: folder.can_rename,
+            can_delete: folder.can_delete,
+            label,
+            scope: Some(
+                standard_mailbox.map_or(Scope::Folder(folder.id), |mailbox| Scope::Account {
+                    account_id: folder.account_id,
+                    mailbox,
+                }),
+            ),
+            context: account_label.to_owned(),
+            detail: String::new(),
+            avatar: String::new(),
+            is_account: false,
+            count: 0,
+        });
+
+        if let Some(descendants) = descendants {
+            for descendant in descendants.iter().rev() {
+                if !visited.contains(&descendant.id) {
+                    pending.push(FolderTreeRoot {
+                        folder: descendant,
+                        depth: depth + 1,
+                        parent_folder_id: folder.id,
+                        standard_mailbox: None,
+                    });
+                }
+            }
+        }
+    }
+}
+
+fn mailbox_entries(
+    accounts: &[Account],
+    folders: &[FolderInfo],
+    local_mail: Option<i64>,
+) -> Vec<MailboxEntry> {
+    let mut entries = Vec::new();
+    for account in accounts {
+        let account_label = account_label(account);
+        entries.push(MailboxEntry {
+            account_id: account.id,
+            folder_id: -1,
+            parent_folder_id: -1,
+            depth: 0,
+            has_children: false,
+            is_standard: false,
+            is_selectable: false,
+            can_create_children: account.can_create_top_level_mailbox,
+            can_rename: false,
+            can_delete: false,
+            label: account_label.clone(),
+            scope: None,
+            context: account_label.clone(),
+            detail: account.email.clone(),
+            avatar: avatar_initials(&account_label),
+            is_account: true,
+            count: 0,
+        });
+        append_mailboxes(
+            &mut entries,
+            account.id,
+            &account_label,
+            folders,
+            account.mail_protocol == MailProtocol::Gmail,
+            false,
+        );
+    }
+    // Local mail follows the accounts, with only the folders it has: those
+    // imported into it and its Trash. The view names its heading.
+    if let Some(account_id) = local_mail.filter(|account_id| {
+        folders
+            .iter()
+            .any(|folder| folder.account_id == *account_id)
+    }) {
+        entries.push(MailboxEntry {
+            account_id,
+            folder_id: -1,
+            parent_folder_id: -1,
+            depth: 0,
+            has_children: false,
+            is_standard: false,
+            is_selectable: false,
+            can_create_children: true,
+            can_rename: false,
+            can_delete: false,
+            label: String::new(),
+            scope: None,
+            context: String::new(),
+            detail: String::new(),
+            avatar: String::new(),
+            is_account: true,
+            count: 0,
+        });
+        append_mailboxes(&mut entries, account_id, "", folders, false, true);
+    }
+    entries
+}
+
+/// One account's mailboxes: its standard mailboxes, each listed even
+/// without a folder, then its own folders as a tree. Gmail lists only
+/// folders with a role; its other labels are labels. Local mail lists the
+/// folders it was given first, then only the standard mailboxes it has.
+fn append_mailboxes(
+    entries: &mut Vec<MailboxEntry>,
+    account_id: i64,
+    account_label: &str,
+    folders: &[FolderInfo],
+    gmail: bool,
+    local: bool,
+) {
+    let account_folders = folders
+        .iter()
+        .filter(|folder| folder.account_id == account_id)
+        .collect::<Vec<_>>();
+    let role_folders = StandardMailbox::ALL
+        .into_iter()
+        .filter_map(|mailbox| {
+            let role = standard_mailbox_role(mailbox)?;
+            account_folders
+                .iter()
+                .copied()
+                .find(|folder| folder.role.as_deref() == Some(role))
+                .map(|folder| (mailbox, folder))
+        })
+        .collect::<std::collections::HashMap<_, _>>();
+    let role_folder_ids = role_folders
+        .values()
+        .map(|folder| folder.id)
+        .collect::<std::collections::HashSet<_>>();
+    let mut tree_folders = account_folders
+        .into_iter()
+        .filter(|folder| {
+            role_folder_ids.contains(&folder.id) || (!gmail && !is_standard_folder(folder))
+        })
+        .collect::<Vec<_>>();
+    // Lowercase once per folder: `sort_by_key` would re-allocate the key on
+    // every comparison (O(n log n) allocations for n folders).
+    tree_folders.sort_by_cached_key(|folder| (folder.display_name.to_lowercase(), folder.id));
+
+    // Fresh discovery provides explicit local parent ids. Path inference
+    // preserves an upgraded database's existing hierarchy until its first
+    // authoritative provider discovery populates those new ids.
+    let ids_by_name = tree_folders
+        .iter()
+        .map(|folder| (folder.path.as_str(), folder.id))
+        .collect::<std::collections::HashMap<_, _>>();
+    let folder_ids = tree_folders
+        .iter()
+        .map(|folder| folder.id)
+        .collect::<std::collections::HashSet<_>>();
+    let parent_ids = tree_folders
+        .iter()
+        .map(|folder| {
+            let path_parent_id = folder
+                .is_jmap
+                .then_some(" / ")
+                .or(folder.delimiter.as_deref())
+                .filter(|delimiter| !delimiter.is_empty())
+                .and_then(|delimiter| folder.path.rsplit_once(delimiter))
+                .and_then(|(parent, _)| ids_by_name.get(parent).copied());
+            let parent_id = folder
+                .parent_id
+                .filter(|parent| *parent != folder.id && folder_ids.contains(parent))
+                .or(path_parent_id)
+                .unwrap_or(-1);
+            // Special-use mailboxes remain pinned roots, matching the
+            // standard ordering used by major desktop mail clients.
+            (
+                folder.id,
+                if role_folder_ids.contains(&folder.id) {
+                    -1
+                } else {
+                    parent_id
+                },
+            )
+        })
+        .collect::<std::collections::HashMap<_, _>>();
+    // Children inherit `tree_folders`' name order, so they need no sort.
+    let mut children = std::collections::HashMap::<i64, Vec<&FolderInfo>>::new();
+    for folder in &tree_folders {
+        let parent_id = parent_ids.get(&folder.id).copied().unwrap_or(-1);
+        if parent_id >= 0 {
+            children.entry(parent_id).or_default().push(folder);
+        }
+    }
+
+    let mut visited = std::collections::HashSet::new();
+    let append_standard = |entries: &mut Vec<MailboxEntry>,
+                           visited: &mut std::collections::HashSet<i64>| {
+        for mailbox in StandardMailbox::ALL {
+            if let Some(folder) = role_folders.get(&mailbox).copied() {
+                append_folder_tree(
+                    entries,
+                    FolderTreeRoot {
+                        folder,
+                        depth: 0,
+                        parent_folder_id: -1,
+                        standard_mailbox: Some(mailbox),
+                    },
+                    account_label,
+                    &children,
+                    visited,
+                );
+                continue;
+            }
+            if local {
+                continue;
+            }
+            entries.push(MailboxEntry {
+                account_id,
+                folder_id: -1,
+                parent_folder_id: -1,
+                depth: 0,
+                has_children: false,
+                is_standard: true,
+                is_selectable: true,
+                can_create_children: false,
+                can_rename: false,
+                can_delete: false,
+                label: mailbox.label().to_owned(),
+                scope: Some(Scope::Account {
+                    account_id,
+                    mailbox,
+                }),
+                context: account_label.to_owned(),
+                detail: String::new(),
+                avatar: String::new(),
+                is_account: false,
+                count: 0,
+            });
+        }
+    };
+    // Accounts lead with their standard mailboxes; local mail ends with them.
+    if !local {
+        append_standard(entries, &mut visited);
+    }
+
+    let roots = tree_folders
+        .iter()
+        .copied()
+        .filter(|folder| {
+            !role_folder_ids.contains(&folder.id)
+                && parent_ids.get(&folder.id).copied().unwrap_or(-1) < 0
+        })
+        .collect::<Vec<_>>();
+    for root in roots {
+        append_folder_tree(
+            entries,
+            FolderTreeRoot {
+                folder: root,
+                depth: 0,
+                parent_folder_id: -1,
+                standard_mailbox: None,
+            },
+            account_label,
+            &children,
+            &mut visited,
+        );
+    }
+    if local {
+        append_standard(entries, &mut visited);
+    }
+
+    // Broken or cyclic provider data must not make a mailbox disappear.
+    // Promote one unvisited node at a time to a safe root; the visited set
+    // then bounds traversal and prevents duplicates.
+    for folder in tree_folders {
+        if !visited.contains(&folder.id) {
+            append_folder_tree(
+                entries,
+                FolderTreeRoot {
+                    folder,
+                    depth: 0,
+                    parent_folder_id: -1,
+                    standard_mailbox: None,
+                },
+                account_label,
+                &children,
+                &mut visited,
+            );
+        }
+    }
+}
+
+fn mailbox_entries_with_counts(
+    accounts: &[Account],
+    folders: &[FolderInfo],
+    local_mail: Option<i64>,
+    badges: &[MailboxBadgeCounts],
+) -> Vec<MailboxEntry> {
+    let mut entries = mailbox_entries(accounts, folders, local_mail);
+    let mut counts = None::<&MailboxBadgeCounts>;
+    for entry in &mut entries {
+        if counts.is_none_or(|counts| counts.account_id != entry.account_id) {
+            counts = badges
+                .iter()
+                .find(|counts| counts.account_id == entry.account_id);
+        }
+        let Some(counts) = counts else {
+            continue;
+        };
+        entry.count = match entry.scope {
+            Some(Scope::Account { mailbox, .. }) => mailbox_badge(mailbox, counts),
+            Some(Scope::Folder(folder_id)) => counts
+                .folders
+                .binary_search_by_key(&folder_id, |(id, _)| *id)
+                .map_or(0, |index| badge(counts.folders[index].1)),
+            _ => 0,
+        };
+    }
+    entries
+}
+
+fn unified_mailbox_entries(badges: &[MailboxBadgeCounts]) -> Vec<MailboxEntry> {
+    let sum = |count: fn(&MailboxBadgeCounts) -> i64| badges.iter().map(count).sum();
+    let total = MailboxBadgeCounts {
+        inbox: sum(|counts| counts.inbox),
+        starred: sum(|counts| counts.starred),
+        drafts: sum(|counts| counts.drafts),
+        sent: sum(|counts| counts.sent),
+        archive: sum(|counts| counts.archive),
+        spam: sum(|counts| counts.spam),
+        trash: sum(|counts| counts.trash),
+        ..Default::default()
+    };
+    // The unified inbox has a dedicated sidebar row.
+    let mailboxes = StandardMailbox::ALL
+        .into_iter()
+        .filter(|mailbox| *mailbox != StandardMailbox::Inbox);
+    let mut entries = Vec::with_capacity(StandardMailbox::ALL.len() - 1);
+    for mailbox in mailboxes {
+        entries.push(MailboxEntry {
+            account_id: 0,
+            folder_id: -1,
+            parent_folder_id: -1,
+            depth: 0,
+            has_children: false,
+            is_standard: true,
+            is_selectable: true,
+            can_create_children: false,
+            can_rename: false,
+            can_delete: false,
+            label: mailbox.label().to_owned(),
+            scope: Some(Scope::Unified(mailbox)),
+            context: "Unified".to_owned(),
+            detail: String::new(),
+            avatar: String::new(),
+            is_account: false,
+            count: mailbox_badge(mailbox, &total),
+        });
+    }
+    entries
+}
+
+/// Label, category and Important/Other badges of the shown accounts.
+fn sidebar_badges(badges: &[MailboxBadgeCounts]) -> SidebarBadges {
+    let mut sidebar = SidebarBadges::default();
+    for counts in badges {
+        sidebar.important = sidebar.important.saturating_add(badge(counts.important));
+        sidebar.other = sidebar.other.saturating_add(badge(counts.other));
+        for (label, count) in &counts.labels {
+            let total = sidebar.labels.entry(*label).or_default();
+            *total = total.saturating_add(badge(*count));
+        }
+    }
+    sidebar
+}
+
+fn mailbox_badge(mailbox: StandardMailbox, counts: &MailboxBadgeCounts) -> u32 {
+    badge(match mailbox {
+        StandardMailbox::Inbox => counts.inbox,
+        StandardMailbox::Starred => counts.starred,
+        StandardMailbox::Sent => counts.sent,
+        StandardMailbox::Archive => counts.archive,
+        StandardMailbox::Spam => counts.spam,
+        StandardMailbox::Trash => counts.trash,
+        StandardMailbox::Drafts => counts.drafts,
+    })
+}
+
+fn badge(count: i64) -> u32 {
+    u32::try_from(count).unwrap_or(if count < 0 { 0 } else { u32::MAX })
+}
+
+/// The folders of `scope` whose unread mail only on the server its list
+/// mentions at its end: inboxes, archives and the user's own folders, where
+/// older unread mail is worth downloading. Sent mail, drafts, spam and trash
+/// are not, and labels and inbox halves span folders.
+fn server_only_folders(scope: Scope, folders: &[FolderInfo]) -> Vec<i64> {
+    let role = |mailbox| match mailbox {
+        StandardMailbox::Inbox => Some(roles::INBOX),
+        StandardMailbox::Archive => Some(roles::ARCHIVE),
+        _ => None,
+    };
+    let (account, role) = match scope {
+        Scope::Unified(mailbox) => (None, role(mailbox)),
+        Scope::Account {
+            account_id,
+            mailbox,
+        } => (Some(account_id), role(mailbox)),
+        Scope::Folder(id) => {
+            return folders
+                .iter()
+                .filter(|folder| {
+                    folder.id == id
+                        && folder
+                            .role
+                            .as_deref()
+                            .is_none_or(|role| [roles::INBOX, roles::ARCHIVE].contains(&role))
+                })
+                .map(|folder| folder.id)
+                .collect();
+        }
+        Scope::Important
+        | Scope::Other
+        | Scope::Snoozed
+        | Scope::Scheduled
+        | Scope::Label { .. } => {
+            return Vec::new();
+        }
+    };
+    let Some(role) = role else {
+        return Vec::new();
+    };
+    folders
+        .iter()
+        .filter(|folder| {
+            folder.role.as_deref() == Some(role)
+                && account.is_none_or(|account| folder.account_id == account)
+        })
+        .map(|folder| folder.id)
+        .collect()
+}
+
+/// The cursor of a list row: its timeline time and id, in `grouping`.
+pub fn row_cursor(grouping: MailGrouping, time: i64, id: i64) -> MailCursor {
+    match grouping {
+        MailGrouping::Conversations => MailCursor::Thread(ThreadCursor {
+            last_message_at: time,
+            thread_id: id,
+        }),
+        MailGrouping::Messages => MailCursor::Message(MessageCursor {
+            date: time,
+            message_id: id,
+        }),
+    }
+}
+
+/// Whether a loaded row is a conversation or a single message.
+fn row_grouping(row: &MailMessage) -> MailGrouping {
+    if row.message_id.is_some() {
+        MailGrouping::Messages
+    } else {
+        MailGrouping::Conversations
+    }
+}
+
+/// The cursor of a loaded row.
+pub fn cursor_of(row: &MailMessage) -> MailCursor {
+    row_cursor(row_grouping(row), row.date_ms, i64::from(row.id))
+}
+
+/// The cursor a page in `order` reads from to start with a loaded `row`.
+pub fn cursor_before_row(row: &MailMessage, order: ListOrder) -> MailCursor {
+    cursor_before(row_grouping(row), row.date_ms, i64::from(row.id), order)
+}
+
+/// The cursor a page in `order` reads from to start with the row of `time`
+/// and `id`: the same time and the next id toward the list's start. Ids are
+/// whole numbers, so that leaves out no other row.
+pub fn cursor_before(grouping: MailGrouping, time: i64, id: i64, order: ListOrder) -> MailCursor {
+    let id = match order {
+        ListOrder::OldestFirst => id - 1,
+        ListOrder::NewestFirst => id + 1,
+    };
+    row_cursor(grouping, time, id)
+}
+
+/// The lists with these saved keys. A key the app no longer knows is left
+/// out, and its list is newest first.
+fn oldest_first_scopes(keys: Vec<String>) -> std::collections::HashSet<Scope> {
+    keys.into_iter()
+        .filter_map(|key| key.parse::<Scope>().ok())
+        .collect()
+}
+
+/// What `scope` belongs to, which its saved order goes with.
+fn list_owner(scope: Scope) -> ListOwner {
+    match scope {
+        Scope::Unified(_) | Scope::Important | Scope::Other | Scope::Snoozed | Scope::Scheduled => {
+            ListOwner::Unified
+        }
+        Scope::Label { id, .. } => ListOwner::Label(id),
+        Scope::Folder(id) => ListOwner::Folder(id),
+        Scope::Account { account_id, .. } => ListOwner::Account(account_id),
+    }
+}
+
+struct ScopeResolution {
+    account_id: Option<i64>,
+    folder_id: Option<i64>,
+    split_id: Option<i64>,
+    label_id: Option<i64>,
+    view: View,
+    title: String,
+}
+
+fn resolve_scope(scope: Scope, folders: &[FolderInfo], labels: &[Label]) -> ScopeResolution {
+    let unfiltered = |view, title: &str| ScopeResolution {
+        account_id: None,
+        folder_id: None,
+        split_id: None,
+        label_id: None,
+        view,
+        title: title.to_owned(),
+    };
+    match scope {
+        Scope::Unified(mailbox) => unfiltered(standard_mailbox_view(mailbox), mailbox.label()),
+        Scope::Important => ScopeResolution {
+            split_id: Some(-1),
+            ..unfiltered(View::Inbox, "Important")
+        },
+        Scope::Other => ScopeResolution {
+            split_id: Some(-2),
+            ..unfiltered(View::Inbox, "Other")
+        },
+        Scope::Snoozed => unfiltered(View::Snoozed, "Snoozed"),
+        Scope::Scheduled => unfiltered(View::Scheduled, "Scheduled"),
+        Scope::Label { id, .. } => match labels.iter().find(|label| label.id == id) {
+            Some(label) => ScopeResolution {
+                account_id: label.owner_account_id,
+                label_id: Some(id),
+                ..unfiltered(
+                    if label.is_auto {
+                        View::Inbox
+                    } else {
+                        View::All
+                    },
+                    &label.name,
+                )
+            },
+            None => resolve_scope(Scope::UNIFIED_INBOX, folders, labels),
+        },
+        Scope::Folder(id) => match folders.iter().find(|folder| folder.id == id) {
+            Some(folder) => ScopeResolution {
+                account_id: Some(folder.account_id),
+                folder_id: Some(folder.id),
+                ..unfiltered(view_for_folder(folder), &folder_label(folder))
+            },
+            None => resolve_scope(Scope::UNIFIED_INBOX, folders, labels),
+        },
+        Scope::Account {
+            account_id,
+            mailbox,
+        } => ScopeResolution {
+            account_id: Some(account_id),
+            ..unfiltered(standard_mailbox_view(mailbox), mailbox.label())
+        },
+    }
+}
+
+/// A warm-start scope is presentation data and can outlive an account,
+/// folder or label. Accept only scopes represented by the current local
+/// database; otherwise fall back to the visible inbox before querying its
+/// first page.
+fn validated_startup_scope(
+    preferred: Scope,
+    accounts: &[Account],
+    folders: &[FolderInfo],
+    local_mail: Option<i64>,
+    labels: &[Label],
+) -> Scope {
+    let scope = match preferred {
+        Scope::Unified(_) | Scope::Important | Scope::Other | Scope::Snoozed | Scope::Scheduled => {
+            Some(preferred)
+        }
+        // A label can move between sections, e.g. when it becomes automatic.
+        Scope::Label { id, .. } => {
+            labels
+                .iter()
+                .find(|label| label.id == id)
+                .map(|label| Scope::Label {
+                    kind: LabelKind::of(label.is_auto, label.owner_account_id),
+                    id,
+                })
+        }
+        Scope::Folder(_) => mailbox_entries(accounts, folders, local_mail)
+            .iter()
+            .any(|mailbox| mailbox.scope == Some(preferred))
+            .then_some(preferred),
+        Scope::Account { account_id, .. } => mailbox_entries(accounts, folders, local_mail)
+            .iter()
+            .any(|mailbox| mailbox.account_id == account_id && mailbox.scope == Some(preferred))
+            .then_some(preferred),
+    };
+    scope.unwrap_or(Scope::UNIFIED_INBOX).visible_for(accounts)
+}
+
+/// Rows show when snoozed mail comes back only in the Snoozed view, and when
+/// a draft goes out only in the Scheduled view; other views show their usual
+/// dates.
+fn shown_times(mut message: MailMessage, view: View, sends: &[ScheduledSend]) -> MailMessage {
+    if view != View::Snoozed {
+        message.snoozed_until = None;
+    }
+    let send = sends
+        .iter()
+        .filter(|send| match message.message_id {
+            Some(draft) => send.draft_id == draft,
+            None => send.thread_id.is_some() && send.thread_id == message.thread_id,
+        })
+        .min_by_key(|send| send.send_at);
+    message.send_at = send.map(|send| send.send_at);
+    message.send_error = send
+        .filter(|send| matches!(send.state.as_str(), "failed" | "uncertain"))
+        .map(|send| send.error.clone().unwrap_or_default());
+    message.send_uncertain = send.is_some_and(|send| send.state == "uncertain");
+    message
+}
+
+fn summary_to_message(
+    thread: ThreadSummary,
+    accounts: &[Account],
+    folder: &str,
+) -> Option<MailMessage> {
+    let id = i32::try_from(thread.id).ok()?;
+    // A conversation can be visible in Inbox and Sent at the same time. Keep
+    // the row identified by the people on the other side of the exchange so a
+    // newly sent reply does not make an Inbox row look like mail from oneself.
+    let mut display_participants = thread
+        .participants
+        .iter()
+        .filter(|person| {
+            !thread
+                .account_addresses
+                .iter()
+                .any(|own| own.eq_ignore_ascii_case(&person.email))
+        })
+        .collect::<Vec<_>>();
+    if display_participants.is_empty() {
+        display_participants.extend(thread.participants.iter());
+    }
+    let (sender, address) = display_people(&display_participants);
+    let thread_account = accounts
+        .iter()
+        .find(|account| account.id == thread.account_id);
+    let account = thread_account
+        .map(account_label)
+        .unwrap_or_else(|| thread.account_email.clone().unwrap_or_default());
+    let domain = domain_from_address(&address).unwrap_or_default();
+
+    let initials = initials(&sender);
+    Some(MailMessage {
+        id,
+        thread_id: Some(thread.id),
+        message_id: None,
+        account_id: thread.account_id,
+        account,
+        folder: folder.to_owned(),
+        sender,
+        address,
+        domain,
+        initials,
+        subject: display_thread_subject(&thread.subject),
+        preview: thread.snippet,
+        date_ms: thread.last_message_at,
+        snoozed_until: thread.snoozed_until,
+        send_at: None,
+        send_error: None,
+        send_uncertain: false,
+        reply_reminder_at: thread.reply_reminder_at,
+        reply_reminder_due: thread.reply_reminder_due,
+        to: String::new(),
+        to_people: Vec::new(),
+        cc_people: Vec::new(),
+        label: if thread.unread_count > 0 {
+            "UNREAD".to_owned()
+        } else {
+            "MAIL".to_owned()
+        },
+        unread: thread.unread_count > 0,
+        starred: thread.is_starred,
+        has_attachments: thread.has_attachments,
+        message_count: thread.message_count.max(1),
+        attachments: Vec::new(),
+        has_replied: thread.has_replied,
+        high_importance: thread.high_importance,
+        is_outgoing: false,
+        labels: thread.labels,
+        html: None,
+        text: None,
+        body_pending: true,
+        sender_verification: String::new(),
+        can_unsubscribe: false,
+        can_block: false,
+        sender_blocked: false,
+        invitation: None,
+        receipt: None,
+        returned_receipts: Vec::new(),
+        verification_code: thread.verification_code,
+        account_uses_labels: thread_account
+            .is_some_and(|account| account.mail_protocol == MailProtocol::Gmail),
+        first_attachment: thread.first_attachment,
+        attachment_total: thread.attachment_total,
+    })
+}
+
+/// What a message calls someone: their name where it gives one, else their
+/// address.
+pub(crate) fn display_name(person: &Address) -> &str {
+    person
+        .name
+        .as_deref()
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or(&person.email)
+}
+
+/// Everyone a message went to, on one line, its To recipients before its Cc
+/// ones, as in "Ada, Grace, alan@example.com".
+fn recipients_line(to: &[Address], cc: &[Address]) -> String {
+    to.iter()
+        .chain(cc)
+        .map(display_name)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// A row's people, named as "A", "A, B" or "A, B +N", and the first one's
+/// address, which names the row's avatar.
+fn display_people(people: &[&Address]) -> (String, String) {
+    let address = people
+        .first()
+        .map(|person| person.email.clone())
+        .unwrap_or_default();
+    let sender = match people {
+        [] => address.clone(),
+        [only] => display_name(only).to_owned(),
+        [first, second] => format!("{}, {}", display_name(first), display_name(second)),
+        [first, second, rest @ ..] => format!(
+            "{}, {} +{}",
+            display_name(first),
+            display_name(second),
+            rest.len()
+        ),
+    };
+    (sender, address)
+}
+
+/// One message as its own mail-list row. A row is named by the other side of
+/// the exchange: the sender, or for mail sent from the account, its
+/// recipients. The subject keeps its reply prefixes, which tell messages of a
+/// conversation apart.
+fn message_summary_to_message(
+    message: MessageSummary,
+    accounts: &[Account],
+    folder: &str,
+) -> Option<MailMessage> {
+    let id = i32::try_from(message.id).ok()?;
+    let own = |person: &Address| {
+        message
+            .account_addresses
+            .iter()
+            .any(|address| address.eq_ignore_ascii_case(&person.email))
+    };
+    let sent = message.is_outgoing || message.is_draft || own(&message.from);
+    let people = if sent && !message.to.is_empty() {
+        message.to.iter().collect::<Vec<_>>()
+    } else {
+        vec![&message.from]
+    };
+    let (sender, address) = display_people(&people);
+    let message_account = accounts
+        .iter()
+        .find(|account| account.id == message.account_id);
+    let account = message_account
+        .map(account_label)
+        .unwrap_or_else(|| message.account_email.clone().unwrap_or_default());
+    let domain = domain_from_address(&address).unwrap_or_default();
+    let initials = initials(&sender);
+    Some(MailMessage {
+        id,
+        thread_id: Some(message.thread_id),
+        message_id: Some(message.id),
+        account_id: message.account_id,
+        account,
+        folder: folder.to_owned(),
+        sender,
+        address,
+        domain,
+        initials,
+        subject: message.subject.trim().to_owned(),
+        preview: message.snippet,
+        date_ms: message.date,
+        snoozed_until: message.snoozed_until,
+        send_at: None,
+        send_error: None,
+        send_uncertain: false,
+        reply_reminder_at: message.reply_reminder_at,
+        reply_reminder_due: message.reply_reminder_due,
+        to: recipients_line(&message.to, &[]),
+        to_people: message.to.clone(),
+        cc_people: Vec::new(),
+        label: if message.is_draft {
+            "DRAFT".to_owned()
+        } else if !message.is_read {
+            "UNREAD".to_owned()
+        } else {
+            "MAIL".to_owned()
+        },
+        unread: !message.is_read && !message.is_draft,
+        starred: message.is_starred,
+        has_attachments: message.has_attachments,
+        message_count: 1,
+        attachments: Vec::new(),
+        has_replied: message.has_replied,
+        high_importance: message.high_importance,
+        is_outgoing: message.is_outgoing,
+        labels: message.labels,
+        html: None,
+        text: None,
+        body_pending: true,
+        sender_verification: String::new(),
+        can_unsubscribe: false,
+        can_block: false,
+        sender_blocked: false,
+        invitation: None,
+        receipt: None,
+        returned_receipts: Vec::new(),
+        verification_code: message.verification_code,
+        account_uses_labels: message_account
+            .is_some_and(|account| account.mail_protocol == MailProtocol::Gmail),
+        first_attachment: message.first_attachment,
+        attachment_total: message.attachment_total,
+    })
+}
+
+/// Keep the newest message's display casing and local prefixes while removing
+/// transport reply prefixes that belong to individual messages, not the
+/// conversation title.
+fn display_thread_subject(subject: &str) -> String {
+    let mut remaining = subject.trim();
+    let mut leading_tags = String::new();
+    while let Some(tag_end) = remaining
+        .strip_prefix('[')
+        .and_then(|rest| rest.find(']').map(|index| index + 1))
+    {
+        let (tag, rest) = remaining.split_at(tag_end + 1);
+        if !leading_tags.is_empty() {
+            leading_tags.push(' ');
+        }
+        leading_tags.push_str(tag.trim());
+        remaining = rest.trim_start();
+    }
+    while let Some(colon) = remaining.find(':') {
+        let prefix = remaining[..colon].trim();
+        let token = prefix
+            .split_once('[')
+            .map_or(prefix, |(token, _)| token)
+            .trim();
+        if !matches!(
+            token.to_ascii_lowercase().as_str(),
+            "re" | "fw" | "fwd" | "aw" | "sv"
+        ) {
+            break;
+        }
+        remaining = remaining[colon + 1..].trim_start();
+    }
+    match (leading_tags.is_empty(), remaining.is_empty()) {
+        (true, _) => remaining.to_owned(),
+        (false, true) => leading_tags,
+        (false, false) => format!("{leading_tags} {remaining}"),
+    }
+}
+
+fn detail_to_message(row: &MailMessage, message: &MessageDetail, body_loaded: bool) -> MailMessage {
+    let sender = message
+        .from
+        .name
+        .clone()
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or_else(|| message.from.email.clone());
+    let html = body_loaded.then(|| {
+        readable_message_html(
+            message.html_body.as_deref(),
+            message.text_body.as_deref(),
+            &message.snippet,
+        )
+    });
+
+    let initials = initials(&sender);
+    // The scheduled draft keeps when it goes out, or why it did not, which
+    // only the list row knows.
+    let scheduled = message.is_draft && row.message_id.is_none_or(|id| id == message.id);
+    MailMessage {
+        id: row.id,
+        thread_id: row.thread_id,
+        message_id: row.message_id,
+        account_id: row.account_id,
+        account: row.account.clone(),
+        folder: row.folder.clone(),
+        sender,
+        address: message.from.email.clone(),
+        domain: domain_from_address(&message.from.email).unwrap_or_default(),
+        initials,
+        subject: message.subject.clone(),
+        preview: message.snippet.clone(),
+        date_ms: message.date,
+        snoozed_until: row.snoozed_until,
+        send_at: row.send_at.filter(|_| scheduled),
+        send_error: row.send_error.clone().filter(|_| scheduled),
+        send_uncertain: row.send_uncertain && scheduled,
+        reply_reminder_at: row.reply_reminder_at,
+        reply_reminder_due: row.reply_reminder_due,
+        to: recipients_line(&message.to, &message.cc),
+        to_people: message.to.clone(),
+        cc_people: message.cc.clone(),
+        label: if message.is_draft {
+            "DRAFT".to_owned()
+        } else if message.is_outgoing {
+            "SENT".to_owned()
+        } else if message.is_read {
+            "MAIL".to_owned()
+        } else {
+            "UNREAD".to_owned()
+        },
+        unread: !message.is_read,
+        starred: row.starred,
+        has_attachments: !message.attachments.is_empty(),
+        message_count: row.message_count,
+        attachments: if body_loaded {
+            message.attachments.clone()
+        } else {
+            Vec::new()
+        },
+        has_replied: row.has_replied,
+        high_importance: row.high_importance,
+        is_outgoing: message.is_outgoing,
+        labels: row.labels.clone(),
+        html,
+        text: if body_loaded {
+            message.text_body.clone()
+        } else {
+            None
+        },
+        body_pending: message.body_state != "cached",
+        sender_verification: message.sender_verification.as_str().to_owned(),
+        can_unsubscribe: !message.is_draft
+            && !message.is_outgoing
+            && !message.in_spam
+            && message.list_unsubscribe.as_deref().is_some_and(|header| {
+                // The core says when an account that only receives can't
+                // send the request.
+                flectar_mail_core::unsubscribe::plan(header, false, true).is_some()
+            }),
+        can_block: !message.is_draft && !message.is_outgoing && message.from.email.contains('@'),
+        sender_blocked: message.sender_blocked,
+        invitation: None,
+        receipt: message
+            .receipt_request
+            .clone()
+            .map(|request| ReceiptAsk {
+                message_id: message.id,
+                request,
+            }),
+        returned_receipts: message.returned_receipts.clone(),
+        verification_code: row.verification_code.clone(),
+        account_uses_labels: row.account_uses_labels,
+        first_attachment: row.first_attachment.clone(),
+        attachment_total: row.attachment_total,
+    }
+}
+
+fn detail_to_conversation_message(
+    row: &MailMessage,
+    message: &MessageDetail,
+    body_loaded: bool,
+) -> Option<MailMessage> {
+    let mut projected = detail_to_message(row, message, body_loaded);
+    projected.id = i32::try_from(message.id).ok()?;
+    projected.thread_id = Some(message.thread_id);
+    projected.account_id = message.account_id;
+    projected.message_count = 1;
+    projected.is_outgoing = message.is_outgoing;
+    Some(projected)
+}
+
+fn readable_message_html(html: Option<&str>, text: Option<&str>, snippet: &str) -> String {
+    html.filter(|value| !value.trim().is_empty())
+        .map(str::to_owned)
+        .or_else(|| {
+            text.filter(|value| !value.trim().is_empty())
+                .map(text_to_html)
+        })
+        // A newly opened message can have an allocated, but still empty,
+        // body row while its MIME sections are in flight. Never turn that
+        // transient state into a completely white reading pane.
+        .unwrap_or_else(|| text_to_html(&display_preview(snippet)))
+}
+
+fn account_label(account: &Account) -> String {
+    account.label().to_owned()
+}
+
+fn avatar_initials(label: &str) -> String {
+    let mut words = label
+        .split_whitespace()
+        .filter_map(|word| word.chars().next());
+    let Some(first) = words.next() else {
+        return "?".to_owned();
+    };
+    let second = words.next();
+    second.map_or_else(
+        || first.to_uppercase().collect(),
+        |second| format!("{}{}", first.to_uppercase(), second.to_uppercase()),
+    )
+}
+
+fn folder_label(folder: &FolderInfo) -> String {
+    match folder.role.as_deref() {
+        Some("inbox") => "Inbox".to_owned(),
+        Some("sent") => "Sent".to_owned(),
+        Some("archive") => "Archive".to_owned(),
+        Some("drafts") => "Drafts".to_owned(),
+        Some("trash") => "Trash".to_owned(),
+        Some("spam") => "Spam".to_owned(),
+        _ => folder
+            .is_jmap
+            .then_some(" / ")
+            .or(folder.delimiter.as_deref())
+            .filter(|delimiter| !delimiter.is_empty())
+            .and_then(|delimiter| folder.display_name.rsplit_once(delimiter))
+            .map(|(_, leaf)| leaf.trim().to_owned())
+            .unwrap_or_else(|| folder.display_name.clone()),
+    }
+}
+
+fn view_for_folder(folder: &FolderInfo) -> View {
+    match folder.role.as_deref() {
+        Some("inbox") => View::Inbox,
+        Some("sent") => View::Sent,
+        Some("drafts") => View::Drafts,
+        Some("archive") => View::Done,
+        Some("trash") => View::Trash,
+        Some("spam") => View::Spam,
+        _ => View::All,
+    }
+}
+
+fn initials(name: &str) -> String {
+    let mut letters = name
+        .split_whitespace()
+        .filter_map(|part| part.chars().next())
+        .take(2)
+        .collect::<String>()
+        .to_uppercase();
+    if letters.is_empty() {
+        letters.push('?');
+    }
+    letters
+}
+
+fn text_to_html(text: &str) -> String {
+    text_to_html_in(text, false)
+}
+
+/// A text body as the reader shows it, written right to left when its
+/// language is, as a translation into Arabic or Hebrew is (#240).
+pub(crate) fn text_to_html_in(text: &str, right_to_left: bool) -> String {
+    const PREFIX: &str = "<html><body style=\"font-family:Arial,sans-serif;padding:32px;line-height:1.6;color:#303348\"";
+    const PRE: &str =
+        "><pre style=\"margin:0;font:inherit;white-space:pre-wrap;overflow-wrap:anywhere\">";
+    const SUFFIX: &str = "</pre></body></html>";
+    let mut html = String::with_capacity(PREFIX.len() + PRE.len() + text.len() + SUFFIX.len() + 10);
+    html.push_str(PREFIX);
+    if right_to_left {
+        html.push_str(" dir=\"rtl\"");
+    }
+    html.push_str(PRE);
+    crate::email_document::append_escaped(&mut html, text);
+    html.push_str(SUFFIX);
+    html
+}
+
+fn markdown_options() -> Options {
+    Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS | Options::ENABLE_SMART_PUNCTUATION
+}
+
+/// Render the compose document to safe email HTML. CommonMark is the native
+/// editor format; sanitizing the generated fragment keeps manually typed HTML
+/// inert while retaining email-safe links, underline tags, and formatting.
+fn markdown_to_html(markdown: &str) -> String {
+    let mut fragment = String::new();
+    html::push_html(&mut fragment, Parser::new_ext(markdown, markdown_options()));
+    let fragment = flectar_mail_core::mime::sanitize_html(&fragment);
+    format!(
+        "<html><body style=\"margin:0;padding:0;font-family:Arial,sans-serif;font-size:14px;line-height:1.55;color:#202124\">{fragment}</body></html>"
+    )
+}
+
+/// Produce the text/plain MIME alternative without leaking CommonMark tokens
+/// such as `**` or link destinations into clients that prefer plain text.
+#[cfg(test)]
+fn markdown_to_plain_text(markdown: &str) -> String {
+    fn ensure_break(output: &mut String) {
+        if !output.ends_with('\n') {
+            output.push('\n');
+        }
+    }
+
+    let mut output = String::new();
+    for event in Parser::new_ext(markdown, markdown_options()) {
+        match event {
+            Event::Text(text)
+            | Event::Code(text)
+            | Event::InlineMath(text)
+            | Event::DisplayMath(text) => output.push_str(&text),
+            Event::SoftBreak | Event::HardBreak => ensure_break(&mut output),
+            Event::Rule => {
+                ensure_break(&mut output);
+                output.push_str("---\n");
+            }
+            Event::TaskListMarker(done) => output.push_str(if done { "[x] " } else { "[ ] " }),
+            Event::Start(Tag::Item) => output.push_str("• "),
+            Event::End(
+                TagEnd::Paragraph
+                | TagEnd::Heading(_)
+                | TagEnd::BlockQuote(_)
+                | TagEnd::CodeBlock
+                | TagEnd::Item,
+            ) => ensure_break(&mut output),
+            Event::Start(_)
+            | Event::End(_)
+            | Event::Html(_)
+            | Event::InlineHtml(_)
+            | Event::FootnoteReference(_) => {}
+        }
+    }
+    output.trim_end().to_owned()
+}
+
+/// Fixture rows with one stable id per fixture account, in first-seen order.
+#[cfg(test)]
+pub fn fixture_messages() -> Vec<MailMessage> {
+    let mut accounts = Vec::new();
+    fixtures()
+        .into_iter()
+        .map(|fixture| {
+            let mut message = MailMessage::from_fixture(fixture);
+            let index = accounts
+                .iter()
+                .position(|account| *account == message.account)
+                .unwrap_or_else(|| {
+                    accounts.push(message.account.clone());
+                    accounts.len() - 1
+                });
+            message.account_id = index as i64 + 1;
+            message
+        })
+        .collect()
+}
+
+#[cfg(test)]
+pub fn fixtures() -> Vec<EmailFixture> {
+    #[derive(serde::Deserialize)]
+    struct DemoData {
+        emails: Vec<EmailFixture>,
+        selected_to: String,
+    }
+    let mut data: DemoData =
+        serde_json::from_str(include_str!("../resources/screenshots/demo-data.json"))
+            .expect("valid shared screenshot fixture");
+    for email in &mut data.emails {
+        email.to.clone_from(&data.selected_to);
+        // Renderer tests need an HTML document; screenshots render the shared
+        // demo-email.html instead. Build test HTML from the same rows.
+        email.html = markdown_to_html(&format!(
+            "# {}\n\n{}\n\n[Open message](https://{}) · [Flectar Mail](https://flectar.com)",
+            email.subject,
+            email.preview,
+            domain_from_address(&email.address).unwrap_or_default()
+        ));
+    }
+    data.emails
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        ComposeMessage, MailTarget, SidebarBadges, compose_args, display_thread_subject,
+        mailbox_entries, mailbox_entries_with_counts, markdown_to_html, markdown_to_plain_text,
+        message_summary_to_message, readable_message_html, recipients_line, resolve_scope,
+        server_only_folders, sidebar_badges, summary_to_message, unified_mailbox_entries,
+        validated_startup_scope, with_local_mail,
+    };
+    use crate::mail_scope::{LabelKind, Scope, StandardMailbox};
+    use flectar_mail_core::models::{
+        Account, ActionTarget, Address, AuthKind, FolderInfo, Importance, Label, MailProtocol,
+        MailboxBadgeCounts, MessageSummary, Provider, ThreadSummary, View,
+    };
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    fn test_account() -> Account {
+        Account {
+            id: 1,
+            email: "person@example.com".into(),
+            display_name: Some("Person".into()),
+            name: None,
+            avatar_url: None,
+            provider: Provider::Generic,
+            auth_kind: AuthKind::Password,
+            mail_protocol: MailProtocol::Imap,
+            sync_state: "idle".into(),
+            sync_error: None,
+            sync_retry_at: None,
+            can_create_top_level_mailbox: true,
+            server_keeps_mail_days: None,
+            caught_up_at: None,
+        }
+    }
+
+    #[test]
+    fn only_inboxes_archives_and_own_folders_mention_mail_on_the_server() {
+        let folder = |id, account_id, role: Option<&str>| FolderInfo {
+            id,
+            account_id,
+            parent_id: None,
+            display_name: String::new(),
+            is_jmap: false,
+            path: format!("folder-{id}"),
+            delimiter: Some("/".into()),
+            role: role.map(str::to_owned),
+            selectable: true,
+            can_create_children: true,
+            can_rename: true,
+            can_delete: true,
+        };
+        let folders = [
+            folder(1, 1, Some("inbox")),
+            folder(2, 1, Some("archive")),
+            folder(3, 1, Some("sent")),
+            folder(4, 1, None),
+            folder(5, 1, Some("spam")),
+            folder(6, 2, Some("inbox")),
+        ];
+        let account = |account_id, mailbox| Scope::Account {
+            account_id,
+            mailbox,
+        };
+        assert_eq!(server_only_folders(Scope::UNIFIED_INBOX, &folders), [1, 6]);
+        assert_eq!(
+            server_only_folders(account(2, StandardMailbox::Inbox), &folders),
+            [6]
+        );
+        assert_eq!(
+            server_only_folders(account(1, StandardMailbox::Archive), &folders),
+            [2]
+        );
+        assert_eq!(server_only_folders(Scope::Folder(4), &folders), [4]);
+        assert_eq!(server_only_folders(Scope::Folder(1), &folders), [1]);
+        for scope in [
+            Scope::Unified(StandardMailbox::Sent),
+            account(1, StandardMailbox::Spam),
+            Scope::Folder(3),
+            Scope::Folder(5),
+            Scope::Important,
+            Scope::Label {
+                kind: LabelKind::Global,
+                id: 1,
+            },
+        ] {
+            assert!(server_only_folders(scope, &folders).is_empty(), "{scope:?}");
+        }
+    }
+
+    #[test]
+    fn every_mailbox_and_folder_gets_the_badge_of_its_list() {
+        let folder = |id, path: &str, role: Option<&str>| FolderInfo {
+            id,
+            account_id: 1,
+            parent_id: None,
+            display_name: path.into(),
+            is_jmap: false,
+            path: path.into(),
+            delimiter: Some("/".into()),
+            role: role.map(str::to_owned),
+            selectable: true,
+            can_create_children: true,
+            can_rename: true,
+            can_delete: true,
+        };
+        let folders = [
+            folder(1, "INBOX", Some("inbox")),
+            folder(2, "Archive", Some("archive")),
+            folder(3, "Projects", None),
+            // A custom folder only shares the Inbox's name.
+            folder(4, "Inbox", None),
+        ];
+        let badges = [
+            MailboxBadgeCounts {
+                account_id: 1,
+                inbox: 4,
+                starred: 2,
+                drafts: 1,
+                sent: 1,
+                archive: 3,
+                spam: 5,
+                trash: 6,
+                important: 3,
+                other: 1,
+                // The Inbox row counts its view, which leaves out snoozes.
+                folders: vec![(1, 9), (2, 3), (3, 2)],
+                labels: vec![(20, 2)],
+            },
+            MailboxBadgeCounts {
+                account_id: 2,
+                inbox: 1,
+                archive: 1,
+                other: 1,
+                labels: vec![(20, 1), (30, 4)],
+                ..Default::default()
+            },
+        ];
+
+        let entries = mailbox_entries_with_counts(&[test_account()], &folders, None, &badges);
+        let count = |scope| {
+            entries
+                .iter()
+                .find(|entry| entry.scope == Some(scope))
+                .unwrap()
+                .count
+        };
+        let standard = |mailbox| Scope::Account {
+            account_id: 1,
+            mailbox,
+        };
+        for (mailbox, expected) in [
+            (StandardMailbox::Inbox, 4),
+            (StandardMailbox::Starred, 2),
+            (StandardMailbox::Sent, 1),
+            (StandardMailbox::Archive, 3),
+            (StandardMailbox::Spam, 5),
+            (StandardMailbox::Trash, 6),
+            (StandardMailbox::Drafts, 1),
+        ] {
+            assert_eq!(count(standard(mailbox)), expected, "{mailbox:?}");
+        }
+        assert_eq!(count(Scope::Folder(3)), 2);
+        assert_eq!(count(Scope::Folder(4)), 0);
+        assert!(
+            entries
+                .iter()
+                .filter(|entry| entry.is_account)
+                .all(|entry| entry.count == 0)
+        );
+
+        let unified = unified_mailbox_entries(&badges);
+        let unified_count = |mailbox| {
+            unified
+                .iter()
+                .find(|entry| entry.scope == Some(Scope::Unified(mailbox)))
+                .unwrap()
+                .count
+        };
+        assert_eq!(unified_count(StandardMailbox::Archive), 4);
+        assert_eq!(unified_count(StandardMailbox::Trash), 6);
+        assert_eq!(
+            sidebar_badges(&badges),
+            SidebarBadges {
+                labels: HashMap::from([(20, 3), (30, 4)]),
+                important: 3,
+                other: 2,
+            }
+        );
+    }
+
+    #[test]
+    fn single_account_scopes_preserve_every_standard_view() {
+        for (provider, mail_protocol) in [
+            (Provider::Generic, MailProtocol::Imap),
+            (Provider::Gmail, MailProtocol::Gmail),
+            (Provider::Microsoft, MailProtocol::Imap),
+        ] {
+            let mut account = test_account();
+            account.provider = provider;
+            account.mail_protocol = mail_protocol;
+            account.display_name = Some("Work / Personal".into());
+            let accounts = [account];
+            let entries = mailbox_entries(&accounts, &[], None);
+            for mailbox in StandardMailbox::ALL {
+                let unified = Scope::Unified(mailbox);
+                let scope = unified.visible_for(&accounts);
+                assert!(entries.iter().any(|entry| entry.scope == Some(scope)));
+                assert_eq!(
+                    validated_startup_scope(unified, &accounts, &[], None, &[]),
+                    scope
+                );
+                let before = resolve_scope(unified, &[], &[]);
+                let after = resolve_scope(scope, &[], &[]);
+                assert_eq!(after.view, before.view);
+                assert_eq!(after.account_id, Some(1));
+                assert_eq!(after.folder_id, None);
+                assert_eq!(after.title, mailbox.label());
+            }
+            let removed = Scope::Account {
+                account_id: 2,
+                mailbox: StandardMailbox::Sent,
+            };
+            assert_eq!(
+                validated_startup_scope(removed, &accounts, &[], None, &[]),
+                Scope::Account {
+                    account_id: 1,
+                    mailbox: StandardMailbox::Inbox
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn startup_keeps_known_navigation_and_drops_stale_targets() {
+        let mut second = test_account();
+        second.id = 2;
+        let accounts = [test_account(), second];
+        let folders = [FolderInfo {
+            id: 42,
+            account_id: 2,
+            parent_id: None,
+            display_name: "Receipts".into(),
+            is_jmap: false,
+            path: "Receipts".into(),
+            delimiter: Some("/".into()),
+            role: None,
+            selectable: true,
+            can_create_children: true,
+            can_rename: true,
+            can_delete: true,
+        }];
+        let kept = [
+            Scope::Unified(StandardMailbox::Drafts),
+            Scope::Important,
+            Scope::Other,
+            Scope::Folder(42),
+            Scope::Account {
+                account_id: 2,
+                mailbox: StandardMailbox::Spam,
+            },
+        ];
+        for scope in kept {
+            assert_eq!(
+                validated_startup_scope(scope, &accounts, &folders, None, &[]),
+                scope
+            );
+        }
+        let stale = [
+            Scope::Folder(43),
+            Scope::Account {
+                account_id: 3,
+                mailbox: StandardMailbox::Inbox,
+            },
+            Scope::Label {
+                kind: LabelKind::Global,
+                id: 9,
+            },
+        ];
+        for scope in stale {
+            assert_eq!(
+                validated_startup_scope(scope, &accounts, &folders, None, &[]),
+                Scope::UNIFIED_INBOX
+            );
+        }
+    }
+
+    #[test]
+    fn empty_in_flight_body_falls_back_to_the_message_snippet() {
+        let html = readable_message_html(Some("  \n"), Some(""), "Instagram message preview");
+
+        assert!(html.contains("Instagram message preview"));
+        assert!(!html.trim().is_empty());
+    }
+
+    #[test]
+    fn rich_body_wins_when_it_is_available() {
+        let html = readable_message_html(
+            Some("<main><strong>Rich message</strong></main>"),
+            Some("plain message"),
+            "preview",
+        );
+
+        assert_eq!(html, "<main><strong>Rich message</strong></main>");
+    }
+
+    #[test]
+    fn plain_text_body_preserves_reply_lines_and_quote_depth() {
+        let text = "Hi Tomas,\n\n> Earlier reply\n>> Older reply";
+        let html = readable_message_html(None, Some(text), "preview");
+        let prepared = crate::renderer::prepare_email_html(&html).unwrap();
+
+        assert!(html.contains("white-space:pre-wrap"));
+        assert!(html.contains("&gt; Earlier reply\n&gt;&gt; Older reply"));
+        assert_eq!(prepared.plain_text, text);
+    }
+
+    fn message_summary(from: &str, to: &[&str], outgoing: bool) -> MessageSummary {
+        MessageSummary {
+            id: 41,
+            thread_id: 22,
+            account_id: 1,
+            account_email: Some("person@example.com".into()),
+            account_addresses: vec!["person@example.com".into()],
+            subject: "Re: Launch review".into(),
+            snippet: "Tuesday works.".into(),
+            from: Address {
+                name: None,
+                email: from.into(),
+            },
+            to: to
+                .iter()
+                .map(|email| Address {
+                    name: None,
+                    email: (*email).into(),
+                })
+                .collect(),
+            date: 5,
+            is_read: false,
+            is_starred: true,
+            is_draft: false,
+            is_outgoing: outgoing,
+            has_attachments: false,
+            has_replied: false,
+            high_importance: false,
+            snoozed_until: None,
+            reply_reminder_at: None,
+            reply_reminder_due: false,
+            labels: vec![3],
+            verification_code: None,
+            first_attachment: None,
+            attachment_total: 0,
+        }
+    }
+
+    #[test]
+    fn a_message_row_shows_that_message_and_acts_on_it_alone() {
+        let row = message_summary_to_message(
+            message_summary("maya@example.com", &["person@example.com"], false),
+            &[test_account()],
+            "Inbox",
+        )
+        .unwrap();
+        assert_eq!(row.id, 41);
+        assert_eq!(row.message_id, Some(41));
+        assert_eq!(row.thread_id, Some(22));
+        assert_eq!(row.sender, "maya@example.com");
+        // Reply prefixes tell the messages of a conversation apart.
+        assert_eq!(row.subject, "Re: Launch review");
+        assert_eq!(row.message_count, 1);
+        assert!(row.unread && row.starred);
+        assert_eq!(row.labels, [3]);
+        assert_eq!(
+            MailTarget::of(&row),
+            Some(MailTarget::Message {
+                id: 41,
+                thread_id: 22
+            })
+        );
+        assert_eq!(
+            MailTarget::of(&row).unwrap().action_target(),
+            ActionTarget::Messages(vec![41])
+        );
+
+        // Mail the account sent is named by its recipients.
+        let sent = message_summary(
+            "person@example.com",
+            &["maya@example.com", "alex@example.com"],
+            true,
+        );
+        let row = message_summary_to_message(sent, &[test_account()], "Sent").unwrap();
+        assert_eq!(row.sender, "maya@example.com, alex@example.com");
+        assert_eq!(row.address, "maya@example.com");
+    }
+
+    #[test]
+    fn the_reader_names_everyone_a_message_went_to() {
+        let person = |name: Option<&str>, email: &str| Address {
+            name: name.map(str::to_owned),
+            email: email.into(),
+        };
+        assert_eq!(
+            recipients_line(
+                &[
+                    person(Some("Ada"), "ada@example.com"),
+                    person(Some(" "), "grace@example.com"),
+                ],
+                &[person(Some("Alan Turing"), "alan@example.com")],
+            ),
+            "Ada, grace@example.com, Alan Turing"
+        );
+        assert_eq!(recipients_line(&[], &[]), "");
+    }
+
+    #[test]
+    fn thread_summary_projects_participants_and_message_count() {
+        let thread = ThreadSummary {
+            id: 22,
+            account_id: 1,
+            account_email: Some("person@example.com".into()),
+            account_addresses: vec!["PERSON@EXAMPLE.COM".into()],
+            subject: "Re: Launch review".into(),
+            snippet: "Tuesday works for everyone.".into(),
+            participants: vec![
+                Address {
+                    name: Some("Me".into()),
+                    email: "person@example.com".into(),
+                },
+                Address {
+                    name: Some("Maya".into()),
+                    email: "maya@example.com".into(),
+                },
+                Address {
+                    name: Some("Alex".into()),
+                    email: "alex@example.com".into(),
+                },
+                Address {
+                    name: None,
+                    email: "lee@example.com".into(),
+                },
+            ],
+            last_message_at: 0,
+            message_count: 4,
+            unread_count: 1,
+            is_starred: false,
+            has_attachments: false,
+            has_replied: true,
+            high_importance: false,
+            snoozed_until: None,
+            reply_reminder_at: None,
+            reply_reminder_due: false,
+            labels: Vec::new(),
+            verification_code: Some("482913".into()),
+            first_attachment: Some(flectar_mail_core::models::AttachmentMeta {
+                id: 7,
+                filename: Some("Launch plan.pdf".into()),
+                mime_type: Some("application/pdf".into()),
+                size: Some(2048),
+                is_inline: false,
+            }),
+            attachment_total: 2,
+        };
+        let row = summary_to_message(thread.clone(), &[test_account()], "Inbox").unwrap();
+
+        assert_eq!(
+            row.account, "Person",
+            "the owner's name without a name of its own"
+        );
+        let named = Account {
+            name: Some("Shop".into()),
+            ..test_account()
+        };
+        assert_eq!(
+            summary_to_message(thread.clone(), &[named], "Inbox")
+                .unwrap()
+                .account,
+            "Shop"
+        );
+        assert_eq!(row.sender, "Maya, Alex +1");
+        assert_eq!(row.address, "maya@example.com");
+        assert_eq!(MailTarget::of(&row), Some(MailTarget::Thread(22)));
+        assert_eq!(row.subject, "Launch review");
+        assert_eq!(row.message_count, 4);
+        assert_eq!(row.id, 22);
+        assert_eq!(row.verification_code.as_deref(), Some("482913"));
+        assert_eq!(row.first_attachment.as_ref().map(|file| file.id), Some(7));
+        assert_eq!(row.attachment_total, 2);
+        assert!(
+            !row.account_uses_labels,
+            "IMAP labels are filed like folders"
+        );
+        let gmail = Account {
+            provider: Provider::Gmail,
+            mail_protocol: MailProtocol::Gmail,
+            ..test_account()
+        };
+        assert!(
+            summary_to_message(thread, &[gmail], "Inbox")
+                .unwrap()
+                .account_uses_labels
+        );
+    }
+
+    #[test]
+    fn conversation_subject_drops_reply_prefixes_and_keeps_local_tags() {
+        assert_eq!(display_thread_subject("Re: Re[2]: Launch"), "Launch");
+        assert_eq!(
+            display_thread_subject("[INVOICE] Re: Payment"),
+            "[INVOICE] Payment"
+        );
+        assert_eq!(
+            display_thread_subject("Re: [team] Standup"),
+            "[team] Standup"
+        );
+    }
+
+    #[test]
+    fn compose_markdown_generates_rich_and_plain_mime_bodies() {
+        let source = "Hello **Maya** — see [the plan](https://example.com).\n\n<u>Important</u>";
+        let html = markdown_to_html(source);
+        let plain = markdown_to_plain_text(source);
+
+        assert!(html.contains("<strong>Maya</strong>"));
+        assert!(html.contains("href=\"https://example.com\""));
+        assert!(html.contains("<u>Important</u>"));
+        assert_eq!(plain, "Hello Maya — see the plan.\nImportant");
+    }
+
+    #[test]
+    fn compose_html_strips_executable_markup() {
+        let html = markdown_to_html("Safe<script>alert('no')</script> text");
+
+        assert!(!html.contains("<script"));
+        assert!(!html.contains("alert('no')"));
+        assert!(html.contains("Safe"));
+    }
+
+    #[test]
+    fn incomplete_drafts_do_not_require_a_recipient() {
+        let message = || ComposeMessage {
+            draft_id: None,
+            account_id: 7,
+            sender_email: None,
+            to: "",
+            cc: "",
+            bcc: "",
+            subject: "",
+            body: "notes",
+            body_html: None,
+            attachments: &[],
+            mode: "new",
+            in_reply_to_message_id: None,
+            in_reply_to_header: None,
+            request_read_receipt: false,
+            importance: Importance::Normal,
+        };
+        let draft = compose_args(message(), false).unwrap();
+
+        assert!(draft.to.is_empty());
+        assert_eq!(draft.account_id, 7);
+        assert_eq!(draft.body_text, "notes");
+        assert!(compose_args(message(), true).is_err());
+    }
+
+    #[test]
+    fn compose_uses_selected_account_and_direct_rich_html() {
+        let draft = compose_args(
+            ComposeMessage {
+                draft_id: Some(17),
+                account_id: 42,
+                sender_email: Some("work@example.com"),
+                to: "maya@example.com",
+                cc: "",
+                bcc: "",
+                subject: "Update",
+                body: "Hello Maya",
+                body_html: Some("<div>Hello <strong>Maya</strong></div>"),
+                attachments: &[],
+                mode: "reply",
+                in_reply_to_message_id: Some(99),
+                in_reply_to_header: None,
+                request_read_receipt: true,
+                importance: Importance::High,
+            },
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(draft.account_id, 42);
+        assert_eq!(draft.draft_id, Some(17));
+        assert_eq!(draft.body_text, "Hello Maya");
+        assert_eq!(draft.mode, "reply");
+        assert_eq!(draft.in_reply_to_message_id, Some(99));
+        assert!(draft.request_read_receipt);
+        assert_eq!(draft.importance, Importance::High);
+        assert_eq!(
+            draft.body_html.as_deref(),
+            Some("<div>Hello <strong>Maya</strong></div>")
+        );
+    }
+
+    #[test]
+    fn mailbox_entries_preserve_unicode_hierarchy_and_stable_ids() {
+        let folders = vec![
+            FolderInfo {
+                id: 10,
+                account_id: 1,
+                parent_id: None,
+                display_name: "☺ Projects".into(),
+                is_jmap: false,
+                path: "&Jjo- Projects".into(),
+                delimiter: Some("/".into()),
+                role: None,
+                selectable: true,
+                can_create_children: true,
+                can_rename: true,
+                can_delete: true,
+            },
+            FolderInfo {
+                id: 11,
+                account_id: 1,
+                parent_id: Some(10),
+                display_name: "☺ Projects/2026".into(),
+                is_jmap: false,
+                path: "&Jjo- Projects/2026".into(),
+                delimiter: Some("/".into()),
+                role: None,
+                selectable: true,
+                can_create_children: true,
+                can_rename: true,
+                can_delete: true,
+            },
+            FolderInfo {
+                id: 12,
+                account_id: 1,
+                parent_id: None,
+                display_name: "Archive copy/2026".into(),
+                is_jmap: false,
+                path: "Archive copy/2026".into(),
+                delimiter: Some("/".into()),
+                role: None,
+                selectable: true,
+                can_create_children: true,
+                can_rename: true,
+                can_delete: true,
+            },
+            FolderInfo {
+                id: 13,
+                account_id: 1,
+                parent_id: None,
+                display_name: "Inbox".into(),
+                is_jmap: false,
+                path: "Inbox".into(),
+                delimiter: Some("/".into()),
+                role: None,
+                selectable: true,
+                can_create_children: true,
+                can_rename: true,
+                can_delete: true,
+            },
+        ];
+
+        let entries = mailbox_entries(&[test_account()], &folders, None);
+        let parent = entries.iter().find(|entry| entry.folder_id == 10).unwrap();
+        let child = entries.iter().find(|entry| entry.folder_id == 11).unwrap();
+        let duplicate_leaf = entries.iter().find(|entry| entry.folder_id == 12).unwrap();
+        let custom_inbox = entries.iter().find(|entry| entry.folder_id == 13).unwrap();
+        assert_eq!(parent.label, "☺ Projects");
+        assert!(parent.has_children);
+        assert_eq!(child.label, "2026");
+        assert_eq!(child.parent_folder_id, parent.folder_id);
+        assert_eq!(child.depth, 1);
+        assert_eq!(child.scope, Some(Scope::Folder(11)));
+        assert_eq!(duplicate_leaf.scope, Some(Scope::Folder(12)));
+        assert_eq!(custom_inbox.scope, Some(Scope::Folder(13)));
+        assert_eq!(custom_inbox.count, 0);
+    }
+
+    #[test]
+    fn recipients_split_on_commas_semicolons_and_newlines() {
+        let parsed = super::parse_recipients(
+            "Ada <ada@example.com>,\nGrace <grace@example.com>; alan@example.com\n\n",
+        )
+        .unwrap();
+        assert_eq!(parsed.len(), 3);
+        assert_eq!(parsed[0].email, "ada@example.com");
+        assert_eq!(parsed[0].name.as_deref(), Some("Ada"));
+        assert_eq!(parsed[1].email, "grace@example.com");
+        assert_eq!(parsed[2].email, "alan@example.com");
+        assert!(parsed[2].name.is_none());
+    }
+
+    #[test]
+    fn quoted_names_keep_their_separators() {
+        let parsed = super::parse_recipients(
+            "\"Doe, Jane\" <jane@example.com>; \"Say \\\"hi\\\"; bye\" <x@example.com>, bob@example.com",
+        )
+        .unwrap();
+        assert_eq!(parsed.len(), 3);
+        assert_eq!(parsed[0].name.as_deref(), Some("Doe, Jane"));
+        assert_eq!(parsed[0].email, "jane@example.com");
+        assert_eq!(parsed[1].name.as_deref(), Some("Say \"hi\"; bye"));
+        assert_eq!(parsed[1].email, "x@example.com");
+        assert_eq!(parsed[2].email, "bob@example.com");
+        assert!(parsed[2].name.is_none());
+    }
+
+    #[test]
+    fn recipient_addresses_reject_embedded_control_characters() {
+        assert!(super::parse_recipients("ok@example.com").is_ok());
+        assert!(super::parse_recipients("a@example.com\rb@example.com").is_err());
+    }
+
+    #[test]
+    fn mailbox_entries_sort_folders_and_subfolders_by_name() {
+        let folder = |id: i64, parent_id: Option<i64>, display_name: &str, path: &str| FolderInfo {
+            id,
+            account_id: 1,
+            parent_id,
+            display_name: display_name.into(),
+            is_jmap: false,
+            path: path.into(),
+            delimiter: Some("/".into()),
+            role: None,
+            selectable: true,
+            can_create_children: true,
+            can_rename: true,
+            can_delete: true,
+        };
+        let folders = vec![
+            folder(30, None, "Zeta", "Zeta"),
+            folder(23, Some(20), "beta", "Projects/beta"),
+            folder(20, None, "Projects", "Projects"),
+            folder(24, Some(20), "gamma", "Projects/gamma"),
+            folder(22, Some(20), "alpha", "Projects/alpha"),
+            folder(21, Some(20), "Alpha", "Projects/Alpha"),
+        ];
+
+        let order = mailbox_entries(&[test_account()], &folders, None)
+            .into_iter()
+            .filter(|entry| entry.folder_id >= 20)
+            .map(|entry| entry.folder_id)
+            .collect::<Vec<_>>();
+        assert_eq!(order, [20, 21, 22, 23, 24, 30]);
+    }
+
+    #[test]
+    fn gmail_user_labels_are_not_duplicated_as_account_folders() {
+        let mut account = test_account();
+        account.provider = Provider::Gmail;
+        account.auth_kind = AuthKind::Oauth2;
+        account.mail_protocol = MailProtocol::Gmail;
+        let folders = vec![FolderInfo {
+            id: 10,
+            account_id: account.id,
+            parent_id: None,
+            display_name: "Travel".into(),
+            is_jmap: false,
+            path: "Travel".into(),
+            delimiter: Some("/".into()),
+            role: None,
+            selectable: true,
+            can_create_children: true,
+            can_rename: true,
+            can_delete: true,
+        }];
+
+        let entries = mailbox_entries(&[account], &folders, None);
+
+        assert!(entries.iter().all(|entry| entry.folder_id != 10));
+        assert_eq!(
+            entries.iter().filter(|entry| !entry.is_account).count(),
+            StandardMailbox::ALL.len()
+        );
+    }
+
+    #[test]
+    fn local_mail_follows_the_accounts_with_only_its_own_folders() {
+        let folder = |id, account_id, path: &str, role: Option<&str>| FolderInfo {
+            id,
+            account_id,
+            parent_id: None,
+            display_name: path.into(),
+            is_jmap: false,
+            path: path.into(),
+            delimiter: Some("/".into()),
+            role: role.map(str::to_owned),
+            selectable: true,
+            can_create_children: true,
+            can_rename: role.is_none(),
+            can_delete: role.is_none(),
+        };
+        let folders = vec![
+            folder(20, 9, "Trash", Some("trash")),
+            folder(21, 9, "Inbox", None),
+            folder(10, 1, "Projects", None),
+        ];
+
+        let entries = mailbox_entries(&[test_account()], &folders, Some(9));
+
+        let heading = entries
+            .iter()
+            .position(|entry| entry.account_id == 9)
+            .unwrap();
+        assert!(entries[..heading].iter().all(|entry| entry.account_id == 1));
+        let local = &entries[heading..];
+        // The view names the heading; there is no address to show.
+        assert!(local[0].is_account && local[0].label.is_empty() && local[0].detail.is_empty());
+        assert!(local[0].can_create_children);
+        // Only the folders it has: no placeholders for the others.
+        let folder_ids = local[1..]
+            .iter()
+            .map(|entry| entry.folder_id)
+            .collect::<Vec<_>>();
+        // Its Trash follows the folders it was given.
+        assert_eq!(folder_ids, [21, 20]);
+        // Thunderbird's local Inbox is an ordinary folder here.
+        let inbox = local.iter().find(|entry| entry.folder_id == 21).unwrap();
+        assert_eq!(inbox.scope, Some(Scope::Folder(21)));
+        assert_eq!(
+            validated_startup_scope(Scope::Folder(21), &[], &folders, Some(9), &[]),
+            Scope::Folder(21)
+        );
+
+        // Without local mail's folders, or local mail, it has no section.
+        let entries = mailbox_entries(&[test_account()], &folders[2..], Some(9));
+        assert!(entries.iter().all(|entry| entry.account_id == 1));
+        let entries = mailbox_entries(&[test_account()], &folders, None);
+        assert!(entries.iter().all(|entry| entry.account_id == 1));
+        assert_eq!(
+            validated_startup_scope(Scope::Folder(21), &[], &folders, None, &[]),
+            Scope::UNIFIED_INBOX
+        );
+    }
+
+    #[test]
+    fn every_profile_shows_local_mail() {
+        let profile = Some(Arc::<[i64]>::from(vec![2, 7]));
+        assert_eq!(
+            with_local_mail(profile.clone(), Some(5)).as_deref(),
+            Some(&[2, 5, 7][..])
+        );
+        assert_eq!(
+            with_local_mail(profile.clone(), Some(7)).as_deref(),
+            Some(&[2, 7][..])
+        );
+        assert_eq!(with_local_mail(profile, None).as_deref(), Some(&[2, 7][..]));
+        assert_eq!(with_local_mail(None, Some(5)), None);
+    }
+
+    #[test]
+    fn standard_archive_is_the_parent_of_its_complete_folder_tree() {
+        let folder = |id, parent_id, name: &str, role: Option<String>, selectable| FolderInfo {
+            id,
+            account_id: 1,
+            parent_id,
+            display_name: name.into(),
+            is_jmap: false,
+            path: name.into(),
+            delimiter: Some("/".into()),
+            role: role.clone(),
+            selectable,
+            can_create_children: true,
+            can_rename: role.is_none(),
+            can_delete: role.is_none(),
+        };
+        let folders = vec![
+            folder(10, None, "Archive", Some("archive".into()), true),
+            folder(11, Some(10), "Archive/2025", None, false),
+            folder(12, Some(11), "Archive/2025/GitHub", None, true),
+            folder(13, Some(10), "Archive/2026", None, false),
+            folder(14, Some(13), "Archive/2026/GitHub", None, true),
+        ];
+
+        let entries = mailbox_entries(&[test_account()], &folders, None);
+        let projected = entries
+            .iter()
+            .filter(|entry| !entry.is_account)
+            .map(|entry| {
+                (
+                    entry.folder_id,
+                    entry.parent_folder_id,
+                    entry.depth,
+                    entry.label.as_str(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            projected,
+            vec![
+                (-1, -1, 0, "Inbox"),
+                (-1, -1, 0, "Starred"),
+                (-1, -1, 0, "Sent"),
+                (10, -1, 0, "Archive"),
+                (11, 10, 1, "2025"),
+                (12, 11, 2, "GitHub"),
+                (13, 10, 1, "2026"),
+                (14, 13, 2, "GitHub"),
+                (-1, -1, 0, "Spam"),
+                (-1, -1, 0, "Trash"),
+                (-1, -1, 0, "Drafts"),
+            ]
+        );
+
+        let archive = entries.iter().find(|entry| entry.folder_id == 10).unwrap();
+        let year = entries.iter().find(|entry| entry.folder_id == 11).unwrap();
+        assert!(archive.is_standard);
+        assert!(archive.has_children);
+        assert!(archive.can_create_children);
+        assert!(!archive.can_rename);
+        assert!(!archive.can_delete);
+        assert!(!year.is_selectable);
+        assert!(year.has_children);
+        assert!(year.can_create_children);
+    }
+
+    #[test]
+    fn category_and_label_scopes_keep_their_core_filters() {
+        let labels = vec![
+            Label {
+                id: 31,
+                name: "Projects".into(),
+                color: "#16a765".into(),
+                keyword: "Projects".into(),
+                position: 0,
+                owner_account_id: None,
+                is_auto: false,
+            },
+            Label {
+                id: 32,
+                name: "Newsletters".into(),
+                color: "#a479e2".into(),
+                keyword: "newsletters".into(),
+                position: 1,
+                owner_account_id: None,
+                is_auto: true,
+            },
+        ];
+
+        let label = |kind, id| Scope::Label { kind, id };
+        let important = resolve_scope(Scope::Important, &[], &labels);
+        assert_eq!(important.view, View::Inbox);
+        assert_eq!(important.split_id, Some(-1));
+
+        let manual = resolve_scope(label(LabelKind::Global, 31), &[], &labels);
+        assert_eq!(manual.view, View::All);
+        assert_eq!(manual.label_id, Some(31));
+        assert_eq!(manual.account_id, None);
+        assert_eq!(manual.title, "Projects");
+
+        let automatic = resolve_scope(label(LabelKind::Category, 32), &[], &labels);
+        assert_eq!(automatic.view, View::Inbox);
+        assert_eq!(automatic.label_id, Some(32));
+        assert_eq!(automatic.title, "Newsletters");
+        // Saved selections follow a label into its current sidebar section.
+        assert_eq!(
+            validated_startup_scope(label(LabelKind::Global, 32), &[], &[], None, &labels),
+            label(LabelKind::Category, 32)
+        );
+        assert_eq!(
+            validated_startup_scope(label(LabelKind::Category, 31), &[], &[], None, &labels),
+            label(LabelKind::Global, 31)
+        );
+        assert_eq!(
+            validated_startup_scope(label(LabelKind::Global, 999), &[], &[], None, &labels),
+            Scope::UNIFIED_INBOX
+        );
+
+        let account_label = Label {
+            id: 33,
+            name: "Travel".into(),
+            color: "#2563eb".into(),
+            keyword: "Travel".into(),
+            position: 0,
+            owner_account_id: Some(7),
+            is_auto: false,
+        };
+        let account_scope = resolve_scope(
+            label(LabelKind::Account, 33),
+            &[],
+            std::slice::from_ref(&account_label),
+        );
+        assert_eq!(account_scope.account_id, Some(7));
+        assert_eq!(account_scope.label_id, Some(33));
+        assert_eq!(
+            validated_startup_scope(
+                label(LabelKind::Global, 33),
+                &[],
+                &[],
+                None,
+                &[account_label]
+            ),
+            label(LabelKind::Account, 33)
+        );
+    }
+}
+
+#[cfg(test)]
+mod search_pagination_adapter_tests {
+    use super::*;
+    use flectar_mail_core::accounts::credentials::DevelopmentFileCredentialStore;
+
+    /// A source with one account whose inbox has threads 1 to 27, each one
+    /// message from that time, all matching "needle".
+    async fn source_with_27_threads(dir: &std::path::Path) -> CoreMailSource {
+        let source = CoreMailSource::start(
+            Paths::for_tests(dir),
+            Arc::new(DevelopmentFileCredentialStore::new(
+                dir.join("credentials.json"),
+            )),
+            Arc::new(flectar_mail_core::oauth::redirect::LoopbackRedirectBroker::default()),
+        )
+        .await
+        .unwrap();
+        source
+            .core
+            .db
+            .write(|conn| {
+                conn.execute(
+                    "INSERT INTO accounts (id,email,provider,auth_kind,username,incoming_host,incoming_port,smtp_host,smtp_port,created_at,mail_protocol,settings_json)
+                     VALUES (1,'fixture@example.test','generic','password','fixture','imap.example.test',993,'smtp.example.test',465,0,'imap','{\"connection\":{\"incomingSecurity\":\"tls\",\"smtpSecurity\":\"tls\"}}')",
+                    [],
+                )?;
+                conn.execute(
+                    "INSERT INTO folders (id,account_id,path,role) VALUES (1,1,'INBOX','inbox')",
+                    [],
+                )?;
+                for id in 1..=27_i64 {
+                    conn.execute(
+                        "INSERT INTO threads (id,account_id,subject_norm,last_message_at,message_count)
+                         VALUES (?1,1,'needle paging',?1,1)",
+                        [id],
+                    )?;
+                    conn.execute(
+                        "INSERT INTO messages (id,account_id,thread_id,folder_id,uid,subject,from_addr,date,is_read,body_state)
+                         VALUES (?1,1,?1,1,?1,'Needle paging','sender@example.test',?1,1,'cached')",
+                        [id],
+                    )?;
+                    flectar_mail_core::db::repo::search::index_message(conn, id)?;
+                }
+                Ok(())
+            })
+            .await
+            .unwrap();
+        source
+    }
+
+    #[tokio::test]
+    async fn search_and_inbox_pages_keep_their_own_cursors() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = source_with_27_threads(dir.path()).await;
+
+        for query in ["needle", ""] {
+            let first = source
+                .load_page(Scope::UNIFIED_INBOX, query, None, 25, false)
+                .await
+                .unwrap();
+            assert_eq!(first.messages.len(), 25);
+            let cursor = first.next_cursor.expect("more mail remains");
+            assert_eq!(matches!(cursor, MailCursor::Search(_)), !query.is_empty());
+            let second = source
+                .load_page(Scope::UNIFIED_INBOX, query, Some(cursor), 25, false)
+                .await
+                .unwrap();
+            assert_eq!(second.messages.len(), 2);
+            assert!(second.next_cursor.is_none());
+            let ids = first
+                .messages
+                .into_iter()
+                .chain(second.messages)
+                .map(|message| message.id)
+                .collect::<Vec<_>>();
+            assert_eq!(ids, (1..=27).rev().collect::<Vec<_>>());
+        }
+    }
+
+    #[tokio::test]
+    async fn a_list_turned_around_pages_oldest_first_and_keeps_that() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = source_with_27_threads(dir.path()).await;
+        let inbox = Scope::UNIFIED_INBOX;
+        assert_eq!(source.order(inbox), ListOrder::NewestFirst);
+        let row_ids = |page: MailPage| page.messages.iter().map(|row| row.id).collect::<Vec<_>>();
+        // A list can open at any row, in either order.
+        let from_20 = source.load_page_from_row(inbox, 20, 3).await.unwrap();
+        assert!(from_20.start.is_some());
+        assert_eq!(row_ids(from_20), [20, 19, 18]);
+
+        let revision = source.account_revision();
+        assert!(source.set_order(inbox, ListOrder::OldestFirst));
+        assert_ne!(
+            source.account_revision(),
+            revision,
+            "pages loaded newest first are out of date"
+        );
+        assert!(!source.set_order(inbox, ListOrder::OldestFirst));
+        let first = source.load_page(inbox, "", None, 25, false).await.unwrap();
+        assert_eq!(first.order, ListOrder::OldestFirst);
+        let second = source
+            .load_page(inbox, "", first.next_cursor, 25, false)
+            .await
+            .unwrap();
+        assert!(second.next_cursor.is_none());
+        let ids = first
+            .messages
+            .into_iter()
+            .chain(second.messages)
+            .map(|message| message.id)
+            .collect::<Vec<_>>();
+        assert_eq!(ids, (1..=27).collect::<Vec<_>>());
+
+        let from_20 = source.load_page_from_row(inbox, 20, 3).await.unwrap();
+        assert_eq!(row_ids(from_20.clone()), [20, 21, 22]);
+        // The rows before come nearest last, as the list shows them.
+        let first = cursor_of(&from_20.messages[0]);
+        let earlier = source.load_earlier(inbox, first, 3).await.unwrap();
+        assert!(earlier.next_cursor.is_some());
+        assert_eq!(row_ids(earlier), [17, 18, 19]);
+        let first = cursor_of(
+            &source
+                .load_page_from_row(inbox, 2, 1)
+                .await
+                .unwrap()
+                .messages[0],
+        );
+        let earliest = source.load_earlier(inbox, first, 3).await.unwrap();
+        assert!(
+            earliest.next_cursor.is_none(),
+            "the list's start is reached"
+        );
+        assert_eq!(row_ids(earliest), [1]);
+        // A row that is gone gives the list's start.
+        let gone = source.load_page_from_row(inbox, 404, 3).await.unwrap();
+        assert!(gone.start.is_none());
+        assert_eq!(row_ids(gone), [1, 2, 3]);
+
+        // Search results span folders, so they stay newest first.
+        let search = source
+            .load_page(inbox, "needle", None, 25, false)
+            .await
+            .unwrap();
+        assert_eq!(search.order, ListOrder::NewestFirst);
+        assert_eq!(search.messages[0].id, 27);
+        // Every other list keeps its own order.
+        assert_eq!(
+            source.order(Scope::Unified(StandardMailbox::Sent)),
+            ListOrder::NewestFirst
+        );
+
+        // The next session starts with the saved orders.
+        source
+            .save_order(inbox, ListOrder::OldestFirst)
+            .await
+            .unwrap();
+        let saved = source.core.oldest_first_lists().await.unwrap();
+        assert_eq!(saved, [inbox.to_string()]);
+        assert_eq!(
+            oldest_first_scopes(saved),
+            std::collections::HashSet::from([inbox])
+        );
+        // A folder that is gone can't keep an order.
+        assert!(
+            source
+                .save_order(Scope::Folder(404), ListOrder::OldestFirst)
+                .await
+                .is_err()
+        );
+        source.set_order(inbox, ListOrder::NewestFirst);
+        source
+            .save_order(inbox, ListOrder::NewestFirst)
+            .await
+            .unwrap();
+        assert!(source.core.oldest_first_lists().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn profile_accounts_limit_pages_search_counts_and_scopes() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = CoreMailSource::start(
+            Paths::for_tests(dir.path()),
+            Arc::new(DevelopmentFileCredentialStore::new(
+                dir.path().join("credentials.json"),
+            )),
+            Arc::new(flectar_mail_core::oauth::redirect::LoopbackRedirectBroker::default()),
+        )
+        .await
+        .unwrap();
+        // Account 1 has threads 1-3 and account 2 threads 11-12, all unread
+        // in their inboxes and matching "needle".
+        source
+            .core
+            .db
+            .write(|conn| {
+                for account in [1_i64, 2] {
+                    conn.execute(
+                        "INSERT INTO accounts (id,email,provider,auth_kind,username,incoming_host,incoming_port,smtp_host,smtp_port,created_at,mail_protocol,settings_json)
+                         VALUES (?1,'fixture'||?1||'@example.test','generic','password','fixture','imap.example.test',993,'smtp.example.test',465,0,'imap','{\"connection\":{\"incomingSecurity\":\"tls\",\"smtpSecurity\":\"tls\"}}')",
+                        [account],
+                    )?;
+                    conn.execute(
+                        "INSERT INTO folders (id,account_id,path,role) VALUES (?1,?1,'INBOX','inbox')",
+                        [account],
+                    )?;
+                }
+                for (account, id) in [(1_i64, 1_i64), (1, 2), (1, 3), (2, 11), (2, 12)] {
+                    conn.execute(
+                        "INSERT INTO threads (id,account_id,subject_norm,last_message_at,message_count,unread_count)
+                         VALUES (?2,?1,'needle',?2,1,1)",
+                        [account, id],
+                    )?;
+                    conn.execute(
+                        "INSERT INTO messages (id,account_id,thread_id,folder_id,uid,subject,from_addr,date,is_read,body_state)
+                         VALUES (?2,?1,?2,?1,?2,'Needle','sender@example.test',?2,0,'cached')",
+                        [account, id],
+                    )?;
+                    flectar_mail_core::db::repo::search::index_message(conn, id)?;
+                }
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let listed = |page: &MailPage| {
+            page.messages
+                .iter()
+                .map(|message| message.id)
+                .collect::<Vec<_>>()
+        };
+        let shown_accounts = |mailboxes: &[MailboxEntry]| {
+            let mut accounts = mailboxes
+                .iter()
+                .map(|mailbox| mailbox.account_id)
+                .collect::<Vec<_>>();
+            accounts.dedup();
+            accounts
+        };
+
+        let all = source
+            .load_page(Scope::UNIFIED_INBOX, "", None, 25, false)
+            .await
+            .unwrap();
+        assert_eq!(listed(&all), vec![12, 11, 3, 2, 1]);
+        assert_eq!(
+            source
+                .load_mail_metadata(Scope::UNIFIED_INBOX)
+                .await
+                .unwrap()
+                .inbox_count,
+            5
+        );
+
+        let revision = source.account_revision();
+        assert!(source.set_profile_accounts(Some(vec![2])));
+        assert!(!source.set_profile_accounts(Some(vec![2, 2])));
+        assert_ne!(
+            source.account_revision(),
+            revision,
+            "older pages are retired"
+        );
+
+        let inbox = source
+            .load_page(Scope::UNIFIED_INBOX, "", None, 25, false)
+            .await
+            .unwrap();
+        assert_eq!(listed(&inbox), vec![12, 11]);
+        assert_eq!(shown_accounts(&inbox.mailboxes), vec![2]);
+        assert_eq!(inbox.account_count, 2, "startup still sees every account");
+        let search = source
+            .load_page(Scope::UNIFIED_INBOX, "needle", None, 25, false)
+            .await
+            .unwrap();
+        assert_eq!(listed(&search), vec![12, 11]);
+        // An account the profile leaves out shows the profile's inbox.
+        let hidden = source
+            .load_page(
+                Scope::Account {
+                    account_id: 1,
+                    mailbox: StandardMailbox::Inbox,
+                },
+                "",
+                None,
+                25,
+                false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(listed(&hidden), vec![12, 11]);
+        let metadata = source
+            .load_mail_metadata(Scope::UNIFIED_INBOX)
+            .await
+            .unwrap();
+        assert_eq!(metadata.inbox_count, 2);
+        assert_eq!(shown_accounts(&metadata.mailboxes), vec![2]);
+
+        // Startup opens a saved mailbox of a hidden account at the shown
+        // account's inbox, but still reports every account.
+        let (accounts, scope, page) = source
+            .load_startup_page(
+                Scope::Account {
+                    account_id: 1,
+                    mailbox: StandardMailbox::Inbox,
+                },
+                25,
+            )
+            .await
+            .unwrap();
+        assert_eq!(accounts.len(), 2);
+        assert_eq!(
+            scope,
+            Scope::Account {
+                account_id: 2,
+                mailbox: StandardMailbox::Inbox,
+            }
+        );
+        assert_eq!(listed(&page.unwrap()), vec![12, 11]);
+
+        assert!(source.set_profile_accounts(None));
+        let all = source
+            .load_page(Scope::UNIFIED_INBOX, "needle", None, 25, false)
+            .await
+            .unwrap();
+        assert_eq!(listed(&all), vec![12, 11, 3, 2, 1]);
+    }
+}
+
+#[cfg(test)]
+mod account_removal_snapshot_tests {
+    use super::*;
+    use flectar_mail_core::accounts::credentials::{
+        CredentialStore, DevelopmentFileCredentialStore, Slot,
+    };
+    use flectar_mail_core::error::{CoreError, Result as CoreResult};
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    struct FailingCredentials {
+        inner: DevelopmentFileCredentialStore,
+        fail: AtomicBool,
+    }
+    impl CredentialStore for FailingCredentials {
+        fn store(&self, account: i64, slot: Slot, value: &str) -> CoreResult<()> {
+            self.inner.store(account, slot, value)
+        }
+        fn load(&self, account: i64, slot: Slot) -> CoreResult<String> {
+            self.inner.load(account, slot)
+        }
+        fn delete(&self, account: i64, slot: Slot) -> CoreResult<()> {
+            self.inner.delete(account, slot)
+        }
+        fn delete_all(&self, account: i64) -> CoreResult<()> {
+            if self.fail.load(Ordering::Relaxed) {
+                return Err(CoreError::CredentialStoreUnavailable(
+                    "fixture failure".into(),
+                ));
+            }
+            self.inner.delete_all(account)
+        }
+    }
+    async fn seed(source: &CoreMailSource) {
+        source.core.db.write(|conn| {
+            conn.execute("INSERT INTO accounts (id, email, provider, auth_kind, username, incoming_host, incoming_port, smtp_host, smtp_port, created_at, mail_protocol, settings_json)
+                VALUES (1, 'fixture@example.test', 'generic', 'password', 'fixture', 'imap.example.test', 993, 'smtp.example.test', 465, 0, 'imap', '{\"connection\":{\"incomingSecurity\":\"tls\",\"smtpSecurity\":\"tls\"}}')", [])?;
+            Ok(())
+        }).await.unwrap();
+    }
+    #[tokio::test]
+    async fn account_removal_failure_preserves_account_and_invalidates_old_snapshots() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(FailingCredentials {
+            inner: DevelopmentFileCredentialStore::new(dir.path().join("credentials.json")),
+            fail: AtomicBool::new(false),
+        });
+        let source = CoreMailSource::start(
+            Paths::for_tests(dir.path()),
+            store.clone(),
+            Arc::new(flectar_mail_core::oauth::redirect::LoopbackRedirectBroker::default()),
+        )
+        .await
+        .unwrap();
+        seed(&source).await;
+        let before = source.load_account_snapshot().await.unwrap();
+        let metadata = source
+            .load_mail_metadata(Scope::UNIFIED_INBOX)
+            .await
+            .unwrap();
+        let page = source
+            .load_page(Scope::UNIFIED_INBOX, "", None, 50, false)
+            .await
+            .unwrap();
+        store.fail.store(true, Ordering::Relaxed);
+        let result = source.remove_account(1).await;
+        assert!(result.is_err());
+        let after = source.load_account_snapshot().await.unwrap();
+        assert!(!crate::account_controller::account_was_removed(
+            1,
+            &result,
+            Some(&after)
+        ));
+        assert_eq!(after.accounts.len(), 1);
+        assert_ne!(source.account_revision(), before.revision);
+        assert_ne!(source.account_revision(), metadata.account_revision);
+        assert_ne!(source.account_revision(), page.account_revision);
+        store.fail.store(false, Ordering::Relaxed);
+        source.remove_account(1).await.unwrap();
+        assert!(source.load_accounts().await.unwrap().is_empty());
+        // Account IDs may be reused by SQLite. Revisions must not act as
+        // permanent tombstones that hide a newly connected account.
+        seed(&source).await;
+        let replacement = source.load_account_snapshot().await.unwrap();
+        assert_eq!(replacement.accounts.len(), 1);
+        assert_eq!(replacement.revision, source.account_revision());
+    }
+    #[tokio::test]
+    async fn account_removal_late_failure_reflects_deleted_account() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::for_tests(dir.path());
+        let source = CoreMailSource::start(
+            paths.clone(),
+            Arc::new(DevelopmentFileCredentialStore::new(
+                dir.path().join("credentials.json"),
+            )),
+            Arc::new(flectar_mail_core::oauth::redirect::LoopbackRedirectBroker::default()),
+        )
+        .await
+        .unwrap();
+        seed(&source).await;
+        let cache = paths.mail_dir(1);
+        std::fs::create_dir_all(cache.parent().unwrap()).unwrap();
+        std::fs::write(cache, b"not a directory").unwrap();
+        let result = source.remove_account(1).await;
+        assert!(result.is_err());
+        let after = source.load_account_snapshot().await.unwrap();
+        assert!(crate::account_controller::account_was_removed(
+            1,
+            &result,
+            Some(&after)
+        ));
+        assert!(after.accounts.is_empty());
+    }
+}

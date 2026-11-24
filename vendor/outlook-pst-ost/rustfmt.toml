@@ -1,0 +1,2 @@
+# Upstream outlook-pst style (rustfmt defaults), not the workspace one.
+edition = "2021"

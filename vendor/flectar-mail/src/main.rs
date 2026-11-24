@@ -1,0 +1,8612 @@
+mod account_controller;
+mod account_discovery;
+mod account_mail_preferences;
+mod account_status;
+#[cfg(desktop)]
+pub mod agents;
+mod ai_features;
+mod app_icon;
+#[cfg(test)]
+mod account_removal_tests;
+mod app_runtime;
+mod attachment_controller;
+mod attachment_reminder;
+mod auto_replies;
+#[cfg(desktop)]
+mod autostart;
+/// The unread count where the app draws it itself.
+#[cfg(any(
+    test,
+    target_os = "windows",
+    all(linux_desktop, not(feature = "flatpak"))
+))]
+mod badge_pixels;
+mod block_sender;
+mod browser;
+pub use browser::ExternalUrlOpener;
+mod calendar;
+mod calendar_layout;
+mod compose_controller;
+mod compose_editor;
+mod compose_paste;
+mod compose_quote;
+mod composer;
+mod contact_import;
+mod contacts;
+mod data_controller;
+mod date_format;
+#[cfg(desktop)]
+mod default_email_app;
+mod document_preview;
+pub mod documents;
+mod email_document;
+pub mod favicon;
+mod files_controller;
+#[cfg(all(linux_desktop, feature = "flatpak"))]
+mod flatpak_secrets;
+mod folder_roles;
+mod han_fallback;
+mod import_controller;
+mod invitation;
+mod keyboard_keys;
+mod latest_load;
+mod link_services;
+mod mail;
+#[cfg(test)]
+mod mail_drop_tests;
+mod mail_groups;
+mod mail_navigation;
+mod mail_render_projection;
+mod mail_rules;
+mod mail_scope;
+mod mail_setup;
+mod mail_view_model;
+#[cfg(test)]
+mod mail_window_tests;
+mod mail_work;
+mod mailto_links;
+mod memory;
+mod message_appearance;
+mod message_source;
+mod motion;
+mod move_picker;
+mod network;
+mod notifications;
+/// What Android asks of the app without its window.
+#[cfg(background_engine)]
+pub use notifications::engine::{
+    EngineServices, check_for_mail, respond_in_background, stop_check, window_ended,
+    window_starting,
+};
+pub use notifications::{
+    Act, Alert, AlertId, Availability, Badge, Controls, Failure, FixedWords, HostFuture,
+    NewMailNotification, NotificationHost, Response, Route, parse_payload, payload, respond,
+};
+mod app_language;
+mod automatic_copies;
+pub use app_language::AppLanguage;
+mod number_format;
+mod privacy_consent;
+pub use privacy_consent::PrivacyConsent;
+mod oauth_browser;
+pub mod pdf_preview;
+mod photo_shrink;
+pub mod platform;
+mod preview_controls;
+mod read_marking;
+mod read_receipts;
+mod reader_clipboard;
+#[cfg(test)]
+mod reader_validation;
+#[cfg(test)]
+mod screenshot_email;
+#[cfg(test)]
+mod screenshot_frameless;
+#[cfg(test)]
+mod screenshot_fixture;
+#[cfg(test)]
+mod screenshot_traffic_lights;
+mod remote;
+mod renderer;
+mod renderer_input_controller;
+mod renderer_preferences;
+mod rendering_report;
+mod retained_model;
+mod rich_compose;
+mod saved_searches;
+mod sender_picker;
+mod server_search;
+mod settings_controller;
+pub mod spelling;
+pub use spelling::{SpellingHost, SpellingSession};
+mod sidebar_model;
+#[cfg(desktop)]
+mod single_instance;
+mod startup;
+mod startup_metrics;
+mod sync_controller;
+mod tabs;
+#[cfg(test)]
+mod tall_surface_tests;
+mod text_size;
+mod theme;
+mod translation;
+mod tray;
+mod ui_dispatch;
+mod ui_message;
+mod undo;
+mod unsubscribe;
+mod updates;
+mod when_picker;
+mod window_chrome;
+mod window_controller;
+mod word_diff;
+
+slint::include_modules!();
+
+mod tray_ui {
+    include!(concat!(env!("OUT_DIR"), "/tray.rs"));
+}
+
+use account_controller::*;
+#[cfg(test)]
+use calendar::start_of_week;
+use calendar::{LocalCalendarState, apply_calendar, first_of_month, refresh_calendar_events};
+use chrono::{Duration as ChronoDuration, Local, NaiveDate, NaiveTime, TimeZone};
+use compose_controller::*;
+use compose_editor::{ComposeEditorStyle, LazyComposeEditor, RenderedComposeEditor};
+use compose_quote::ComposeQuote;
+use contacts::{
+    ContactDirectoryState, apply_contact_directory, apply_contact_rows, clear_contact_form,
+};
+use data_controller::register_data_management_callbacks;
+use date_format::DateStyle;
+use favicon::{
+    FaviconImage, FaviconImages, FaviconLoader, ProfileAvatarImages, ProfileAvatarLoader,
+    physical_pixel_side,
+};
+use flectar_mail_core::config::Paths;
+#[cfg(test)]
+use flectar_mail_core::models::ThreadCursor;
+use flectar_mail_core::models::{
+    Account, AccountConfig, AddPasswordAccountArgs, CalendarConnection, CardDavConnection,
+    CheckInterval, ConnectionSecurity, ContactRecord, ContactRecordCursor, ContactRecordPage,
+    CreateEventArgs, DraftAttachmentIn, Label, ListOrder, LoginMethod, MailConnectionSettings,
+    MailGrouping, MailProfile, MailProtocol, Provider, Settings, Snippet, UpdateEventArgs,
+};
+#[cfg(test)]
+use mail::fixture_messages;
+use mail::{
+    ComposeMessage, ComposeSource, CoreMailSource, MailCursor, MailMessage, MailMetadata,
+    MailTarget, MailboxEntry, SidebarBadges, display_preview,
+};
+use mail_groups::{
+    MailGroupState, earlier_entry, mail_group_key, mail_list_entry_key, project_mail_list,
+    same_mail_list_entry, server_only_entry,
+};
+use mail_render_projection::*;
+use mail_scope::{Scope, StandardMailbox, accounts_to_check};
+use mail_view_model::*;
+use renderer::{GpuEmailRenderer, RenderedEmail};
+use renderer_input_controller::register_renderer_input_callbacks;
+use rich_compose::{ComposeSelection, RichComposeDocument};
+use settings_controller::register_settings_preference_callbacks;
+use sidebar_model::{SidebarAnimation, SidebarModel, refresh_sidebar, refresh_sidebar_with_motion};
+use slint::{DataTransfer, Image, Model, ModelRc, Rgba8Pixel, SharedPixelBuffer, Timer, VecModel};
+use startup::{
+    PendingCoreUpdates, StartupCalendarSnapshot, StartupSnapshot, StartupUpdate,
+    WarmStartCacheWriter, WarmStartCursor, WarmStartProjection, WarmStartSnapshot, apply_settings,
+    apply_warm_start_snapshot, load_startup_calendar_snapshot, load_startup_mail_metadata,
+    load_startup_snapshot, load_warm_start_snapshot, spawn_core_event_listener,
+};
+use startup_metrics::StartupMetrics;
+use std::{
+    cell::{Cell, RefCell},
+    collections::{HashMap, HashSet},
+    path::PathBuf,
+    rc::Rc,
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
+};
+use tokio::sync::mpsc::error::TryRecvError;
+use ui_dispatch::{UiSender, UiWake, bounded_ui_channel};
+use ui_message::{AppWindowMessages, UiMessage, translated};
+use window_controller::{
+    create_and_register_window_lifecycle, register_window_preference_callbacks,
+};
+
+const PAGE_SIZE: usize = 25;
+const FAVICON_CONCURRENCY: usize = 4;
+const MAX_FAVICON_CACHE_ENTRIES: usize = 256;
+const MAX_FAVICON_CACHE_BYTES: usize = 8 * 1024 * 1024;
+const SENDER_AVATAR_SMALL_SIDE: f32 = 28.0;
+const SENDER_AVATAR_REGULAR_SIDE: f32 = 38.0;
+const ACCOUNT_AVATAR_SMALL_SIDE: f32 = 22.0;
+const ACCOUNT_AVATAR_REGULAR_SIDE: f32 = 38.0;
+const MAX_COMPOSE_ATTACHMENT_BYTES: u64 = 25 * 1024 * 1024;
+const MAX_COMPOSE_ATTACHMENT_FILES: usize = 20;
+
+fn favicon_retry_delay(attempts: u8) -> Duration {
+    let exponent = attempts.saturating_sub(1).min(6);
+    Duration::from_secs((60_u64 << exponent).min(60 * 60))
+}
+
+fn favicon_bytes(images: &FaviconImages) -> usize {
+    images
+        .small
+        .pixels
+        .len()
+        .saturating_add(images.regular.pixels.len())
+}
+
+fn insert_bounded_favicon_result(
+    icons: &mut HashMap<String, FaviconImages>,
+    missing: &mut HashSet<String>,
+    domain: String,
+    result: Option<FaviconImages>,
+) {
+    insert_bounded_favicon_result_with_limits(
+        icons,
+        missing,
+        domain,
+        result,
+        MAX_FAVICON_CACHE_ENTRIES,
+        MAX_FAVICON_CACHE_BYTES,
+    );
+}
+
+fn insert_bounded_favicon_result_with_limits(
+    icons: &mut HashMap<String, FaviconImages>,
+    missing: &mut HashSet<String>,
+    domain: String,
+    mut result: Option<FaviconImages>,
+    max_entries: usize,
+    max_bytes: usize,
+) {
+    icons.remove(&domain);
+    missing.remove(&domain);
+    if max_entries == 0 {
+        return;
+    }
+
+    if result
+        .as_ref()
+        .is_some_and(|images| favicon_bytes(images) > max_bytes)
+    {
+        result = None;
+    }
+    let incoming_bytes = result.as_ref().map_or(0, favicon_bytes);
+    let mut retained_bytes = icons.values().map(favicon_bytes).sum::<usize>();
+    while icons.len().saturating_add(missing.len()) >= max_entries
+        || retained_bytes.saturating_add(incoming_bytes) > max_bytes
+    {
+        // Byte pressure must evict a decoded raster. For entry-count pressure,
+        // discard a negative lookup first so successfully loaded brand marks
+        // remain warm as the user pages through mail.
+        let byte_pressure = retained_bytes.saturating_add(incoming_bytes) > max_bytes;
+        if !byte_pressure && let Some(victim) = missing.iter().next().cloned() {
+            missing.remove(&victim);
+            continue;
+        }
+        let Some(victim) = icons.keys().next().cloned() else {
+            break;
+        };
+        if let Some(removed) = icons.remove(&victim) {
+            retained_bytes = retained_bytes.saturating_sub(favicon_bytes(&removed));
+        }
+    }
+
+    if let Some(images) = result {
+        icons.insert(domain, images);
+    } else if max_entries > 0 {
+        missing.insert(domain);
+    }
+}
+
+fn paged_visible_count(page: usize, total: usize) -> usize {
+    page.saturating_mul(PAGE_SIZE).min(total)
+}
+
+/// Reconcile a retained Slint model by stable row id.
+///
+/// Keeping the same `VecModel` lets `ListView` retain its virtualization and
+/// scroll anchor. The common pagination path is one batched tail insertion;
+/// live updates near the top use granular insert/remove notifications so the
+/// row currently under the pointer does not move on screen.
+fn reconcile_model_rows<T>(model: &VecModel<T>, rows: Vec<T>, key: impl Fn(&T) -> i32)
+where
+    T: Clone + PartialEq + 'static,
+{
+    reconcile_model_rows_by(model, rows, key, PartialEq::eq);
+}
+
+fn reconcile_model_rows_by<T: Clone + 'static, K: Eq + std::hash::Hash>(
+    model: &VecModel<T>,
+    rows: Vec<T>,
+    key: impl Fn(&T) -> K,
+    same: impl Fn(&T, &T) -> bool,
+) {
+    let current_len = model.row_count();
+
+    if rows.is_empty() {
+        if current_len != 0 {
+            model.clear();
+        }
+        return;
+    }
+    if current_len == 0 {
+        model.extend(rows);
+        return;
+    }
+
+    // Most refreshes keep the same row IDs. Inspect one old row at a time so
+    // their strings/images are not all cloned into a second retained vector.
+    let common_len = current_len.min(rows.len());
+    let mut changed = Vec::new();
+    let mut shared_prefix = 0;
+    for (index, row) in rows.iter().take(common_len).enumerate() {
+        let old = model.row_data(index).expect("index is within row_count");
+        if key(&old) != key(row) {
+            break;
+        }
+        if !same(&old, row) {
+            changed.push(index);
+        }
+        shared_prefix += 1;
+    }
+    if shared_prefix == common_len {
+        for index in changed {
+            model.set_row_data(index, rows[index].clone());
+        }
+        if rows.len() > current_len {
+            model.extend(rows[current_len..].iter().cloned());
+        } else {
+            for index in (rows.len()..current_len).rev() {
+                model.remove(index);
+            }
+        }
+        return;
+    }
+
+    // Only row identities are needed for reordering. Keeping whole rows here
+    // would deep-clone every retained string and selected body until refresh
+    // completes.
+    let mut current_keys = model.iter().map(|row| key(&row)).collect::<Vec<_>>();
+    // Unrelated result sets should reset in one notification. Related sets
+    // (new mail inserted, a thread removed, or rows reordered) are edited by
+    // id so Slint can keep the visible delegate anchored.
+    let current_ids = current_keys.iter().collect::<HashSet<_>>();
+    let overlap = rows
+        .iter()
+        .filter(|row| current_ids.contains(&key(row)))
+        .count();
+    if overlap.saturating_mul(2) < current_keys.len().min(rows.len()) {
+        model.set_vec(rows);
+        return;
+    }
+
+    let mut index = 0;
+    while index < rows.len() {
+        if index >= current_keys.len() {
+            model.extend(rows[index..].iter().cloned());
+            break;
+        }
+        if current_keys[index] == key(&rows[index]) {
+            let old = model.row_data(index).expect("index is within row_count");
+            if !same(&old, &rows[index]) {
+                model.set_row_data(index, rows[index].clone());
+            }
+            index += 1;
+            continue;
+        }
+        if let Some(relative) = current_keys[index + 1..]
+            .iter()
+            .position(|old_key| *old_key == key(&rows[index]))
+        {
+            let found = index + 1 + relative;
+            for _ in index..found {
+                current_keys.remove(index);
+                model.remove(index);
+            }
+        } else {
+            current_keys.insert(index, key(&rows[index]));
+            model.insert(index, rows[index].clone());
+        }
+    }
+    while current_keys.len() > rows.len() {
+        current_keys.pop();
+        model.remove(current_keys.len());
+    }
+}
+
+#[derive(Clone)]
+struct ComposeFile {
+    path: PathBuf,
+    filename: String,
+    size: u64,
+    /// Host-owned import copy behind `path`. Removing the attachment or
+    /// clearing the composer releases it; drafts and sends stage the file in
+    /// Core first.
+    _import: Option<Rc<documents::ImportedDocument>>,
+    /// A JPEG photo large enough to go out shrunk.
+    shrinkable: bool,
+    /// The photo this file is a shrunk copy of, which comes back when the message's photos
+    /// no longer go out shrunk.
+    original: Option<Box<ComposeFile>>,
+}
+
+struct FaviconUpdate {
+    domain: String,
+    pixel_sides: (u32, u32),
+    generation: u64,
+    result: Result<Option<FaviconImages>, String>,
+}
+
+#[derive(Clone, Copy)]
+struct FaviconRetry {
+    attempts: u8,
+    retry_at: Instant,
+}
+
+struct ProfileAvatarUpdate {
+    account_id: i64,
+    source_url: String,
+    pixel_sides: (u32, u32),
+    images: Option<ProfileAvatarImages>,
+}
+
+struct SyncUpdate {
+    /// The accounts checked, or every account.
+    accounts: Option<Vec<i64>>,
+    result: Result<(), String>,
+    metadata: Option<mail::MailMetadata>,
+}
+
+struct ComposeSendUpdate {
+    action_id: i64,
+    result: Result<(), String>,
+}
+
+struct MailListUpdate {
+    view_generation: u64,
+    scope: Scope,
+    query: String,
+    kind: MailListUpdateKind,
+    result: Result<mail::MailPage, String>,
+}
+
+enum MailListUpdateKind {
+    Refresh,
+    Pagination { cursor: MailCursor, generation: u64 },
+    /// The rows before the first one, which `first` is the cursor of.
+    Earlier {
+        first: MailCursor,
+        generation: u64,
+    },
+}
+
+struct MailMetadataUpdate {
+    result: Result<mail::MailMetadata, String>,
+}
+
+struct FolderMutationUpdate {
+    message: UiMessage,
+    metadata: Option<mail::MailMetadata>,
+    reveal_parent_id: Option<i64>,
+    /// Mailbox shown when the change was made. The result moves the list to
+    /// `metadata.scope` only if that mailbox is still shown.
+    issued_scope: Scope,
+    /// Folders a deletion removed. A list that moved into one of them since
+    /// goes to the inbox.
+    removed_folders: Vec<i64>,
+}
+
+struct MessageLoadUpdate {
+    generation: u64,
+    id: i32,
+    result: Result<mail::MailConversation, String>,
+}
+
+struct ContactLoadUpdate {
+    scope: String,
+    query: String,
+    cursor: Option<ContactRecordCursor>,
+    generation: u64,
+    result: Result<ContactRecordPage, String>,
+    photos: HashMap<String, ProfileAvatarImages>,
+}
+
+fn spawn_contact_page(
+    runtime: &tokio::runtime::Handle,
+    core: CoreMailSource,
+    updates: UiSender<ContactLoadUpdate>,
+    scope: String,
+    query: String,
+    cursor: Option<ContactRecordCursor>,
+    generation: u64,
+) {
+    runtime.spawn(async move {
+        let result = core
+            .load_contact_page(
+                scope.clone(),
+                query.clone(),
+                cursor.clone(),
+                PAGE_SIZE as i64,
+            )
+            .await;
+        let mut photos = HashMap::new();
+        if let Ok(page) = &result {
+            for record in &page.records {
+                if let Some(hash) = &record.details.photo_hash {
+                    if photos.contains_key(hash) {
+                        continue;
+                    }
+                    if let Ok(Some(bytes)) = core.contact_photo(hash.clone()).await
+                        && let Ok(images) = favicon::decode_profile_avatars(bytes, 88, 104).await
+                    {
+                        photos.insert(hash.clone(), images);
+                    }
+                }
+            }
+        }
+        let _ = updates
+            .send(ContactLoadUpdate {
+                scope,
+                query,
+                cursor,
+                generation,
+                result,
+                photos,
+            })
+            .await;
+    });
+}
+
+struct UiTaskUpdate {
+    message: UiMessage,
+    accounts: Option<mail::AccountSnapshot>,
+    account_removal: Option<AccountRemovalUpdate>,
+    calendar_connections: Option<Vec<CalendarConnection>>,
+    carddav_connections: Option<Vec<CardDavConnection>>,
+    calendar_error: Option<(i64, Option<String>)>,
+    clear_account_form: bool,
+    finishes_account_setup: bool,
+    finishes_oauth: bool,
+    close_to_tray: Option<bool>,
+}
+
+#[derive(Clone, Default)]
+struct AccountPresentationSettings {
+    profiles: Vec<MailProfile>,
+    /// The profile whose accounts the mail view shows.
+    active_profile: Option<String>,
+    show_markers: bool,
+    account_colors: HashMap<String, String>,
+}
+
+impl AccountPresentationSettings {
+    fn from_settings(settings: &Settings) -> Self {
+        Self {
+            profiles: settings.mail_profiles.clone(),
+            active_profile: settings.active_mail_profile.clone(),
+            show_markers: settings.show_account_badges,
+            account_colors: settings.account_colors.clone(),
+        }
+    }
+
+    /// The profile the mail view shows, if it has accounts.
+    fn active_profile(&self) -> Option<&MailProfile> {
+        let active = self.active_profile.as_deref()?;
+        self.profiles
+            .iter()
+            .find(|profile| profile.id == active && !profile.account_ids.is_empty())
+    }
+
+    /// The accounts the mail view shows, sorted, while a profile is active.
+    fn active_profile_accounts(&self) -> Option<Vec<i64>> {
+        self.active_profile().map(|profile| {
+            let mut accounts = profile.account_ids.clone();
+            accounts.sort_unstable();
+            accounts.dedup();
+            accounts
+        })
+    }
+
+    fn profile(&self, account_id: i64) -> Option<&MailProfile> {
+        self.profiles
+            .iter()
+            .find(|profile| profile.account_ids.contains(&account_id))
+    }
+
+    fn marker_color(&self, account_id: i64) -> slint::Color {
+        let configured = self
+            .profile(account_id)
+            .map(|profile| profile.color.as_str())
+            .or_else(|| {
+                self.account_colors
+                    .get(&account_id.to_string())
+                    .map(String::as_str)
+            });
+        configured
+            .and_then(parse_marker_color)
+            .unwrap_or_else(|| fallback_account_color(account_id))
+    }
+
+    fn has_account_color(&self, account_id: i64) -> bool {
+        self.account_colors.contains_key(&account_id.to_string())
+    }
+
+    fn remove_account(&mut self, account_id: i64) {
+        for profile in &mut self.profiles {
+            profile.account_ids.retain(|id| *id != account_id);
+        }
+        // Like the core, stop showing a profile left without accounts.
+        if self.active_profile().is_none() {
+            self.active_profile = None;
+        }
+        self.account_colors.remove(&account_id.to_string());
+    }
+}
+
+fn parse_marker_color(value: &str) -> Option<slint::Color> {
+    value
+        .strip_prefix('#')
+        .filter(|hex| hex.len() == 6)
+        .and_then(|hex| u32::from_str_radix(hex, 16).ok())
+        .map(|rgb| {
+            slint::Color::from_rgb_u8(
+                ((rgb >> 16) & 0xff) as u8,
+                ((rgb >> 8) & 0xff) as u8,
+                (rgb & 0xff) as u8,
+            )
+        })
+}
+
+fn fallback_account_color(account_id: i64) -> slint::Color {
+    const COLORS: [(u8, u8, u8); 8] = [
+        (0x3b, 0x82, 0xf6),
+        (0x8b, 0x5c, 0xf6),
+        (0x0d, 0x94, 0x88),
+        (0xea, 0x58, 0x0c),
+        (0xdb, 0x27, 0x77),
+        (0x65, 0xa3, 0x0d),
+        (0x08, 0x91, 0xb2),
+        (0x93, 0x33, 0xea),
+    ];
+    let (red, green, blue) = COLORS[account_id.unsigned_abs() as usize % COLORS.len()];
+    slint::Color::from_rgb_u8(red, green, blue)
+}
+
+struct InboxState {
+    core: Option<CoreMailSource>,
+    email_renderer: Rc<RefCell<GpuEmailRenderer>>,
+    use_wgpu: bool,
+    using_core: bool,
+    messages: Vec<MailMessage>,
+    conversation_owner_id: Option<i32>,
+    conversation_messages: Vec<MailMessage>,
+    conversation_selected_index: usize,
+    conversation_rows: Rc<VecModel<ThreadMessageRow>>,
+    labels: Vec<Label>,
+    email_rows: Rc<VecModel<EmailRow>>,
+    mail_list_entries: Rc<VecModel<MailListEntry>>,
+    mail_groups: MailGroupState,
+    mailboxes: Vec<MailboxEntry>,
+    unified_mailboxes: Vec<MailboxEntry>,
+    sidebar_badges: SidebarBadges,
+    /// Unread mail only on the server of the scope it was counted for.
+    server_only: Option<(Scope, u32)>,
+    /// The searches the sidebar keeps, with their unread mail.
+    saved_searches: Vec<mail::SavedSearchEntry>,
+    /// The search of the servers for the list's search.
+    server_search: server_search::ServerSearch,
+    mail_work: Option<mail_work::MailWork>,
+    collapsed_folder_ids: HashSet<i64>,
+    collapsed_sidebar_sections: HashSet<String>,
+    initialized_sidebar_accounts: HashSet<i64>,
+    initialized_sidebar_folders: HashSet<i64>,
+    sidebar_rows: Rc<SidebarModel>,
+    sidebar_animation: Rc<SidebarAnimation>,
+    folder_filter: String,
+    /// Always visible for `connected_accounts`; write through
+    /// [`InboxState::set_scope`] and [`InboxState::set_connected_accounts`].
+    scope: Scope,
+    query: String,
+    search_filter: String,
+    inbox_count: usize,
+    page: usize,
+    next_cursor: Option<MailCursor>,
+    /// Where the rows start when the list's earlier rows aren't loaded: a
+    /// list opened at a message further down than one read goes. Refreshes
+    /// read from here, and the list offers the rows before.
+    window_start: Option<MailCursor>,
+    selected_id: Option<i32>,
+    /// Conversation to select once the next replacing page arrives, for a
+    /// tab restored without cached rows.
+    pending_selection: Option<i32>,
+    /// Selecting the pending conversation opens it, which marks it read: a
+    /// background tab shown for the first time.
+    pending_selection_opens: bool,
+    /// Message a restored tab had open in a conversation, as (conversation
+    /// row id, message id). Loading that conversation opens this message
+    /// rather than the newest one.
+    restore_thread_message: Option<(i32, i32)>,
+    checked_ids: HashSet<i32>,
+    rendered_id: Option<i32>,
+    preview_closed: bool,
+    favicon_loader: Option<FaviconLoader>,
+    favicon_icons: HashMap<String, FaviconImages>,
+    favicon_pending: HashSet<String>,
+    favicon_missing: HashSet<String>,
+    favicon_retry: HashMap<String, FaviconRetry>,
+    favicon_pixel_sides: (u32, u32),
+    favicon_generation: u64,
+    favicon_tx: UiSender<FaviconUpdate>,
+    connected_accounts: Vec<Account>,
+    /// How each account's checks are going, for its sidebar heading.
+    account_activity: account_status::AccountActivity,
+    account_configs: Vec<AccountConfig>,
+    /// Mail imported into folders on this device, which belongs to no
+    /// account.
+    local_mail: Option<flectar_mail_core::models::LocalMail>,
+    /// Counts reloads of `local_mail`, so an earlier one never lands after a
+    /// later one.
+    local_mail_reloads: u64,
+    account_presentation: AccountPresentationSettings,
+    /// The active profile's accounts, sorted. The mail view shows only these;
+    /// `None` shows every connected account.
+    profile_accounts: Option<Vec<i64>>,
+    calendar_connections: Vec<CalendarConnection>,
+    carddav_connections: Vec<CardDavConnection>,
+    calendar_errors: HashMap<i64, String>,
+    profile_avatar_loader: Option<ProfileAvatarLoader>,
+    profile_avatar_images: HashMap<i64, ProfileAvatarImages>,
+    profile_avatar_pending: HashSet<i64>,
+    profile_avatar_missing: HashSet<i64>,
+    profile_avatar_pixel_sides: (u32, u32),
+    profile_avatar_tx: UiSender<ProfileAvatarUpdate>,
+    remote_images_enabled: bool,
+    remote_images_override_id: Option<i32>,
+    /// When an opened unread message counts as read.
+    mark_read: flectar_mail_core::models::MarkRead,
+    /// Whether the mail list shows conversations or each message on its own.
+    grouping: MailGrouping,
+    /// A scheduled send is being sent now, cancelled or moved. The mail
+    /// server may still be letting go of it, so another change waits.
+    changing_send: bool,
+    /// The order of `messages`, which their date sections follow.
+    list_order: ListOrder,
+    warm_start_cache: WarmStartCacheWriter,
+}
+
+#[derive(Debug)]
+struct MailDragPayload {
+    items: Vec<MailDragItem>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct MailDragItem {
+    message_id: i32,
+    account_id: i32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum MailDropDestination {
+    Action(&'static str),
+    Folder(i64),
+    /// A folder of another account.
+    Transfer(i64),
+    Label(i64),
+    Route(String),
+}
+
+fn mail_drag_payload(data: &DataTransfer) -> Option<Rc<MailDragPayload>> {
+    data.user_data()?.downcast::<MailDragPayload>().ok()
+}
+
+fn mail_operation_ids(
+    messages: &[MailMessage],
+    checked_ids: &HashSet<i32>,
+    trigger_id: i32,
+) -> Vec<i32> {
+    if checked_ids.contains(&trigger_id) {
+        messages
+            .iter()
+            .filter(|message| checked_ids.contains(&message.id))
+            .map(|message| message.id)
+            .collect()
+    } else {
+        vec![trigger_id]
+    }
+}
+
+/// The provider folder backing one account's standard mailbox, if any.
+fn standard_mailbox_folder(
+    state: &InboxState,
+    account_id: i64,
+    mailbox: StandardMailbox,
+) -> Option<i64> {
+    let scope = Scope::Account {
+        account_id,
+        mailbox,
+    };
+    state
+        .mailboxes
+        .iter()
+        .find(|entry| entry.scope == Some(scope) && entry.is_selectable && entry.folder_id >= 0)
+        .map(|entry| entry.folder_id)
+}
+
+fn resolve_single_mail_drop(
+    state: &InboxState,
+    item: &MailDragItem,
+    target_scope: Scope,
+    target_account_id: i32,
+    target_folder_id: i32,
+) -> Result<(MailTarget, MailDropDestination), String> {
+    if !state.using_core || state.core.is_none() {
+        return Err("mail account is not ready".to_owned());
+    }
+    let message = state
+        .messages
+        .iter()
+        .find(|message| message.id == item.message_id)
+        .ok_or_else(|| "message is no longer available".to_owned())?;
+    let target =
+        MailTarget::of(message).ok_or_else(|| "message thread is unavailable".to_owned())?;
+    if message.account_id != i64::from(item.account_id) {
+        return Err("dragged message account is stale".to_owned());
+    }
+    if state.scope == target_scope {
+        return Err("message is already in this destination".to_owned());
+    }
+
+    let destination = match target_scope {
+        Scope::Important => MailDropDestination::Route("important".to_owned()),
+        Scope::Other => MailDropDestination::Route("other".to_owned()),
+        Scope::Label { id: label_id, .. } => {
+            let label = state
+                .labels
+                .iter()
+                .find(|label| label.id == label_id)
+                .ok_or_else(|| "label destination is no longer available".to_owned())?;
+            if let Some(owner_account_id) = label.owner_account_id
+                && owner_account_id != message.account_id
+            {
+                return Err(format!(
+                    "this label belongs to another account; choose a label for {}",
+                    message.account
+                ));
+            }
+            if message.labels.contains(&label_id) {
+                return Err("message already has this label".to_owned());
+            }
+            if label.is_auto {
+                MailDropDestination::Route(format!("label:{label_id}"))
+            } else {
+                MailDropDestination::Label(label_id)
+            }
+        }
+        Scope::Unified(StandardMailbox::Starred) if !message.starred => {
+            MailDropDestination::Action("star")
+        }
+        Scope::Unified(StandardMailbox::Inbox) if message.folder == "Spam" => {
+            MailDropDestination::Action("not_spam")
+        }
+        Scope::Unified(StandardMailbox::Inbox) if message.folder == "Archive" => {
+            MailDropDestination::Action("unarchive")
+        }
+        Scope::Unified(StandardMailbox::Inbox) if message.folder != "Inbox" => {
+            MailDropDestination::Folder(
+                standard_mailbox_folder(state, message.account_id, StandardMailbox::Inbox)
+                    .ok_or_else(|| "this account has no inbox destination".to_owned())?,
+            )
+        }
+        Scope::Unified(StandardMailbox::Archive) if message.folder != "Archive" => {
+            MailDropDestination::Folder(
+                standard_mailbox_folder(state, message.account_id, StandardMailbox::Archive)
+                    .ok_or_else(|| "this account has no archive destination".to_owned())?,
+            )
+        }
+        Scope::Unified(StandardMailbox::Spam) if message.folder != "Spam" => {
+            standard_mailbox_folder(state, message.account_id, StandardMailbox::Spam)
+                .ok_or_else(|| "this account has no spam destination".to_owned())?;
+            MailDropDestination::Action("spam")
+        }
+        Scope::Unified(StandardMailbox::Trash) if message.folder != "Trash" => {
+            standard_mailbox_folder(state, message.account_id, StandardMailbox::Trash)
+                .ok_or_else(|| "this account has no trash destination".to_owned())?;
+            MailDropDestination::Action("trash")
+        }
+        Scope::Unified(_) => {
+            return Err("this unified mailbox is not a drop destination".to_owned());
+        }
+        // Snoozing needs a time, which Snooze asks for.
+        Scope::Snoozed => {
+            return Err("Snoozed is not a drop destination".to_owned());
+        }
+        // Only a draft can be scheduled, from the composer.
+        Scope::Scheduled => {
+            return Err("Scheduled is not a drop destination".to_owned());
+        }
+        Scope::Folder(_) | Scope::Account { .. } => {
+            let target = state
+                .mailboxes
+                .iter()
+                .find(|mailbox| {
+                    !mailbox.is_account
+                        && mailbox.account_id == i64::from(target_account_id)
+                        && mailbox.scope == Some(target_scope)
+                        && mailbox.folder_id == i64::from(target_folder_id)
+                })
+                .ok_or_else(|| "mailbox destination is no longer available".to_owned())?;
+            if !target.is_selectable {
+                return Err("this mailbox is a hierarchy container".to_owned());
+            }
+            // Custom folders are plain moves even when named like a
+            // standard mailbox.
+            let standard = match target_scope {
+                Scope::Account { mailbox, .. } => Some(mailbox),
+                _ => None,
+            };
+            // Mail moves to another account as Thunderbird moves it: a copy
+            // goes there, and the original goes once the copy is in place.
+            if target.account_id != message.account_id {
+                return match standard {
+                    Some(
+                        StandardMailbox::Sent | StandardMailbox::Drafts | StandardMailbox::Starred,
+                    ) => Err("this mailbox is not a drop destination".to_owned()),
+                    _ if target.folder_id >= 0 => Ok((
+                        MailTarget::of(message)
+                            .ok_or_else(|| "message thread is unavailable".to_owned())?,
+                        MailDropDestination::Transfer(target.folder_id),
+                    )),
+                    _ => Err("mailbox destination is unavailable".to_owned()),
+                };
+            }
+            // Folders are told apart by scope: another folder can have the
+            // name of the one shown.
+            if state.scope.shows_mail_in(target_scope) {
+                return Err("message is already in this destination".to_owned());
+            }
+            match standard {
+                Some(StandardMailbox::Starred) if !message.starred => {
+                    MailDropDestination::Action("star")
+                }
+                Some(StandardMailbox::Inbox) if message.folder == "Spam" => {
+                    MailDropDestination::Action("not_spam")
+                }
+                Some(StandardMailbox::Inbox) if message.folder == "Archive" => {
+                    MailDropDestination::Action("unarchive")
+                }
+                Some(StandardMailbox::Archive) => MailDropDestination::Folder(target.folder_id),
+                Some(StandardMailbox::Spam) => MailDropDestination::Action("spam"),
+                Some(StandardMailbox::Trash) => MailDropDestination::Action("trash"),
+                Some(StandardMailbox::Sent | StandardMailbox::Drafts | StandardMailbox::Starred) => {
+                    return Err("this mailbox is not a drop destination".to_owned());
+                }
+                Some(StandardMailbox::Inbox) | None if target.folder_id >= 0 => {
+                    MailDropDestination::Folder(target.folder_id)
+                }
+                Some(StandardMailbox::Inbox) | None => {
+                    return Err("mailbox destination is unavailable".to_owned());
+                }
+            }
+        }
+    };
+
+    Ok((target, destination))
+}
+
+fn resolve_mail_drop(
+    state: &InboxState,
+    payload: &MailDragPayload,
+    target_scope: Scope,
+    target_account_id: i32,
+    target_folder_id: i32,
+) -> Result<Vec<(i32, MailTarget, MailDropDestination)>, String> {
+    if payload.items.is_empty() {
+        return Err("no messages were dragged".to_owned());
+    }
+    payload
+        .items
+        .iter()
+        .map(|item| {
+            resolve_single_mail_drop(
+                state,
+                item,
+                target_scope,
+                target_account_id,
+                target_folder_id,
+            )
+            .map(|(target, destination)| (item.message_id, target, destination))
+        })
+        .collect()
+}
+
+fn perform_mail_drop(
+    _app: &AppWindow,
+    state: &Rc<RefCell<InboxState>>,
+    _runtime: &tokio::runtime::Handle,
+    payload: &MailDragPayload,
+    target_scope: Scope,
+    target_account_id: i32,
+    target_folder_id: i32,
+) -> Result<(), String> {
+    let (core, operations) = {
+        let state = state.borrow();
+        let operations = resolve_mail_drop(
+            &state,
+            payload,
+            target_scope,
+            target_account_id,
+            target_folder_id,
+        )?;
+        (
+            state
+                .core
+                .clone()
+                .ok_or_else(|| "mail core is unavailable".to_owned())?,
+            operations,
+        )
+    };
+
+    mail_work::enqueue(
+        state,
+        core,
+        operations
+            .into_iter()
+            .map(|(id, target, destination)| (id, target, mail_work::Operation::Drop(destination)))
+            .collect(),
+    )
+}
+
+/// Shows the mail list's rows as dense as `settings` keep them, with as many
+/// lines of each message's text.
+pub(crate) fn apply_list_rows(app: &AppWindow, settings: &Settings) {
+    app.set_mail_compact_rows(
+        settings.list_density == flectar_mail_core::models::ListDensity::Compact,
+    );
+    app.set_mail_preview_lines(i32::from(
+        settings
+            .preview_lines
+            .min(flectar_mail_core::models::MAX_PREVIEW_LINES),
+    ));
+}
+
+/// Show conversations, or each message on its own. The list starts over like
+/// a newly chosen mailbox, and tabs forget the conversations or messages they
+/// had open, whose ids belong to the other grouping. Returns whether the
+/// grouping changed.
+fn apply_mail_grouping(
+    app: &AppWindow,
+    state: &Rc<RefCell<InboxState>>,
+    runtime: &tokio::runtime::Handle,
+    grouping: MailGrouping,
+) -> bool {
+    app.set_conversation_view(grouping == MailGrouping::Conversations);
+    let core = state.borrow().core.clone();
+    let changed = core.is_some_and(|core| core.set_grouping(grouping));
+    if state.borrow().grouping == grouping && !changed {
+        return false;
+    }
+    {
+        let mut state = state.borrow_mut();
+        state.grouping = grouping;
+        state.pending_selection = None;
+        state.pending_selection_opens = false;
+        state.restore_thread_message = None;
+        state.mail_groups.clear();
+        state.page = 1;
+        state.next_cursor = None;
+        state.selected_id = None;
+        state.checked_ids.clear();
+        state.preview_closed = true;
+        state.conversation_owner_id = None;
+        state.conversation_messages.clear();
+        state.conversation_selected_index = 0;
+    }
+    let tabs = app.global::<TabsUi>();
+    tabs.set_list_offset(0.0);
+    tabs.set_list_restore(-1.0);
+    tabs.invoke_regroup();
+    // Single-pane layouts go back to the list, as for a tab with nothing open.
+    tabs.set_shown_conversation(false);
+    tabs.set_shown(tabs.get_shown().wrapping_add(1));
+    if changed && let Err(error) = refresh_from_source(app, state, runtime, false, &[]) {
+        app.set_render_status(UiMessage::detail("Mail refresh failed: {}", error));
+    }
+    true
+}
+
+fn perform_mail_list_action(
+    _app: &AppWindow,
+    state: &Rc<RefCell<InboxState>>,
+    _runtime: &tokio::runtime::Handle,
+    trigger_id: i32,
+    action: &str,
+    use_checked_selection: bool,
+) -> Result<(), String> {
+    let (core, operations) = {
+        let state = state.borrow();
+        if !state.using_core {
+            return Err("mail account is not ready".to_owned());
+        }
+        let ids = if use_checked_selection {
+            mail_operation_ids(&state.messages, &state.checked_ids, trigger_id)
+        } else {
+            vec![trigger_id]
+        };
+        // Local mail has no archive or spam, so a selection that includes
+        // some moves only the rest.
+        let local_mail = state.local_mail.map(|local| local.account_id);
+        let needs_roles = matches!(action, "archive" | "unarchive" | "spam" | "not_spam");
+        let operations = ids
+            .into_iter()
+            .filter_map(|id| {
+                let Some(message) = state.messages.iter().find(|message| message.id == id) else {
+                    return Some(Err("message is no longer available".to_owned()));
+                };
+                if needs_roles && Some(message.account_id) == local_mail {
+                    return None;
+                }
+                Some(
+                    MailTarget::of(message)
+                        .map(|target| (id, target))
+                        .ok_or_else(|| "message thread is unavailable".to_owned()),
+                )
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        (
+            state
+                .core
+                .clone()
+                .ok_or_else(|| "mail core is unavailable".to_owned())?,
+            operations,
+        )
+    };
+
+    mail_work::enqueue(
+        state,
+        core,
+        operations
+            .into_iter()
+            .map(|(id, target)| (id, target, mail_work::Operation::Action(action.to_owned())))
+            .collect(),
+    )
+}
+
+#[cfg(any(test, desktop))]
+fn parse_preview_window_size(value: &str) -> Result<slint::LogicalSize, String> {
+    let normalized = value.trim().to_ascii_lowercase();
+    let (width, height) = normalized
+        .split_once('x')
+        .ok_or_else(|| "expected WIDTHxHEIGHT, for example 390x844".to_owned())?;
+    let width = width
+        .trim()
+        .parse::<u32>()
+        .map_err(|_| "preview width must be a positive integer".to_owned())?;
+    let height = height
+        .trim()
+        .parse::<u32>()
+        .map_err(|_| "preview height must be a positive integer".to_owned())?;
+    if !(320..=4096).contains(&width) || !(320..=4096).contains(&height) {
+        return Err("preview dimensions must each be between 320 and 4096 logical pixels".into());
+    }
+    Ok(slint::LogicalSize::new(width as f32, height as f32))
+}
+
+fn normalized_language_preference(language: &str) -> &'static str {
+    match language {
+        "en" => "en",
+        "es" => "es",
+        "tr" => "tr",
+        "ru" | "ru-RU" | "ru_RU" => "ru",
+        "zh" | "zh-Hans" | "zh_Hans" => "zh_Hans",
+        _ => "system",
+    }
+}
+
+fn bundled_language_for_locale(locale: &str) -> Option<&'static str> {
+    let mut subtags = locale
+        .split(['-', '_', '.', '@'])
+        .filter(|part| !part.is_empty());
+    let language = subtags.next()?;
+    if language.eq_ignore_ascii_case("es") {
+        return Some("es");
+    }
+    if language.eq_ignore_ascii_case("tr") {
+        return Some("tr");
+    }
+    if language.eq_ignore_ascii_case("ru") {
+        return Some("ru");
+    }
+    if !language.eq_ignore_ascii_case("zh") {
+        return None;
+    }
+
+    // Bare `zh` defaults to Hans. A Hant script or Traditional Chinese region
+    // must not fall back to the Simplified Chinese catalog.
+    let is_traditional = subtags.next().is_some_and(|subtag| {
+        ["hant", "tw", "hk", "mo"]
+            .iter()
+            .any(|value| subtag.eq_ignore_ascii_case(value))
+    });
+    (!is_traditional).then_some("zh_Hans")
+}
+
+/// The app's privacy policy on flectar.com, in the UI language when the site
+/// has that translation and in English otherwise.
+fn privacy_policy_url(language: &str) -> &'static str {
+    match language {
+        "es" => "https://flectar.com/es/mail/privacy/",
+        "ru" => "https://flectar.com/ru/mail/privacy/",
+        "tr" => "https://flectar.com/tr/mail/privacy/",
+        "zh_Hans" => "https://flectar.com/zh-hans/mail/privacy/",
+        _ => "https://flectar.com/mail/privacy/",
+    }
+}
+
+fn apply_language(app: &AppWindow, preference: &str) {
+    let language_mode = normalized_language_preference(preference);
+    let system_locale = sys_locale::get_locale();
+    let selected = match language_mode {
+        "system" => system_locale
+            .as_deref()
+            .and_then(bundled_language_for_locale)
+            .unwrap_or("en"),
+        language => language,
+    };
+    number_format::set_language(selected);
+    spelling::apply_display_language(language_mode);
+    // Before the translation, whose text is laid out again with these fonts.
+    han_fallback::set_ui_language(selected, slint::fontique_012::shared_collection);
+    if let Err(error) = slint::select_bundled_translation(selected) {
+        eprintln!("could not select {selected} translation: {error}");
+    }
+    sidebar_model::reload_mailbox_names(app);
+    renderer::set_default_summary(&app.global::<I18n>().invoke_details_summary());
+    let line = |message: UiMessage| translated(app, &message).to_string();
+    renderer::set_header_lines(renderer::HeaderLines {
+        from: line(UiMessage::detail("From: {}", renderer::HEADER_VALUE)),
+        date: line(UiMessage::detail("Date: {}", renderer::HEADER_VALUE)),
+        subject: line(UiMessage::detail("Subject: {}", renderer::HEADER_VALUE)),
+        to: line(UiMessage::detail("To: {}", renderer::HEADER_VALUE)),
+        cc: line(UiMessage::detail("Cc: {}", renderer::HEADER_VALUE)),
+    });
+    attachment_controller::set_unnamed_message(&translated(
+        app,
+        &UiMessage::plain("Forwarded message"),
+    ));
+    app.set_language_mode(language_mode.into());
+    app.set_privacy_policy_url(privacy_policy_url(selected).into());
+    app.invoke_app_language_changed(language_mode.into(), selected.into());
+    date_format::reload(app);
+    notifications::ui::language_changed(app);
+    translation::language_changed(app, selected, language_mode != "system");
+}
+
+impl InboxState {
+    fn empty(
+        favicon_loader: Option<FaviconLoader>,
+        favicon_tx: UiSender<FaviconUpdate>,
+        profile_avatar_loader: Option<ProfileAvatarLoader>,
+        profile_avatar_tx: UiSender<ProfileAvatarUpdate>,
+        use_wgpu: bool,
+        remote_images_enabled: bool,
+        warm_start_cache: WarmStartCacheWriter,
+    ) -> Self {
+        Self {
+            core: None,
+            email_renderer: Rc::new(RefCell::new(GpuEmailRenderer::default())),
+            use_wgpu,
+            using_core: false,
+            mailboxes: Vec::new(),
+            unified_mailboxes: Vec::new(),
+            sidebar_badges: SidebarBadges::default(),
+            server_only: None,
+            saved_searches: Vec::new(),
+            server_search: Default::default(),
+            mail_work: None,
+            collapsed_folder_ids: HashSet::new(),
+            collapsed_sidebar_sections: HashSet::from([
+                "categories".into(),
+                "global-labels".into(),
+            ]),
+            initialized_sidebar_accounts: HashSet::new(),
+            initialized_sidebar_folders: HashSet::new(),
+            sidebar_rows: Rc::new(SidebarModel::default()),
+            sidebar_animation: Rc::new(SidebarAnimation::default()),
+            folder_filter: String::new(),
+            inbox_count: 0,
+            messages: Vec::new(),
+            conversation_owner_id: None,
+            conversation_messages: Vec::new(),
+            conversation_selected_index: 0,
+            conversation_rows: Rc::new(VecModel::default()),
+            labels: Vec::new(),
+            email_rows: Rc::new(VecModel::default()),
+            mail_list_entries: Rc::new(VecModel::default()),
+            mail_groups: MailGroupState::default(),
+            scope: Scope::UNIFIED_INBOX,
+            query: String::new(),
+            search_filter: "All mail".to_owned(),
+            page: 1,
+            next_cursor: None,
+            window_start: None,
+            selected_id: None,
+            pending_selection: None,
+            pending_selection_opens: false,
+            restore_thread_message: None,
+            checked_ids: HashSet::new(),
+            rendered_id: None,
+            preview_closed: false,
+            favicon_loader,
+            favicon_icons: HashMap::new(),
+            favicon_pending: HashSet::new(),
+            favicon_missing: HashSet::new(),
+            favicon_retry: HashMap::new(),
+            favicon_pixel_sides: (0, 0),
+            favicon_generation: 0,
+            favicon_tx,
+            connected_accounts: Vec::new(),
+            account_activity: account_status::AccountActivity::default(),
+            account_configs: Vec::new(),
+            local_mail: None,
+            local_mail_reloads: 0,
+            account_presentation: AccountPresentationSettings::default(),
+            profile_accounts: None,
+            calendar_connections: Vec::new(),
+            carddav_connections: Vec::new(),
+            calendar_errors: HashMap::new(),
+            profile_avatar_loader,
+            profile_avatar_images: HashMap::new(),
+            profile_avatar_pending: HashSet::new(),
+            profile_avatar_missing: HashSet::new(),
+            profile_avatar_pixel_sides: (0, 0),
+            profile_avatar_tx,
+            remote_images_enabled,
+            remote_images_override_id: None,
+            mark_read: flectar_mail_core::models::MarkRead::Immediately,
+            grouping: MailGrouping::Conversations,
+            changing_send: false,
+            list_order: ListOrder::NewestFirst,
+            warm_start_cache,
+        }
+    }
+
+    /// Starts a change to a scheduled send, or returns false while another
+    /// is still under way. Clear `changing_send` once it is done.
+    fn start_send_change(&mut self) -> bool {
+        !std::mem::replace(&mut self.changing_send, true)
+    }
+
+    /// The order the list of the current mailbox and search loads in: the
+    /// mailbox's own, except search results, which are newest first.
+    fn list_order_for_view(&self) -> ListOrder {
+        match &self.core {
+            Some(core) if self.query.trim().is_empty() => core.order(self.scope),
+            _ => ListOrder::NewestFirst,
+        }
+    }
+
+    /// Select `scope`, or the equivalent mailbox the sidebar shows for the
+    /// mail view's accounts. A mailbox of an account outside the active
+    /// profile gives way to the profile's own.
+    fn set_scope(&mut self, scope: Scope) {
+        let scope = if self.shows_scope(scope) {
+            scope
+        } else {
+            scope.unified()
+        };
+        self.scope = scope.visible_for(&self.mail_accounts());
+    }
+
+    /// Whether the mail view shows this account's mail: every account's
+    /// unless a profile is active. Every profile shows local mail.
+    fn shows_account(&self, account_id: i64) -> bool {
+        self.local_mail
+            .is_some_and(|local| local.account_id == account_id)
+            || self
+                .profile_accounts
+                .as_ref()
+                .is_none_or(|accounts| accounts.binary_search(&account_id).is_ok())
+    }
+
+    /// The connected accounts the mail view shows.
+    fn mail_accounts(&self) -> Vec<Account> {
+        self.connected_accounts
+            .iter()
+            .filter(|account| self.shows_account(account.id))
+            .cloned()
+            .collect()
+    }
+
+    /// Takes the sidebar's mailboxes and badges from fresh metadata.
+    /// Returns whether the end of the list says something else now.
+    fn set_mail_metadata(&mut self, metadata: MailMetadata) -> bool {
+        let note = self.server_only_note();
+        self.mailboxes = metadata.mailboxes;
+        self.unified_mailboxes = metadata.unified_mailboxes;
+        self.sidebar_badges = metadata.sidebar_badges;
+        self.saved_searches = metadata.saved_searches;
+        self.inbox_count = metadata.inbox_count;
+        self.server_only = Some((metadata.scope, metadata.server_only_unread));
+        self.server_only_note() != note
+    }
+
+    /// How many older unread messages of the list are only on the server,
+    /// which the list's old end mentions once it is shown. A list shown
+    /// oldest first starts there, and a newest first one gets there once all
+    /// of its mail is in. Not for searches, nor for filters other than
+    /// unread mail.
+    fn server_only_note(&self) -> u32 {
+        let at_old_end = match self.list_order {
+            ListOrder::OldestFirst => self.window_start.is_none(),
+            ListOrder::NewestFirst => self.next_cursor.is_none(),
+        };
+        match self.server_only {
+            Some((scope, count))
+                if scope == self.scope
+                    && self.using_core
+                    && at_old_end
+                    && self.query.trim().is_empty()
+                    && matches!(self.search_filter.as_str(), "All mail" | "Unread") =>
+            {
+                count
+            }
+            _ => 0,
+        }
+    }
+
+    /// The accounts a manual check for new mail covers in the current view:
+    /// the account whose mailbox, folder or label it shows, otherwise the
+    /// shown accounts. `None` stands for every account.
+    fn accounts_in_view(&self) -> Option<Vec<i64>> {
+        let owner = match self.scope {
+            Scope::Account { account_id, .. } => Some(account_id),
+            Scope::Folder(_) => self
+                .mailboxes
+                .iter()
+                .find(|mailbox| mailbox.scope == Some(self.scope))
+                .map(|mailbox| mailbox.account_id),
+            Scope::Label { id, .. } => self
+                .labels
+                .iter()
+                .find(|label| label.id == id)
+                .and_then(|label| label.owner_account_id),
+            Scope::Unified(_)
+            | Scope::Important
+            | Scope::Other
+            | Scope::Snoozed
+            | Scope::Scheduled => None,
+        };
+        let connected = self
+            .connected_accounts
+            .iter()
+            .map(|account| account.id)
+            .collect::<Vec<_>>();
+        accounts_to_check(owner, &connected, self.profile_accounts.as_deref())
+    }
+
+    /// Whether there is any mail to show: an account's, or mail kept on this
+    /// device.
+    fn has_mail(&self) -> bool {
+        !self.connected_accounts.is_empty() || self.local_mail.is_some()
+    }
+
+    /// Whether `scope` belongs to a shown account, or to none. Folders and
+    /// labels not loaded yet count as shown; their page falls back to the
+    /// inbox if they are not.
+    fn shows_scope(&self, scope: Scope) -> bool {
+        match scope {
+            Scope::Unified(_)
+            | Scope::Important
+            | Scope::Other
+            | Scope::Snoozed
+            | Scope::Scheduled => true,
+            Scope::Account { account_id, .. } => self.shows_account(account_id),
+            Scope::Folder(_) => self
+                .mailboxes
+                .iter()
+                .find(|mailbox| mailbox.scope == Some(scope))
+                .is_none_or(|mailbox| self.shows_account(mailbox.account_id)),
+            Scope::Label { id, .. } => self
+                .labels
+                .iter()
+                .find(|label| label.id == id)
+                .and_then(|label| label.owner_account_id)
+                .is_none_or(|owner| self.shows_account(owner)),
+        }
+    }
+
+    /// Show the active profile's accounts, as the presentation settings name
+    /// them. Returns whether the mail view's accounts changed; the caller
+    /// then reloads the list and counts.
+    #[must_use]
+    fn sync_profile_accounts(&mut self) -> bool {
+        let accounts = self.account_presentation.active_profile_accounts();
+        if let Some(core) = &self.core {
+            core.set_profile_accounts(accounts.clone());
+        }
+        let changed = self.profile_accounts != accounts;
+        self.profile_accounts = accounts;
+        changed
+    }
+
+    /// Replace the account inventory. Returns whether the selection moved to
+    /// stay visible, in which case the caller must reload the message list.
+    #[must_use]
+    fn set_connected_accounts(&mut self, accounts: Vec<Account>) -> bool {
+        self.connected_accounts = accounts;
+        let previous = self.scope;
+        self.set_scope(previous);
+        self.scope != previous
+    }
+
+    fn queue_warm_start_update(&self) {
+        // A warm projection loaded before Core exists is not authoritative and
+        // must never overwrite a newer cache if startup subsequently fails.
+        if self.core.is_none() {
+            return;
+        }
+        if self.connected_accounts.is_empty() {
+            self.warm_start_cache.clear();
+            return;
+        }
+        // Search results and temporary filters are intentionally session-only;
+        // keep the last ordinary mailbox page as the repeat-launch surface.
+        // A list opened further down starts at its start next time.
+        if !self.query.trim().is_empty()
+            || self.search_filter != "All mail"
+            || self.window_start.is_some()
+        {
+            return;
+        }
+        self.warm_start_cache
+            .save(WarmStartSnapshot::capture(WarmStartProjection {
+                scope: self.scope,
+                inbox_count: self.inbox_count,
+                grouping: self.grouping,
+                order: self.list_order,
+                next_cursor: self.next_cursor.and_then(WarmStartCursor::of),
+                accounts: &self.connected_accounts,
+                profile_accounts: self.profile_accounts.as_deref(),
+                messages: &self.messages,
+                mailboxes: &self.mailboxes,
+                unified_mailboxes: &self.unified_mailboxes,
+            }));
+    }
+}
+
+/// Everything the shared application needs from its host. Desktop builds use
+/// `PlatformContext::desktop`; mobile hosts construct it from their own
+/// sandbox paths and native services. See platform/README.md.
+#[derive(Clone)]
+pub struct PlatformContext {
+    /// Host URL dispatch for mail links and browser-based authorization.
+    pub external_urls: ExternalUrlOpener,
+    /// The system's notification service for new mail; `None` where the host
+    /// has none. Desktop builds leave it empty: `run` creates the platform's
+    /// own once this process owns the profile.
+    pub notifications: Option<Arc<dyn NotificationHost>>,
+    /// Host hook for withdrawing a first-use privacy consent, when the host
+    /// stores one.
+    pub privacy_consent: PrivacyConsent,
+    /// Host hook for a native app language that must follow the shared UI.
+    pub app_language: AppLanguage,
+    /// The system's spell checker, where the app has none of its own for the
+    /// platform: Android's. `None` elsewhere.
+    pub spelling: Option<Arc<dyn SpellingHost>>,
+    pub paths: Paths,
+    pub documents: Arc<dyn documents::DocumentProvider>,
+    pub credentials: flectar_mail_core::accounts::credentials::CredentialStoreHandle,
+    pub oauth_redirects: flectar_mail_core::oauth::redirect::OAuthRedirectBrokerHandle,
+}
+
+impl PlatformContext {
+    #[cfg(desktop)]
+    pub fn desktop() -> Result<Self, flectar_mail_core::error::CoreError> {
+        let paths = Paths::default_dirs()?;
+        let credentials = desktop_credential_store(&paths);
+        Ok(Self {
+            paths,
+            external_urls: ExternalUrlOpener::default(),
+            notifications: None,
+            privacy_consent: PrivacyConsent::default(),
+            app_language: AppLanguage::default(),
+            spelling: None,
+            documents: documents::default_provider(),
+            credentials,
+            oauth_redirects: Arc::new(
+                flectar_mail_core::oauth::redirect::LoopbackRedirectBroker::default(),
+            ),
+        })
+    }
+
+    /// A host-owned sandbox: durable data below `data_root/data`, plus the
+    /// host's native document, credential and OAuth services.
+    pub fn app_private(
+        data_root: PathBuf,
+        cache_dir: PathBuf,
+        documents: Arc<dyn documents::DocumentProvider>,
+        credentials: flectar_mail_core::accounts::credentials::CredentialStoreHandle,
+        oauth_redirects: flectar_mail_core::oauth::redirect::OAuthRedirectBrokerHandle,
+    ) -> Self {
+        Self {
+            paths: Self::app_private_paths(data_root, cache_dir),
+            external_urls: ExternalUrlOpener::default(),
+            notifications: None,
+            privacy_consent: PrivacyConsent::default(),
+            app_language: AppLanguage::default(),
+            spelling: None,
+            documents,
+            credentials,
+            oauth_redirects,
+        }
+    }
+
+    /// The profile in a host-owned sandbox, as [`Self::app_private`] keeps it:
+    /// what a process that runs without the window opens too.
+    pub fn app_private_paths(data_root: PathBuf, cache_dir: PathBuf) -> Paths {
+        Paths::new(data_root.join("data"), cache_dir)
+    }
+}
+
+#[cfg(desktop)]
+fn desktop_credential_store(
+    paths: &Paths,
+) -> flectar_mail_core::accounts::credentials::CredentialStoreHandle {
+    #[cfg(all(linux_desktop, debug_assertions))]
+    if isolated_container_without_secret_service() {
+        let path = paths.data_dir.join("credentials-v1.json");
+        tracing::warn!(
+            path = %path.display(),
+            "credential: no D-Bus session in development container; using debug-only plaintext storage"
+        );
+        return Arc::new(
+            flectar_mail_core::accounts::credentials::DevelopmentFileCredentialStore::new(path),
+        );
+    }
+    #[cfg(all(linux_desktop, feature = "flatpak"))]
+    return flatpak_secrets::credential_store(paths);
+    #[cfg(not(all(linux_desktop, feature = "flatpak")))]
+    Arc::new(flectar_mail_core::accounts::credentials::SystemCredentialStore::for_profile(paths))
+}
+
+#[cfg(all(linux_desktop, debug_assertions))]
+fn isolated_container_without_secret_service() -> bool {
+    let container = std::env::var("container")
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    isolated_container_without_secret_service_values(
+        &container,
+        std::env::var_os("DBUS_SESSION_BUS_ADDRESS").is_some_and(|value| !value.is_empty()),
+    )
+}
+
+#[cfg(all(linux_desktop, any(debug_assertions, test)))]
+fn isolated_container_without_secret_service_values(
+    container: &str,
+    has_session_bus: bool,
+) -> bool {
+    matches!(container, "podman" | "docker") && !has_session_bus
+}
+
+#[cfg(all(test, linux_desktop))]
+mod desktop_credential_store_tests {
+    use super::isolated_container_without_secret_service_values;
+
+    #[test]
+    fn debug_file_store_is_limited_to_isolated_desktop_containers() {
+        assert!(isolated_container_without_secret_service_values(
+            "podman", false
+        ));
+        assert!(isolated_container_without_secret_service_values(
+            "docker", false
+        ));
+        assert!(!isolated_container_without_secret_service_values(
+            "podman", true
+        ));
+        assert!(!isolated_container_without_secret_service_values("", false));
+        assert!(!isolated_container_without_secret_service_values(
+            "flatpak", false
+        ));
+    }
+}
+
+fn startup_diagnostic_id(error: &str) -> String {
+    use sha2::Digest;
+    let digest = sha2::Sha256::digest(error.as_bytes());
+    format!(
+        "START-{:02X}{:02X}{:02X}{:02X}",
+        digest[0], digest[1], digest[2], digest[3]
+    )
+}
+
+fn startup_diagnostics(paths: &Paths, diagnostic_id: &str, error: &str) -> String {
+    format!(
+        "Flectar Mail {}\nplatform={}\nabi={}\ndiagnostic_id={}\nmail_db={}\ncalendar_db={}\nmail_db_exists={}\ncalendar_db_exists={}\nstartup_error={}\n",
+        env!("CARGO_PKG_VERSION"),
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+        diagnostic_id,
+        paths.db_file().display(),
+        paths.calendar_db_file().display(),
+        paths.db_file().is_file(),
+        paths.calendar_db_file().is_file(),
+        error,
+    )
+}
+
+fn spawn_startup_load(
+    runtime: &tokio::runtime::Handle,
+    paths: Paths,
+    credentials: flectar_mail_core::accounts::credentials::CredentialStoreHandle,
+    oauth_redirects: flectar_mail_core::oauth::redirect::OAuthRedirectBrokerHandle,
+    startup_tx: UiSender<StartupUpdate>,
+    metrics: StartupMetrics,
+) {
+    runtime.spawn(async move {
+        for obsolete in paths.obsolete_warm_start_files() {
+            match tokio::fs::remove_file(obsolete).await {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    tracing::warn!(error = %error, "obsolete warm-start cache cleanup failed");
+                }
+            }
+        }
+        // Rows saved in the other grouping would be replaced at once.
+        let grouping = flectar_mail_core::startup_presentation(&paths).grouping;
+        let warm = load_warm_start_snapshot(&paths.warm_start_file())
+            .await
+            .filter(|snapshot| snapshot.grouping == grouping);
+        let preferred_scope = warm
+            .as_ref()
+            .map_or(Scope::UNIFIED_INBOX, |snapshot| snapshot.scope);
+        metrics.emit(
+            "warm_cache_loaded",
+            serde_json::json!({
+                "hit": warm.is_some(),
+            }),
+        );
+        if let Some(warm) = warm {
+            let (applied_tx, applied_rx) = tokio::sync::oneshot::channel();
+            if startup_tx
+                .send(StartupUpdate::Warm {
+                    snapshot: Box::new(warm),
+                    applied: applied_tx,
+                })
+                .await
+                .is_err()
+            {
+                return;
+            }
+            // Give the saved rows one event-loop turn to paint before database
+            // initialization can replace them. The timeout preserves startup
+            // progress if a platform suspends or tears down the window.
+            let _ = tokio::time::timeout(Duration::from_millis(250), applied_rx).await;
+        }
+
+        let result = load_startup_snapshot(
+            paths,
+            credentials,
+            oauth_redirects,
+            preferred_scope,
+            &metrics,
+        )
+        .await;
+        metrics.emit(
+            "local_startup_loaded",
+            serde_json::json!({
+                "success": result.is_ok(),
+            }),
+        );
+        let follow_up = result
+            .as_ref()
+            .ok()
+            .map(|snapshot| (snapshot.core.clone(), snapshot.scope));
+        let _ = startup_tx
+            .send(StartupUpdate::Ready(result.map(Box::new)))
+            .await;
+        let Some((core, scope)) = follow_up else {
+            return;
+        };
+
+        let metadata_tx = startup_tx.clone();
+        let metadata_core = core.clone();
+        tokio::spawn(async move {
+            let result = load_startup_mail_metadata(&metadata_core, scope).await;
+            let _ = metadata_tx.send(StartupUpdate::MailMetadata(result)).await;
+        });
+    });
+}
+
+/// Keep the launcher's activation token and clear it from the environment,
+/// so programs Flectar Mail starts do not inherit it.
+///
+/// # Safety
+///
+/// Changes the environment: call it before any other thread starts.
+#[cfg(desktop)]
+pub unsafe fn take_launch_activation_token() {
+    // SAFETY: forwarded from the caller.
+    unsafe { window_chrome::take_launch_activation_token() };
+}
+
+/// Slint installs one backend per process. Retry failed GPU startup in a fresh
+/// CPU process, releasing the failed device and keeping the saved choice intact.
+pub fn run_desktop(platform: PlatformContext) -> Result<(), Box<dyn std::error::Error>> {
+    let result = run(platform);
+    #[cfg(desktop)]
+    if let Err(error) = &result
+        && error.is::<renderer_preferences::GpuStartupError>()
+        && !renderer_preferences::gpu_startup_failed()
+    {
+        return renderer_preferences::restart_cpu(error.as_ref());
+    }
+    result
+}
+
+pub fn run(platform: PlatformContext) -> Result<(), Box<dyn std::error::Error>> {
+    let startup_metrics = StartupMetrics::from_environment();
+    let benchmark_tray = startup_metrics.enabled()
+        && std::env::var_os("FLECTAR_BENCHMARK_TRAY_INTERVAL_MS").is_some();
+    let benchmark_disable_background =
+        std::env::var("FLECTAR_BENCHMARK_DISABLE_SYNC").as_deref() == Ok("1");
+    normalize_appimage_environment();
+    // Overlaps the system's font lookups with the rest of startup.
+    han_fallback::warm_up();
+    // Before any connection: those that follow the system's proxy settings
+    // read them through the platform.
+    platform::install_system_proxy();
+
+    // Created before the backend: claiming the profile uses its reactor, and
+    // a launch that only forwards to a running instance should exit before
+    // any renderer or window is initialized. Everything that uses it is
+    // declared later and dropped first, so the runtime shuts down last.
+    let app_runtime = app_runtime::AppRuntime::new(
+        tokio::runtime::Builder::new_multi_thread()
+            // Mail sync is I/O-bound. Avoid reserving one Tokio worker per
+            // logical CPU in a desktop shell while leaving room for the UI,
+            // Blitz renderer, and the core's dedicated DB threads.
+            .worker_threads(2)
+            .max_blocking_threads(2)
+            .enable_all()
+            .build()?,
+    );
+    let runtime = app_runtime.handle().clone();
+    #[cfg(desktop)]
+    let launch_links = mailto_links::launch_links(std::env::args_os().skip(1));
+    // A mail link launch always shows the window, whatever else it says.
+    #[cfg(desktop)]
+    let background_launch = launch_links.is_none() && autostart::launched_in_background();
+    #[cfg(desktop)]
+    let mut instance = {
+        use single_instance::{Acquired, Activation, Request};
+        let request = if background_launch {
+            Request::Nothing
+        } else {
+            Request::Show(Activation {
+                activation_token: window_chrome::launch_activation_token(),
+                links: launch_links.clone().unwrap_or_default(),
+            })
+        };
+        match single_instance::acquire(&runtime, &platform.paths.data_dir, request) {
+            Ok(Acquired::Primary(primary)) => Some(primary),
+            Ok(Acquired::Forwarded) => return Ok(()),
+            Ok(Acquired::Unresponsive(error)) => {
+                return Err(
+                    format!("Flectar Mail is already running but did not respond: {error}").into(),
+                );
+            }
+            Err(error) => {
+                eprintln!("could not coordinate with other Flectar Mail processes: {error}");
+                None
+            }
+        }
+    };
+    // Set up by the process that owns the profile, before any window: Windows
+    // takes the app's identity before the first one, and macOS needs the
+    // notification delegate before the application finishes launching, so a
+    // click that launched it reaches the app.
+    #[cfg(desktop)]
+    let platform = PlatformContext {
+        notifications: platform.notifications.clone().or_else(notifications::host),
+        ..platform
+    };
+
+    let renderer_preference_path = platform.paths.data_dir.join("renderer.json");
+    let tabs_path = platform.paths.data_dir.join("tabs.json");
+    let preferred_renderer = renderer_preferences::load(&renderer_preference_path);
+    let requested_renderer = renderer_preferences::requested(preferred_renderer);
+    eprintln!(
+        "FLECTAR_RENDERER {}",
+        serde_json::json!({
+            "event": "requested", "pid": std::process::id(),
+            "preferred": preferred_renderer.key(), "requested": requested_renderer.key(),
+            "gpu_supported": renderer_preferences::GPU_SUPPORTED,
+        })
+    );
+    // Read before the backend is selected: native frame attributes are fixed
+    // when the window is created. This is the same zero-wait lookup used for
+    // the rest of the first frame's presentation state.
+    let startup_presentation = flectar_mail_core::startup_presentation(&platform.paths);
+    let window_frame = startup_presentation.window_frame.as_deref().map_or_else(
+        window_chrome::WindowFrame::default,
+        window_chrome::WindowFrame::parse,
+    );
+    #[cfg(desktop)]
+    let (use_wgpu, cpu_renderer) = (
+        renderer_preferences::select_backend(requested_renderer, window_frame)?,
+        "software",
+    );
+    // The platform layer installs the mobile backend and names its renderer.
+    #[cfg(mobile)]
+    let (use_wgpu, cpu_renderer) = (false, platform::select_renderer()?);
+
+    eprintln!(
+        "FLECTAR_RENDERER {}",
+        serde_json::json!({
+            "event": "selected", "pid": std::process::id(),
+            "preferred": preferred_renderer.key(), "requested": requested_renderer.key(),
+            "active": if use_wgpu { "gpu" } else { "cpu" },
+            "slint": if use_wgpu { "femtovg-wgpu" } else { cpu_renderer },
+            "blitz": if use_wgpu { "vello-gpu" } else { "vello-cpu" },
+            "wgpu_initialized": if use_wgpu { serde_json::Value::Null } else { serde_json::json!(false) },
+            "shared_device": if use_wgpu { serde_json::Value::Null } else { serde_json::json!(false) },
+        })
+    );
+
+    // Match resources/com.flectar.mail.desktop so Wayland compositors and XDG
+    // window managers can associate the native window with the installed icon.
+    #[cfg(all(
+        unix,
+        not(any(mobile, target_os = "macos"))
+    ))]
+    slint::set_xdg_app_id("com.flectar.mail")?;
+
+    // Register the deterministic emoji face and the Han fallback before any
+    // initial text is measured.
+    configure_emoji_font_fallback()?;
+    han_fallback::install_ui(&mut slint::fontique_012::shared_collection());
+
+    // Construct the window before opening or migrating either database. Seed
+    // the presentation preferences visible in the inert mailbox shell from
+    // the zero-wait read-only lookup above, then map the first frame with its
+    // saved list width and window frame. Full settings validation still
+    // happens during normal background startup.
+    window_chrome::prepare(window_frame);
+    let app = renderer_preferences::initialize_step(use_wgpu, AppWindow::new)?;
+    app.global::<MailListNavigation>()
+        .on_target(mail_navigation::target);
+    app.global::<KeyboardKeys>().on_chord(keyboard_keys::chord);
+    if let Some(width) = startup_presentation.workspace_list_pane_width {
+        app.set_workspace_list_pane_width(width as f32);
+    }
+    window_chrome::register(&app, &runtime);
+    motion::watch(&app, &runtime);
+    app_icon::apply(&app, startup_presentation.app_icon);
+    app.set_app_version(env!("CARGO_PKG_VERSION").into());
+    let privacy_consent = platform.privacy_consent.clone();
+    app.set_privacy_consent_withdrawable(privacy_consent.is_supported());
+    app.on_withdraw_privacy_consent(move || {
+        // Withdrawal only fails when the host never wired its hook. Hosts log
+        // `tracing` where stderr is not visible, such as OpenHarmony's hilog.
+        if let Err(error) = privacy_consent.withdraw() {
+            tracing::warn!(%error, "withdrawing privacy consent failed");
+        }
+    });
+    app.on_settings_search_matches(|haystack, query| {
+        let query = query.to_string().trim().to_lowercase();
+        query.is_empty() || haystack.to_string().to_lowercase().contains(&query)
+    });
+    renderer_preferences::register(
+        &app,
+        renderer_preference_path,
+        preferred_renderer,
+        use_wgpu,
+        renderer_preferences::GPU_SUPPORTED,
+        renderer_preferences::gpu_startup_failed(),
+    );
+    app.global::<ZoomApi>()
+        .on_resolve(|action, current, minimum, maximum| {
+            crate::preview_controls::zoom(&action, current, minimum, maximum)
+        });
+    theme::register_theme_utilities(&app);
+    app.set_print_supported(!cfg!(mobile));
+    // Every host provides a document provider now: desktop dialogs on desktop,
+    // the system picker on mobile. The document entry points (compose
+    // attachments, account backups, database snapshots) stay available.
+    app.set_document_apis_supported(true);
+    // A sign-in launch stays hidden only when the user keeps the app running
+    // with its window closed and has a way back to it; otherwise the window
+    // opens. So does a launch for a click on a notification: a button needs
+    // no window, and a click on the notification itself shows it.
+    #[cfg(desktop)]
+    let start_hidden = (background_launch || notifications::launched_for_click())
+        && startup_presentation.close_to_tray
+        && window_controller::can_start_hidden(&runtime);
+    #[cfg(mobile)]
+    let start_hidden = false;
+    if start_hidden {
+        startup_metrics.emit("started_in_tray", serde_json::Value::Null);
+    } else {
+        renderer_preferences::initialize_step(use_wgpu, || app.show())?;
+        startup_metrics.emit(
+            "window_shown",
+            serde_json::json!({
+                "renderer": if use_wgpu { "wgpu" } else { "software" },
+                "slint_backend": std::env::var("SLINT_BACKEND").ok(),
+                "display": std::env::var("DISPLAY").ok(),
+                "wayland_display": std::env::var("WAYLAND_DISPLAY").ok(),
+            }),
+        );
+    }
+    startup_metrics.schedule_rendered_frame(app.as_weak(), "first_frame");
+    let favicon_wake = UiWake::new(app.as_weak(), |app| app.invoke_drain_favicon_updates());
+    let profile_avatar_wake = UiWake::new(app.as_weak(), |app| {
+        app.invoke_drain_profile_avatar_updates()
+    });
+    let resource_wake = UiWake::new(app.as_weak(), |app| app.invoke_refresh_email_resources());
+    let (favicon_raw_tx, favicon_rx) = bounded_ui_channel();
+    let favicon_tx = UiSender::new(favicon_raw_tx, favicon_wake);
+    let (profile_avatar_raw_tx, profile_avatar_rx) = bounded_ui_channel();
+    let profile_avatar_tx = UiSender::new(profile_avatar_raw_tx, profile_avatar_wake);
+
+    spelling::install(
+        &runtime,
+        &platform.paths.cache_dir,
+        platform.spelling.clone(),
+    );
+    let profile_avatar_loader = if benchmark_disable_background {
+        None
+    } else {
+        match ProfileAvatarLoader::new(&platform.paths.cache_dir) {
+            Ok(loader) => Some(loader),
+            Err(error) => {
+                eprintln!("account avatars unavailable: {error}");
+                None
+            }
+        }
+    };
+    let warm_start_cache = WarmStartCacheWriter::spawn(&runtime, platform.paths.warm_start_file());
+    let initial_state = InboxState::empty(
+        None,
+        favicon_tx,
+        profile_avatar_loader,
+        profile_avatar_tx,
+        use_wgpu,
+        false,
+        warm_start_cache,
+    );
+    initial_state
+        .email_renderer
+        .borrow_mut()
+        .set_resource_notifier(Arc::new(move || resource_wake.wake()));
+    if let Err(error) = initial_state
+        .email_renderer
+        .borrow_mut()
+        .configure_resources(runtime.clone(), false)
+    {
+        eprintln!("email images unavailable: {error}");
+    }
+    #[cfg(desktop)]
+    if let Some(value) = std::env::var_os("FLECTAR_PREVIEW_SIZE") {
+        match value.to_str().map(parse_preview_window_size) {
+            Some(Ok(size)) => app.window().set_size(size),
+            Some(Err(error)) => eprintln!("ignoring FLECTAR_PREVIEW_SIZE: {error}"),
+            None => eprintln!("ignoring FLECTAR_PREVIEW_SIZE: value is not valid UTF-8"),
+        }
+    }
+    app.set_compose_from_label(app.global::<I18n>().invoke_no_connected_account());
+    app.set_remote_images_available(cfg!(feature = "remote-content"));
+    app.set_remote_images_enabled(false);
+    app.set_google_oauth_bundled(
+        flectar_mail_core::oauth::providers::has_bundled_credentials(Provider::Gmail),
+    );
+    app.set_microsoft_oauth_bundled(
+        flectar_mail_core::oauth::providers::has_bundled_credentials(Provider::Microsoft),
+    );
+    // A start in the tray needs its icon now; a visible start registers it
+    // once full settings are applied, after the first frame.
+    if start_hidden {
+        app.set_close_to_tray(true);
+    }
+    let tray = create_and_register_window_lifecycle(&app, &runtime)?;
+    #[cfg(desktop)]
+    if let Some(instance) = instance.as_mut() {
+        let app = app.as_weak();
+        instance.serve(&runtime, move |activation| {
+            let _ = app.upgrade_in_event_loop(move |app| {
+                window_controller::activate(&app, activation.activation_token);
+                mailto_links::open(&app, "forwarded", activation.links);
+            });
+        });
+    }
+    // They open once the mail store is ready and the composer connected.
+    #[cfg(desktop)]
+    mailto_links::open(&app, "launch", launch_links.unwrap_or_default());
+    // The launcher's token was meant for this window: it lets the desktop
+    // focus it (Wayland) and ends the launch feedback (X11).
+    #[cfg(desktop)]
+    if !start_hidden && let Some(token) = window_chrome::launch_activation_token() {
+        let weak = app.as_weak();
+        window_controller::when_first_shown(&app, move || {
+            if let Some(app) = weak.upgrade() {
+                window_chrome::focus(&app, Some(token));
+            }
+        });
+    }
+    let email_renderer = Rc::clone(&initial_state.email_renderer);
+
+    let gpu_startup_error = Rc::new(RefCell::new(None::<String>));
+    let gpu_startup_completed = Rc::new(Cell::new(false));
+    #[cfg(feature = "gpu-renderer")]
+    if use_wgpu {
+        let email_renderer_for_notifier = Rc::clone(&email_renderer);
+        let app_weak_for_notifier = app.as_weak();
+        let startup_completed = gpu_startup_completed.clone();
+        let mut reported_device = false;
+        let mut email_gpu_unavailable = None::<String>;
+        app.window()
+            .set_rendering_notifier(move |state, graphics_api| {
+                if matches!(&state, slint::RenderingState::RenderingTeardown) {
+                    email_renderer_for_notifier.borrow_mut().teardown_gpu();
+                    reported_device = false;
+                    email_gpu_unavailable = None;
+                    return;
+                }
+
+                let slint::RenderingState::BeforeRendering = &state else {
+                    return;
+                };
+                let slint::GraphicsAPI::WGPU30 { device, queue, .. } = graphics_api else {
+                    return;
+                };
+                if !reported_device {
+                    let initialized = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        email_renderer_for_notifier.borrow_mut().initialize_gpu(device, queue)
+                    })).unwrap_or_else(|_| Err("GPU initialization panicked".into()));
+                    let info = device.adapter_info();
+                    if let Err(error) = initialized {
+                        email_renderer_for_notifier.borrow_mut().teardown_gpu();
+                        eprintln!("FLECTAR_RENDERER {}", serde_json::json!({
+                            "event": "email_gpu_init_fallback", "slint": "femtovg-wgpu",
+                            "blitz": "vello-cpu", "error": error.clone(),
+                        }));
+                        email_gpu_unavailable = Some(error);
+                    }
+                    eprintln!("FLECTAR_RENDERER {}", serde_json::json!({
+                        "event": "gpu_ready", "wgpu_version": 30,
+                        "backend": format!("{:?}", info.backend), "adapter": info.name,
+                        "device_type": format!("{:?}", info.device_type),
+                        "wgpu_initialized": true, "instance_owner": "slint",
+                        "shared_device": email_renderer_for_notifier.borrow().shares_gpu(device, queue),
+                        "slint": "femtovg-wgpu",
+                        "blitz": if email_gpu_unavailable.is_some() { "vello-cpu" } else { "vello-gpu" },
+                    }));
+                    reported_device = true;
+                    startup_completed.set(true);
+                }
+                // A Vello pipeline failure must degrade only the email body,
+                // never terminate the application event loop. Keep Slint's
+                // working WGPU shell and render mail tiles in software.
+                if email_gpu_unavailable.is_none()
+                    && email_renderer_for_notifier.borrow().has_document()
+                    && !email_renderer_for_notifier
+                        .borrow()
+                        .prefers_software_rendering()
+                {
+                    let initialized = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        email_renderer_for_notifier.borrow_mut().initialize_gpu(device, queue)
+                    })).unwrap_or_else(|_| Err("GPU initialization panicked".into()));
+                    if let Err(error) = initialized {
+                        email_renderer_for_notifier.borrow_mut().teardown_gpu();
+                        email_gpu_unavailable = Some(error);
+                    }
+                }
+                let Some(app) = app_weak_for_notifier.upgrade() else {
+                    return;
+                };
+
+                let logical_width = app.get_email_viewport_width();
+                let logical_height = app.get_email_viewport_height();
+                let scale_factor = app.window().scale_factor();
+                let complex_message = email_renderer_for_notifier
+                    .borrow()
+                    .prefers_software_rendering();
+                if complex_message || email_gpu_unavailable.is_some() {
+                    let fallback = email_renderer_for_notifier
+                        .borrow_mut()
+                        .render_cpu_if_needed(
+                            logical_width.max(1.0).ceil() as u32,
+                            logical_height.max(1.0).ceil() as u32,
+                            scale_factor,
+                        );
+                    match fallback {
+                        Ok(Some(frame)) => {
+                            apply_cpu_frame(&app, frame);
+                            sync_reader_metadata(&app, &email_renderer_for_notifier);
+                            if complex_message {
+                                app.set_render_status(UiMessage::plain(
+                                    "Large message rendered in compatibility mode.",
+                                ));
+                            } else if let Some(error) = email_gpu_unavailable.as_ref() {
+                                app.set_render_status(UiMessage::detail(
+                                    "Rendered with software fallback after GPU error: {}",
+                                    error,
+                                ));
+                            }
+                        }
+                        Ok(None) => {
+                            sync_reader_metadata(&app, &email_renderer_for_notifier);
+                        }
+                        Err(cpu_error) => {
+                            app.global::<EmailReader>()
+                                .set_notice(cpu_error.clone().into());
+                            clear_reader_projection(&app);
+                            app.set_text_mode(true);
+                            app.set_render_status(UiMessage::detail(
+                                "Software email render failed: {}",
+                                cpu_error,
+                            ));
+                        }
+                    }
+                    return;
+                }
+                let result = email_renderer_for_notifier.borrow_mut().render_if_needed(
+                    device,
+                    queue,
+                    logical_width,
+                    logical_height,
+                    scale_factor,
+                );
+                match result {
+                    Ok(Some(frame)) => {
+                        apply_gpu_frame(&app, frame);
+                        sync_reader_metadata(&app, &email_renderer_for_notifier);
+                    }
+                    Ok(None) => {}
+                    Err(gpu_error) => {
+                        eprintln!("FLECTAR_RENDERER {}", serde_json::json!({
+                            "event": "email_render_fallback", "slint": "femtovg-wgpu",
+                            "blitz": "vello-cpu", "error": gpu_error,
+                        }));
+                        let fallback = email_renderer_for_notifier
+                            .borrow_mut()
+                            .render_cpu_if_needed(
+                                logical_width.max(1.0).ceil() as u32,
+                                logical_height.max(1.0).ceil() as u32,
+                                scale_factor,
+                            );
+                        match fallback {
+                            Ok(Some(frame)) => {
+                                apply_cpu_frame(&app, frame);
+                                sync_reader_metadata(&app, &email_renderer_for_notifier);
+                                app.set_render_status(UiMessage::detail(
+                                    "Rendered with software fallback after GPU error: {}",
+                                    gpu_error,
+                                ));
+                            }
+                            Ok(None) => {
+                                sync_reader_metadata(&app, &email_renderer_for_notifier);
+                            }
+                            Err(cpu_error) => {
+                                app.global::<EmailReader>()
+                                    .set_notice(cpu_error.clone().into());
+                                clear_reader_projection(&app);
+                                app.set_text_mode(true);
+                                app.set_render_status(UiMessage::arguments(
+                                    "Blitz render failed (GPU: {}; software: {})",
+                                    gpu_error,
+                                    cpu_error,
+                                ));
+                            }
+                        }
+                    }
+                }
+            }).map_err(|error| renderer_preferences::startup_error(error, true))?;
+    }
+
+    app.set_emails(Rc::clone(&initial_state.email_rows).into());
+    app.set_mail_list_entries(Rc::clone(&initial_state.mail_list_entries).into());
+    app.set_thread_messages(Rc::clone(&initial_state.conversation_rows).into());
+    app.set_sidebar_rows(Rc::clone(&initial_state.sidebar_rows).into());
+    let state = Rc::new(RefCell::new(initial_state));
+    let app_language = platform.app_language.clone();
+    let language_state = Rc::downgrade(&state);
+    app.on_app_language_changed(move |mode, selected| {
+        app_language.set(mode.as_str(), selected.as_str());
+        // A folder filter matches standard mailboxes by their names in the
+        // new language too. It runs again on the next event-loop turn,
+        // outside whatever state the caller is holding.
+        let state = language_state.clone();
+        Timer::single_shot(Duration::ZERO, move || {
+            let Some(state) = state.upgrade() else {
+                return;
+            };
+            let filtering = !state.borrow().folder_filter.trim().is_empty();
+            if filtering {
+                refresh_sidebar(&state);
+            }
+        });
+    });
+    mail_work::register(&app, &state, &runtime);
+    move_picker::register(&app, &state, &runtime);
+    files_controller::register(
+        &app,
+        &state,
+        &runtime,
+        platform.documents.clone(),
+        platform.paths.temp_dir(),
+    );
+
+    attachment_controller::register(&app, &state, &runtime, platform.documents.clone());
+
+    let state_for_mail_drag = Rc::clone(&state);
+    app.global::<MailDragApi>()
+        .on_make_transfer(move |message_id, account_id| {
+            let items = {
+                let state = state_for_mail_drag.borrow();
+                mail_operation_ids(&state.messages, &state.checked_ids, message_id)
+                    .into_iter()
+                    .map(|id| {
+                        state
+                            .messages
+                            .iter()
+                            .find(|message| message.id == id)
+                            .map(|message| MailDragItem {
+                                message_id: message.id,
+                                account_id: i32::try_from(message.account_id).unwrap_or(-1),
+                            })
+                            .unwrap_or(MailDragItem {
+                                message_id: id,
+                                account_id,
+                            })
+                    })
+                    .collect()
+            };
+            let mut transfer = DataTransfer::default();
+            transfer.set_user_data(Rc::new(MailDragPayload { items }));
+            transfer
+        });
+    let state_for_mail_drop_check = Rc::clone(&state);
+    app.global::<MailDragApi>().on_can_drop_on_mailbox(
+        move |data, target_scope, target_account_id, target_folder_id| {
+            let (Some(payload), Ok(target_scope)) =
+                (mail_drag_payload(&data), target_scope.parse::<Scope>())
+            else {
+                return false;
+            };
+            resolve_mail_drop(
+                &state_for_mail_drop_check.borrow(),
+                &payload,
+                target_scope,
+                target_account_id,
+                target_folder_id,
+            )
+            .is_ok()
+        },
+    );
+    let app_for_mail_drop = app.as_weak();
+    let state_for_mail_drop = Rc::clone(&state);
+    let runtime_for_mail_drop = runtime.clone();
+    app.global::<MailDragApi>().on_drop_on_mailbox(
+        move |data, target_scope, target_account_id, target_folder_id| {
+            let Some(app) = app_for_mail_drop.upgrade() else {
+                return false;
+            };
+            let Some(payload) = mail_drag_payload(&data) else {
+                app.set_render_status(UiMessage::detail(
+                    "Message action failed: {}",
+                    "invalid drag payload",
+                ));
+                return false;
+            };
+            let Ok(target_scope) = target_scope.parse::<Scope>() else {
+                app.set_render_status(UiMessage::detail(
+                    "Message action failed: {}",
+                    "invalid mailbox destination",
+                ));
+                return false;
+            };
+            match perform_mail_drop(
+                &app,
+                &state_for_mail_drop,
+                &runtime_for_mail_drop,
+                &payload,
+                target_scope,
+                target_account_id,
+                target_folder_id,
+            ) {
+                Ok(()) => true,
+                Err(error) => {
+                    app.set_render_status(UiMessage::detail("Message action failed: {}", error));
+                    false
+                }
+            }
+        },
+    );
+
+    let contact_state = Rc::new(RefCell::new(ContactDirectoryState::new(Vec::new(), false)));
+    app.set_contacts(Rc::clone(&contact_state.borrow().rows).into());
+    app.set_contact_sidebar_rows(Rc::clone(&contact_state.borrow().sidebar_rows).into());
+    let sidebar_contacts = Rc::clone(&contact_state);
+    let sidebar_app = app.as_weak();
+    app.on_toggle_contact_section(move |key, open| {
+        let Some(app) = sidebar_app.upgrade() else {
+            return;
+        };
+        {
+            let mut directory = sidebar_contacts.borrow_mut();
+            if open {
+                directory.collapsed_sections.remove(key.as_str());
+            } else {
+                directory.collapsed_sections.insert(key.to_string());
+            }
+        }
+        contacts::refresh_contact_sidebar(&app, &sidebar_contacts);
+    });
+    let contacts_loaded = Rc::new(Cell::new(false));
+    let contacts_loading = Rc::new(Cell::new(false));
+    apply_contact_directory(&app, &contact_state);
+
+    // Contact pages use the same bounded worker-to-UI handoff as mail. The
+    // generation discards a stale search/scope result without ever replacing
+    // the retained Slint model.
+    let contact_load_generation = Rc::new(Cell::new(0_u64));
+    let (contact_load_raw_tx, contact_load_rx) = bounded_ui_channel::<ContactLoadUpdate>();
+    let contact_load_tx = UiSender::new(
+        contact_load_raw_tx,
+        UiWake::new(app.as_weak(), |app| app.invoke_drain_contact_load_updates()),
+    );
+    let contact_load_rx = Rc::new(RefCell::new(contact_load_rx));
+    let contact_load_app = app.as_weak();
+    let contact_load_state = Rc::clone(&contact_state);
+    let contact_load_loaded = Rc::clone(&contacts_loaded);
+    let contact_load_loading = Rc::clone(&contacts_loading);
+    let contact_load_generation_for_result = Rc::clone(&contact_load_generation);
+    app.on_drain_contact_load_updates(move || {
+        while let Ok(update) = contact_load_rx.borrow_mut().try_recv() {
+            if update.generation != contact_load_generation_for_result.get() {
+                continue;
+            }
+            let Some(app) = contact_load_app.upgrade() else {
+                return;
+            };
+            let is_current = {
+                let directory = contact_load_state.borrow();
+                directory.scope == update.scope
+                    && directory.query == update.query
+                    && (update.cursor.is_none()
+                        || directory.next_cursor.as_ref() == update.cursor.as_ref())
+            };
+            if !is_current {
+                continue;
+            }
+
+            contact_load_loading.set(false);
+            app.set_contact_loading_more(false);
+            match update.result {
+                Ok(page) => {
+                    {
+                        let mut directory = contact_load_state.borrow_mut();
+                        if update.cursor.is_none() {
+                            directory.photos.clear();
+                        }
+                        for (hash, images) in update.photos {
+                            let image = |data: FaviconImage| {
+                                Image::from_rgba8(
+                                    SharedPixelBuffer::<Rgba8Pixel>::clone_from_slice(
+                                        &data.pixels,
+                                        data.width,
+                                        data.height,
+                                    ),
+                                )
+                            };
+                            directory
+                                .photos
+                                .insert(hash, (image(images.small), image(images.regular)));
+                        }
+                    }
+                    if contact_load_state
+                        .borrow_mut()
+                        .apply_core_page(update.cursor.as_ref(), page)
+                    {
+                        contact_load_loaded.set(true);
+                        app.set_contact_save_status(UiMessage::EMPTY);
+                        apply_contact_directory(&app, &contact_load_state);
+                        app.set_contact_list_revision(
+                            app.get_contact_list_revision().wrapping_add(1),
+                        );
+                    }
+                }
+                Err(error) => {
+                    if update.cursor.is_none() {
+                        contact_load_loaded.set(false);
+                    }
+                    app.set_contact_save_status(UiMessage::detail(
+                        "Could not load contacts: {}",
+                        error,
+                    ));
+                }
+            }
+        }
+    });
+
+    let app_weak = app.as_weak();
+    let contacts_for_select = Rc::clone(&contact_state);
+    app.on_select_contact(move |id| {
+        let Some(app) = app_weak.upgrade() else {
+            return;
+        };
+        let mut directory = contacts_for_select.borrow_mut();
+        directory.selected_id = Some(i64::from(id));
+        directory.editing_new = false;
+        drop(directory);
+        app.set_contact_save_status(UiMessage::EMPTY);
+        apply_contact_directory(&app, &contacts_for_select);
+    });
+
+    let app_weak = app.as_weak();
+    let contacts_for_search = Rc::clone(&contact_state);
+    let inbox_for_contact_search = Rc::clone(&state);
+    let runtime_for_contact_search = runtime.clone();
+    let contact_load_tx_for_search = contact_load_tx.clone();
+    let contact_load_generation_for_search = Rc::clone(&contact_load_generation);
+    let contacts_loading_for_search = Rc::clone(&contacts_loading);
+    app.on_search_contacts(move |query| {
+        let Some(app) = app_weak.upgrade() else {
+            return;
+        };
+        let query = query.to_string();
+        if !contacts_for_search.borrow().using_core {
+            let mut directory = contacts_for_search.borrow_mut();
+            directory.query = query;
+            directory.page = 1;
+            drop(directory);
+            apply_contact_directory(&app, &contacts_for_search);
+            return;
+        }
+        let Some(core) = inbox_for_contact_search.borrow().core.clone() else {
+            return;
+        };
+        let (scope, generation) = {
+            let mut directory = contacts_for_search.borrow_mut();
+            directory.query = query.clone();
+            directory.begin_core_query();
+            let generation = contact_load_generation_for_search.get().wrapping_add(1);
+            contact_load_generation_for_search.set(generation);
+            (directory.scope.clone(), generation)
+        };
+        contacts_loading_for_search.set(true);
+        app.set_contact_loading_more(true);
+        app.set_contact_save_status(UiMessage::plain("Loading contacts…"));
+        apply_contact_directory(&app, &contacts_for_search);
+        spawn_contact_page(
+            &runtime_for_contact_search,
+            core,
+            contact_load_tx_for_search.clone(),
+            scope,
+            query,
+            None,
+            generation,
+        );
+    });
+
+    let app_weak = app.as_weak();
+    let contacts_for_scope = Rc::clone(&contact_state);
+    let inbox_for_contact_scope = Rc::clone(&state);
+    let runtime_for_contact_scope = runtime.clone();
+    let contact_load_tx_for_scope = contact_load_tx.clone();
+    let contact_load_generation_for_scope = Rc::clone(&contact_load_generation);
+    let contacts_loading_for_scope = Rc::clone(&contacts_loading);
+    app.on_select_contact_scope(move |scope| {
+        let Some(app) = app_weak.upgrade() else {
+            return;
+        };
+        let scope = match scope.as_str() {
+            "Favorites" => "Favorites".to_owned(),
+            "Suggestions" => "Suggestions".to_owned(),
+            value if value.starts_with("Account:") => value.to_owned(),
+            _ => "All contacts".to_owned(),
+        };
+        if !contacts_for_scope.borrow().using_core {
+            let mut directory = contacts_for_scope.borrow_mut();
+            directory.scope = scope;
+            directory.page = 1;
+            directory.editing_new = false;
+            drop(directory);
+            apply_contact_directory(&app, &contacts_for_scope);
+            return;
+        }
+        let Some(core) = inbox_for_contact_scope.borrow().core.clone() else {
+            return;
+        };
+        let (query, generation) = {
+            let mut directory = contacts_for_scope.borrow_mut();
+            directory.scope = scope.clone();
+            directory.begin_core_query();
+            let generation = contact_load_generation_for_scope.get().wrapping_add(1);
+            contact_load_generation_for_scope.set(generation);
+            (directory.query.clone(), generation)
+        };
+        contacts_loading_for_scope.set(true);
+        app.set_contact_loading_more(true);
+        app.set_contact_save_status(UiMessage::plain("Loading contacts…"));
+        apply_contact_directory(&app, &contacts_for_scope);
+        spawn_contact_page(
+            &runtime_for_contact_scope,
+            core,
+            contact_load_tx_for_scope.clone(),
+            scope,
+            query,
+            None,
+            generation,
+        );
+    });
+
+    let app_weak = app.as_weak();
+    let contacts_for_more = Rc::clone(&contact_state);
+    let inbox_for_contact_more = Rc::clone(&state);
+    let runtime_for_contact_more = runtime.clone();
+    let contact_load_tx_for_more = contact_load_tx.clone();
+    let contact_load_generation_for_more = Rc::clone(&contact_load_generation);
+    let contacts_loading_for_more = Rc::clone(&contacts_loading);
+    app.on_load_more_contacts(move || {
+        let Some(app) = app_weak.upgrade() else {
+            return;
+        };
+        if !contacts_for_more.borrow().using_core {
+            let mut directory = contacts_for_more.borrow_mut();
+            directory.page = directory.page.saturating_add(1);
+            drop(directory);
+            apply_contact_rows(&app, &contacts_for_more);
+            app.set_contact_list_revision(app.get_contact_list_revision().wrapping_add(1));
+            return;
+        }
+        if contacts_loading_for_more.replace(true) {
+            return;
+        }
+        let Some(core) = inbox_for_contact_more.borrow().core.clone() else {
+            contacts_loading_for_more.set(false);
+            return;
+        };
+        let (scope, query, cursor) = {
+            let directory = contacts_for_more.borrow();
+            (
+                directory.scope.clone(),
+                directory.query.clone(),
+                directory.next_cursor.clone(),
+            )
+        };
+        let Some(cursor) = cursor else {
+            contacts_loading_for_more.set(false);
+            return;
+        };
+        app.set_contact_loading_more(true);
+        spawn_contact_page(
+            &runtime_for_contact_more,
+            core,
+            contact_load_tx_for_more.clone(),
+            scope,
+            query,
+            Some(cursor),
+            contact_load_generation_for_more.get(),
+        );
+    });
+
+    let app_weak = app.as_weak();
+    let contacts_for_new = Rc::clone(&contact_state);
+    let inbox_for_new_contact = Rc::clone(&state);
+    let runtime_for_new_contact = runtime.clone();
+    app.on_new_contact(move || {
+        let Some(app) = app_weak.upgrade() else {
+            return;
+        };
+        let mut directory = contacts_for_new.borrow_mut();
+        directory.selected_id = None;
+        directory.editing_new = true;
+        drop(directory);
+        clear_contact_form(&app);
+        if let Some(account_id) = contacts_for_new
+            .borrow()
+            .scope
+            .strip_prefix("Account:")
+            .and_then(|id| id.parse().ok())
+            && let Some(core) = inbox_for_new_contact.borrow().core.clone()
+            && let Ok(Some(destination)) =
+                runtime_for_new_contact.block_on(core.contact_destination(account_id))
+        {
+            app.set_contact_source(destination.into());
+        }
+        app.set_contact_has_selection(true);
+        app.set_contact_save_status(UiMessage::plain(
+            "Enter a name, email address, or phone number, then save.",
+        ));
+        apply_contact_rows(&app, &contacts_for_new);
+    });
+
+    app.on_usable_contact_email(|email| flectar_mail_core::carddav::vcard::usable_email(&email));
+    let values_app = app.as_weak();
+    app.on_add_contact_value(move |kind| {
+        let Some(app) = values_app.upgrade() else {
+            return;
+        };
+        let model = if kind == "email" {
+            app.get_contact_emails()
+        } else {
+            app.get_contact_phones()
+        };
+        if let Some(rows) = model.as_any().downcast_ref::<VecModel<ContactValueRow>>() {
+            rows.push(ContactValueRow::default());
+        }
+    });
+    let values_app = app.as_weak();
+    app.on_remove_contact_value(move |kind, index| {
+        let Some(app) = values_app.upgrade() else {
+            return;
+        };
+        let model = if kind == "email" {
+            app.get_contact_emails()
+        } else {
+            app.get_contact_phones()
+        };
+        if let Some(rows) = model.as_any().downcast_ref::<VecModel<ContactValueRow>>()
+            && index >= 0
+            && (index as usize) < rows.row_count()
+        {
+            rows.remove(index as usize);
+        }
+    });
+
+    let values_app = app.as_weak();
+    app.on_prefer_contact_value(move |kind, index| {
+        let Some(app) = values_app.upgrade() else {
+            return;
+        };
+        let model = if kind == "email" {
+            app.get_contact_emails()
+        } else {
+            app.get_contact_phones()
+        };
+        if index < 0 || index as usize >= model.row_count() {
+            return;
+        }
+        for row in 0..model.row_count() {
+            if let Some(mut value) = model.row_data(row) {
+                value.preference = if row == index as usize { 1 } else { 100 };
+                model.set_row_data(row, value);
+            }
+        }
+    });
+
+    let conflict_app = app.as_weak();
+    let conflict_contacts = Rc::clone(&contact_state);
+    let conflict_inbox = Rc::clone(&state);
+    let conflict_runtime = runtime.clone();
+    let conflict_loaded = Rc::clone(&contacts_loaded);
+    app.on_resolve_contact_conflict(move |keep_local| {
+        let Some(app) = conflict_app.upgrade() else {
+            return;
+        };
+        let selected = {
+            let state = conflict_contacts.borrow();
+            state
+                .selected_id
+                .and_then(|id| state.contacts.iter().find(|c| c.id == id))
+                .cloned()
+        };
+        let Some(contact) = selected else {
+            return;
+        };
+        let Some(core) = conflict_inbox.borrow().core.clone() else {
+            return;
+        };
+        match conflict_runtime.block_on(core.resolve_contact_conflict(
+            contact.id,
+            contact.details.revision,
+            keep_local,
+        )) {
+            Ok(()) => {
+                conflict_loaded.set(false);
+                app.invoke_load_contacts();
+            }
+            Err(error) => {
+                app.set_contact_save_status(UiMessage::detail("Could not save contact: {}", error))
+            }
+        }
+    });
+
+    let app_weak = app.as_weak();
+    let contacts_for_save = Rc::clone(&contact_state);
+    let inbox_for_contact_save = Rc::clone(&state);
+    let runtime_for_save = runtime.clone();
+    let contact_load_tx_for_save = contact_load_tx.clone();
+    let contact_load_generation_for_save = Rc::clone(&contact_load_generation);
+    let contacts_loading_for_save = Rc::clone(&contacts_loading);
+    app.on_save_contact(
+        move |id,
+              name,
+              company,
+              job_title,
+              website,
+              birthday,
+              address,
+              notes,
+              tags,
+              favorite| {
+            let Some(app) = app_weak.upgrade() else {
+                return;
+            };
+            let previous = contacts_for_save
+                .borrow()
+                .contacts
+                .iter()
+                .find(|contact| contact.id == i64::from(id))
+                .cloned();
+            let promoting_suggestion = previous
+                .as_ref()
+                .is_some_and(|contact| !contact.is_managed);
+            let new_contact_accounts = contacts_for_save
+                .borrow()
+                .scope
+                .strip_prefix("Account:")
+                .and_then(|value| value.parse::<i64>().ok())
+                .into_iter()
+                .collect::<Vec<_>>();
+            let mut record = ContactRecord {
+                details: previous
+                    .as_ref()
+                    .map(|c| c.details.clone())
+                    .unwrap_or_default(),
+                id: i64::from(id),
+                name: name.trim().to_owned(),
+                email: String::new(),
+                phone: String::new(),
+                company: company.trim().to_owned(),
+                job_title: job_title.trim().to_owned(),
+                website: website.trim().to_owned(),
+                birthday: birthday.trim().to_owned(),
+                postal_address: address.trim().to_owned(),
+                notes: notes.trim().to_owned(),
+                tags: tags.trim().to_owned(),
+                is_favorite: favorite,
+                interactions: previous.as_ref().map_or(0, |contact| contact.interactions),
+                last_interacted: previous
+                    .as_ref()
+                    .and_then(|contact| contact.last_interacted),
+                account_ids: previous
+                    .as_ref()
+                    .map(|contact| contact.account_ids.clone())
+                    .unwrap_or(new_contact_accounts),
+                is_managed: true,
+            };
+            record.details.emails = contacts::contact_values(app.get_contact_emails());
+            record.details.phones = contacts::contact_values(app.get_contact_phones());
+            record.refresh_primary_values();
+            let using_core = contacts_for_save.borrow().using_core;
+            let core = if using_core {
+                let Some(core) = inbox_for_contact_save.borrow().core.clone() else {
+                    app.set_contact_save_status(UiMessage::plain(
+                        "Could not save: contact storage is unavailable.",
+                    ));
+                    return;
+                };
+                Some(core)
+            } else {
+                None
+            };
+            let saved = if let Some(core) = core.as_ref() {
+                match runtime_for_save.block_on(core.save_contact(record)) {
+                    Ok(saved) => saved,
+                    Err(error) => {
+                        app.set_contact_save_status(UiMessage::detail(
+                            "Could not save contact: {}",
+                            error,
+                        ));
+                        return;
+                    }
+                }
+            } else {
+                let mut saved = record;
+                if saved.id <= 0 {
+                    saved.id = contacts_for_save
+                        .borrow()
+                        .contacts
+                        .iter()
+                        .map(|contact| contact.id)
+                        .max()
+                        .unwrap_or(0)
+                        + 1;
+                }
+                saved
+            };
+            if let Some(core) = core {
+                let (scope, query, generation) = {
+                    let mut directory = contacts_for_save.borrow_mut();
+                    if promoting_suggestion {
+                        directory.scope = "All contacts".to_owned();
+                    }
+                    directory.begin_core_query();
+                    directory.selected_id = Some(saved.id);
+                    let generation = contact_load_generation_for_save.get().wrapping_add(1);
+                    contact_load_generation_for_save.set(generation);
+                    (directory.scope.clone(), directory.query.clone(), generation)
+                };
+                contacts_loading_for_save.set(true);
+                app.set_contact_loading_more(true);
+                app.set_contact_save_status(if promoting_suggestion {
+                    UiMessage::plain("Saved to contacts.")
+                } else {
+                    UiMessage::plain("Contact saved.")
+                });
+                apply_contact_directory(&app, &contacts_for_save);
+                spawn_contact_page(
+                    &runtime_for_save,
+                    core,
+                    contact_load_tx_for_save.clone(),
+                    scope,
+                    query,
+                    None,
+                    generation,
+                );
+                return;
+            }
+            let mut directory = contacts_for_save.borrow_mut();
+            if let Some(existing) = directory
+                .contacts
+                .iter_mut()
+                .find(|contact| contact.id == saved.id)
+            {
+                *existing = saved.clone();
+            } else {
+                directory.contacts.push(saved.clone());
+            }
+            directory.selected_id = Some(saved.id);
+            directory.editing_new = false;
+            drop(directory);
+            apply_contact_directory(&app, &contacts_for_save);
+            app.set_contact_save_status(UiMessage::plain("Contact saved."));
+        },
+    );
+
+    let app_weak = app.as_weak();
+    let contacts_for_delete = Rc::clone(&contact_state);
+    let inbox_for_contact_delete = Rc::clone(&state);
+    let runtime_for_delete = runtime.clone();
+    let contact_load_tx_for_delete = contact_load_tx.clone();
+    let contact_load_generation_for_delete = Rc::clone(&contact_load_generation);
+    let contacts_loading_for_delete = Rc::clone(&contacts_loading);
+    app.on_delete_contact(move |id| {
+        let Some(app) = app_weak.upgrade() else {
+            return;
+        };
+        let using_core = contacts_for_delete.borrow().using_core;
+        if using_core {
+            let Some(core) = inbox_for_contact_delete.borrow().core.clone() else {
+                app.set_contact_save_status(UiMessage::plain(
+                    "Could not delete: contact storage is unavailable.",
+                ));
+                return;
+            };
+            let revision = contacts_for_delete
+                .borrow()
+                .contacts
+                .iter()
+                .find(|contact| contact.id == i64::from(id))
+                .map_or(0, |contact| contact.details.revision);
+            if let Err(error) =
+                runtime_for_delete.block_on(core.delete_contact(i64::from(id), revision))
+            {
+                app.set_contact_save_status(UiMessage::detail(
+                    "Could not delete contact: {}",
+                    error,
+                ));
+                return;
+            }
+            let (scope, query, generation) = {
+                let mut directory = contacts_for_delete.borrow_mut();
+                directory.begin_core_query();
+                let generation = contact_load_generation_for_delete.get().wrapping_add(1);
+                contact_load_generation_for_delete.set(generation);
+                (directory.scope.clone(), directory.query.clone(), generation)
+            };
+            contacts_loading_for_delete.set(true);
+            app.set_contact_loading_more(true);
+            app.set_contact_save_status(UiMessage::plain("Contact deleted."));
+            apply_contact_directory(&app, &contacts_for_delete);
+            spawn_contact_page(
+                &runtime_for_delete,
+                core,
+                contact_load_tx_for_delete.clone(),
+                scope,
+                query,
+                None,
+                generation,
+            );
+            return;
+        }
+        let mut directory = contacts_for_delete.borrow_mut();
+        directory
+            .contacts
+            .retain(|contact| contact.id != i64::from(id));
+        directory.selected_id = None;
+        directory.editing_new = false;
+        drop(directory);
+        apply_contact_directory(&app, &contacts_for_delete);
+        app.set_contact_save_status(UiMessage::plain("Contact deleted."));
+    });
+
+    // Contacts are not part of the launch-critical snapshot. Loading the
+    // directory only when its workspace is opened keeps startup I/O and the
+    // retained Slint model proportional to what the user is actually viewing.
+    let app_weak = app.as_weak();
+    let contacts_for_load = Rc::clone(&contact_state);
+    let contacts_loaded_for_load = Rc::clone(&contacts_loaded);
+    let contacts_loading_for_load = Rc::clone(&contacts_loading);
+    let inbox_for_contact_load = Rc::clone(&state);
+    let runtime_for_contact_load = runtime.clone();
+    let contact_load_tx_for_load = contact_load_tx.clone();
+    let contact_load_generation_for_load = Rc::clone(&contact_load_generation);
+    app.on_load_contacts(move || {
+        if contacts_loaded_for_load.get() || contacts_loading_for_load.replace(true) {
+            return;
+        }
+        let Some(app) = app_weak.upgrade() else {
+            contacts_loading_for_load.set(false);
+            return;
+        };
+        let Some(core) = inbox_for_contact_load.borrow().core.clone() else {
+            contacts_loading_for_load.set(false);
+            app.set_contact_save_status(UiMessage::plain(
+                "Local contact storage is still starting…",
+            ));
+            return;
+        };
+        let (scope, query, generation) = {
+            let mut directory = contacts_for_load.borrow_mut();
+            directory.begin_core_query();
+            let generation = contact_load_generation_for_load.get().wrapping_add(1);
+            contact_load_generation_for_load.set(generation);
+            (directory.scope.clone(), directory.query.clone(), generation)
+        };
+        app.set_contact_loading_more(true);
+        app.set_contact_save_status(UiMessage::plain("Loading contacts…"));
+        apply_contact_directory(&app, &contacts_for_load);
+        spawn_contact_page(
+            &runtime_for_contact_load,
+            core,
+            contact_load_tx_for_load.clone(),
+            scope,
+            query,
+            None,
+            generation,
+        );
+    });
+
+    // The calendar is always backed by the standalone local calendar store.
+    // Provider sync enriches the same store but is never required to use it.
+    let calendar_today = Local::now().date_naive();
+    app.global::<CalendarAgendaNavigation>()
+        .on_index(calendar::agenda_row_index);
+    let calendar_state = Rc::new(RefCell::new(LocalCalendarState::new(calendar_today)));
+    app.set_calendar_sources(Rc::clone(&calendar_state.borrow().source_rows).into());
+    let calendar_editing_event_id = Rc::new(Cell::new(None::<i64>));
+
+    // Counts group their digits the way the UI language does.
+    app.global::<Numbers>()
+        .on_count(|value| number_format::count(u64::try_from(value).unwrap_or(0)).into());
+
+    let app_weak = app.as_weak();
+    let state_for_dates = Rc::clone(&state);
+    let runtime_for_dates = runtime.clone();
+    let calendar_for_dates = Rc::clone(&calendar_state);
+    let contacts_for_dates = Rc::clone(&contact_state);
+    app.on_date_formats_changed(move || {
+        let Some(app) = app_weak.upgrade() else {
+            return;
+        };
+        refresh_message_dates(&app, &state_for_dates, &runtime_for_dates);
+        apply_calendar(
+            &app,
+            &calendar_for_dates.borrow(),
+            Local::now().date_naive(),
+        );
+        apply_contact_rows(&app, &contacts_for_dates);
+        files_controller::refresh_dates(&app);
+    });
+
+    let app_weak = app.as_weak();
+    let calendar_for_navigation = Rc::clone(&calendar_state);
+    let inbox_for_calendar_navigation = Rc::clone(&state);
+    let runtime_for_navigation = runtime.clone();
+    app.on_calendar_navigate(move |scope, direction| {
+        let Some(app) = app_weak.upgrade() else {
+            return;
+        };
+        let today = Local::now().date_naive();
+        let mut calendar = calendar_for_navigation.borrow_mut();
+        calendar.navigate(scope.as_str(), direction);
+        if let Some(core) = inbox_for_calendar_navigation.borrow().core.clone()
+            && let Err(error) = refresh_calendar_events(
+                &core,
+                &runtime_for_navigation,
+                &mut calendar,
+                &inbox_for_calendar_navigation.borrow().connected_accounts,
+            )
+        {
+            app.set_sync_status(UiMessage::detail("Could not load calendar: {}", error));
+        }
+        apply_calendar(&app, &calendar, today);
+        app.set_calendar_agenda_scroll_request(
+            app.get_calendar_agenda_scroll_request().wrapping_add(1),
+        );
+    });
+
+    let app_weak = app.as_weak();
+    let calendar_for_selection = Rc::clone(&calendar_state);
+    let inbox_for_calendar_selection = Rc::clone(&state);
+    let runtime_for_selection = runtime.clone();
+    app.on_calendar_select_date(move |date| {
+        let Some(app) = app_weak.upgrade() else {
+            return;
+        };
+        let Ok(date) = NaiveDate::parse_from_str(date.as_str(), "%Y-%m-%d") else {
+            return;
+        };
+        let today = Local::now().date_naive();
+        let mut calendar = calendar_for_selection.borrow_mut();
+        calendar.selected_date = date;
+        calendar.visible_month = first_of_month(date);
+        if let Some(core) = inbox_for_calendar_selection.borrow().core.clone()
+            && let Err(error) = refresh_calendar_events(
+                &core,
+                &runtime_for_selection,
+                &mut calendar,
+                &inbox_for_calendar_selection.borrow().connected_accounts,
+            )
+        {
+            app.set_sync_status(UiMessage::detail("Could not load calendar: {}", error));
+        }
+        apply_calendar(&app, &calendar, today);
+        app.set_calendar_agenda_scroll_request(
+            app.get_calendar_agenda_scroll_request().wrapping_add(1),
+        );
+    });
+
+    let app_weak = app.as_weak();
+    let calendar_for_view = Rc::clone(&calendar_state);
+    let inbox_for_calendar_view = Rc::clone(&state);
+    let runtime_for_view = runtime.clone();
+    app.on_calendar_set_view(move |view| {
+        let Some(app) = app_weak.upgrade() else {
+            return;
+        };
+        let today = Local::now().date_naive();
+        let mut calendar = calendar_for_view.borrow_mut();
+        calendar.set_view(view.as_str());
+        if let Some(core) = inbox_for_calendar_view.borrow().core.clone()
+            && let Err(error) = refresh_calendar_events(
+                &core,
+                &runtime_for_view,
+                &mut calendar,
+                &inbox_for_calendar_view.borrow().connected_accounts,
+            )
+        {
+            app.set_sync_status(UiMessage::detail("Could not load calendar: {}", error));
+        }
+        apply_calendar(&app, &calendar, today);
+        app.set_calendar_agenda_scroll_request(
+            app.get_calendar_agenda_scroll_request().wrapping_add(1),
+        );
+    });
+
+    let app_weak = app.as_weak();
+    let calendar_for_filter = Rc::clone(&calendar_state);
+    app.on_calendar_toggle_agenda_filter(move |id, checked| {
+        let Some(app) = app_weak.upgrade() else {
+            return;
+        };
+        let mut calendar = calendar_for_filter.borrow_mut();
+        if checked {
+            calendar.agenda_hidden.remove(&i64::from(id));
+        } else {
+            calendar.agenda_hidden.insert(i64::from(id));
+        }
+        calendar::apply_agenda(
+            &app,
+            &calendar,
+            Local::now().date_naive(),
+            Local::now().time(),
+        );
+    });
+    let app_weak = app.as_weak();
+    let calendar_for_clear_filter = Rc::clone(&calendar_state);
+    app.on_calendar_clear_agenda_filters(move || {
+        let Some(app) = app_weak.upgrade() else {
+            return;
+        };
+        let mut calendar = calendar_for_clear_filter.borrow_mut();
+        calendar.agenda_hidden.clear();
+        calendar::apply_agenda(
+            &app,
+            &calendar,
+            Local::now().date_naive(),
+            Local::now().time(),
+        );
+    });
+
+    let app_weak = app.as_weak();
+    let calendar_for_source_toggle = Rc::clone(&calendar_state);
+    let inbox_for_source_toggle = Rc::clone(&state);
+    let runtime_for_source_toggle = runtime.clone();
+    app.on_calendar_set_source_enabled(move |calendar_id, enabled| {
+        let Some(app) = app_weak.upgrade() else {
+            return;
+        };
+        let Some(core) = inbox_for_source_toggle.borrow().core.clone() else {
+            return;
+        };
+        match runtime_for_source_toggle
+            .block_on(core.set_calendar_enabled(i64::from(calendar_id), enabled))
+        {
+            Ok(()) => {
+                app.set_sync_status(if enabled {
+                    UiMessage::plain("Calendar shown and syncing.")
+                } else {
+                    UiMessage::plain("Calendar hidden and sync paused.")
+                });
+                let today = Local::now().date_naive();
+                let mut calendar = calendar_for_source_toggle.borrow_mut();
+                let _ = refresh_calendar_events(
+                    &core,
+                    &runtime_for_source_toggle,
+                    &mut calendar,
+                    &inbox_for_source_toggle.borrow().connected_accounts,
+                );
+                apply_calendar(&app, &calendar, today);
+            }
+            Err(error) => {
+                app.set_sync_status(UiMessage::detail("Calendar update failed: {}", error))
+            }
+        }
+    });
+
+    let app_weak = app.as_weak();
+    let calendar_for_today = Rc::clone(&calendar_state);
+    let inbox_for_calendar_today = Rc::clone(&state);
+    let runtime_for_today = runtime.clone();
+    app.on_calendar_today(move || {
+        let Some(app) = app_weak.upgrade() else {
+            return;
+        };
+        let today = Local::now().date_naive();
+        let mut calendar = calendar_for_today.borrow_mut();
+        calendar.selected_date = today;
+        calendar.visible_month = first_of_month(today);
+        if let Some(core) = inbox_for_calendar_today.borrow().core.clone()
+            && let Err(error) = refresh_calendar_events(
+                &core,
+                &runtime_for_today,
+                &mut calendar,
+                &inbox_for_calendar_today.borrow().connected_accounts,
+            )
+        {
+            app.set_sync_status(UiMessage::detail("Could not load calendar: {}", error));
+        }
+        apply_calendar(&app, &calendar, today);
+        app.set_calendar_agenda_scroll_request(
+            app.get_calendar_agenda_scroll_request().wrapping_add(1),
+        );
+    });
+
+    let app_weak = app.as_weak();
+    let calendar_for_editor = Rc::clone(&calendar_state);
+    let editing_event_for_new = Rc::clone(&calendar_editing_event_id);
+    app.on_calendar_open_editor(move || {
+        let Some(app) = app_weak.upgrade() else {
+            return;
+        };
+        let calendar = calendar_for_editor.borrow();
+        editing_event_for_new.set(None);
+        app.set_calendar_event_editing(false);
+        app.set_calendar_event_title("".into());
+        app.set_calendar_event_date(calendar.selected_date.format("%Y-%m-%d").to_string().into());
+        app.set_calendar_event_time(date_format::current().time(9, 0).into());
+        app.set_calendar_event_duration("60".into());
+        app.set_calendar_event_color(0);
+        app.set_calendar_editor_open(true);
+    });
+
+    let app_weak = app.as_weak();
+    let calendar_for_edit = Rc::clone(&calendar_state);
+    let editing_event_for_edit = Rc::clone(&calendar_editing_event_id);
+    app.on_calendar_edit_event(move |event_id| {
+        let Some(app) = app_weak.upgrade() else {
+            return;
+        };
+        let event = calendar_for_edit
+            .borrow()
+            .events
+            .iter()
+            .find(|event| event.id == event_id && event.is_local)
+            .cloned();
+        let Some(event) = event else {
+            app.set_sync_status(UiMessage::plain(
+                "Only events created in Flectar Mail can be edited.",
+            ));
+            return;
+        };
+        editing_event_for_edit.set(Some(i64::from(event.id)));
+        app.set_calendar_event_editing(true);
+        app.set_calendar_event_title(event.title.into());
+        app.set_calendar_event_date(event.date.format("%Y-%m-%d").to_string().into());
+        let start = event.start_minutes.clamp(0, 24 * 60 - 1) as u32;
+        app.set_calendar_event_time(date_format::current().time(start / 60, start % 60).into());
+        app.set_calendar_event_duration(event.duration_minutes.to_string().into());
+        app.set_calendar_event_color(event.color_index);
+        app.set_calendar_editor_open(true);
+    });
+
+    let app_weak = app.as_weak();
+    let calendar_for_answer = Rc::clone(&calendar_state);
+    let runtime_for_calendar_answer = runtime.clone();
+    let inbox_for_calendar_answer = Rc::clone(&state);
+    app.on_calendar_answer_event(move |event_id, response, occurrence| {
+        let Some(app) = app_weak.upgrade() else {
+            return;
+        };
+        let Some(core) = inbox_for_calendar_answer.borrow().core.clone() else {
+            app.set_sync_status(UiMessage::plain("Calendar storage is unavailable."));
+            return;
+        };
+        // An occurrence of a repeating event comes by its RECURRENCE-ID, or
+        // empty for the whole event.
+        let occurrence = occurrence.parse::<i64>().ok();
+        if let Err(error) = runtime_for_calendar_answer.block_on(core.rsvp_event(
+            i64::from(event_id),
+            response.as_str(),
+            occurrence,
+        )) {
+            app.set_sync_status(UiMessage::detail("Could not answer: {}", error));
+        }
+        let today = Local::now().date_naive();
+        let mut calendar = calendar_for_answer.borrow_mut();
+        if let Err(error) = refresh_calendar_events(
+            &core,
+            &runtime_for_calendar_answer,
+            &mut calendar,
+            &inbox_for_calendar_answer.borrow().connected_accounts,
+        ) {
+            app.set_sync_status(UiMessage::detail("Could not load calendar: {}", error));
+        }
+        apply_calendar(&app, &calendar, today);
+    });
+
+    let app_weak = app.as_weak();
+    let calendar_for_delete = Rc::clone(&calendar_state);
+    let runtime_for_calendar_delete = runtime.clone();
+    let inbox_for_calendar_delete = Rc::clone(&state);
+    let editing_event_for_delete = Rc::clone(&calendar_editing_event_id);
+    app.on_calendar_delete_event(move |event_id| {
+        let Some(app) = app_weak.upgrade() else {
+            return;
+        };
+        // Events created here, and cancelled ones from others, which leave
+        // the calendar without telling anyone.
+        let Some(is_local) = calendar_for_delete
+            .borrow()
+            .events
+            .iter()
+            .find(|event| event.id == event_id && (event.is_local || event.cancelled()))
+            .map(|event| event.is_local)
+        else {
+            app.set_sync_status(UiMessage::plain(
+                "Only events created in Flectar Mail can be deleted.",
+            ));
+            return;
+        };
+        let Some(core) = inbox_for_calendar_delete.borrow().core.clone() else {
+            app.set_sync_status(UiMessage::plain("Calendar storage is unavailable."));
+            return;
+        };
+        if let Err(error) =
+            runtime_for_calendar_delete.block_on(core.delete_event(i64::from(event_id)))
+        {
+            app.set_sync_status(UiMessage::detail("Could not delete event: {}", error));
+            return;
+        }
+        if editing_event_for_delete.get() == Some(i64::from(event_id)) {
+            editing_event_for_delete.set(None);
+            app.set_calendar_editor_open(false);
+            app.set_calendar_event_editing(false);
+        }
+        let today = Local::now().date_naive();
+        let mut calendar = calendar_for_delete.borrow_mut();
+        if let Err(error) = refresh_calendar_events(
+            &core,
+            &runtime_for_calendar_delete,
+            &mut calendar,
+            &inbox_for_calendar_delete.borrow().connected_accounts,
+        ) {
+            app.set_sync_status(UiMessage::detail(
+                "Event deleted, but refresh failed: {}",
+                error,
+            ));
+        } else if is_local {
+            app.set_sync_status(UiMessage::plain("Event deleted."));
+        } else {
+            app.set_sync_status(UiMessage::plain("Removed from your calendar."));
+        }
+        apply_calendar(&app, &calendar, today);
+    });
+
+    let app_weak = app.as_weak();
+    let calendar_for_save = Rc::clone(&calendar_state);
+    let runtime_for_calendar_save = runtime.clone();
+    let inbox_for_calendar_save = Rc::clone(&state);
+    let editing_event_for_save = Rc::clone(&calendar_editing_event_id);
+    app.on_calendar_save_event(move |title, date, time, duration, _color| {
+        let Some(app) = app_weak.upgrade() else {
+            return;
+        };
+        let formats = date_format::current();
+        let parsed = NaiveDate::parse_from_str(date.trim(), "%Y-%m-%d").ok().zip(
+            formats
+                .parse_time(&time)
+                .and_then(|(hour, minute)| NaiveTime::from_hms_opt(hour, minute, 0)),
+        );
+        let Some((date, time)) = parsed else {
+            app.set_sync_status(UiMessage::detail(
+                "Use YYYY-MM-DD for the date and a time such as {}.",
+                formats.time(9, 30),
+            ));
+            return;
+        };
+        let Ok(duration) = duration.trim().parse::<i32>() else {
+            app.set_sync_status(UiMessage::plain(
+                "Event duration must be a number of minutes.",
+            ));
+            return;
+        };
+        if title.trim().is_empty() || !(15..=1440).contains(&duration) {
+            app.set_sync_status(UiMessage::plain(
+                "Add a title and choose a duration from 15 to 1440 minutes.",
+            ));
+            return;
+        }
+        let Some(start) = Local.from_local_datetime(&date.and_time(time)).earliest() else {
+            app.set_sync_status(UiMessage::plain(
+                "That local time does not exist in the current time zone.",
+            ));
+            return;
+        };
+        let Some(core) = inbox_for_calendar_save.borrow().core.clone() else {
+            app.set_sync_status(UiMessage::plain("Calendar storage is unavailable."));
+            return;
+        };
+        let starts_at = start.timestamp_millis();
+        let ends_at = (start + ChronoDuration::minutes(i64::from(duration))).timestamp_millis();
+        let editing_event = editing_event_for_save.get().and_then(|event_id| {
+            calendar_for_save
+                .borrow()
+                .events
+                .iter()
+                .find(|event| i64::from(event.id) == event_id && event.is_local)
+                .cloned()
+        });
+        let result = if let Some(event) = editing_event {
+            runtime_for_calendar_save
+                .block_on(core.update_event(UpdateEventArgs {
+                    event_id: i64::from(event.id),
+                    summary: title.trim().to_owned(),
+                    description: (!event.description.is_empty()).then_some(event.description),
+                    location: (!event.location.is_empty()).then_some(event.location),
+                    join_url: (!event.join_url.is_empty()).then_some(event.join_url),
+                    starts_at,
+                    ends_at,
+                    all_day: event.all_day,
+                    attendees: event.attendee_addresses,
+                    notify: false,
+                }))
+                .map(|_| ())
+        } else {
+            let account_id = inbox_for_calendar_save
+                .borrow()
+                .connected_accounts
+                .first()
+                .map(|account| account.id)
+                .unwrap_or(0);
+            runtime_for_calendar_save
+                .block_on(core.create_event(CreateEventArgs {
+                    account_id,
+                    calendar_id: None,
+                    summary: title.trim().to_owned(),
+                    description: None,
+                    location: None,
+                    join_url: None,
+                    starts_at,
+                    ends_at,
+                    all_day: false,
+                    attendees: Vec::new(),
+                }))
+                .map(|_| ())
+        };
+        if let Err(error) = result {
+            app.set_sync_status(UiMessage::detail("Could not save event: {}", error));
+            return;
+        }
+        let today = Local::now().date_naive();
+        let mut calendar = calendar_for_save.borrow_mut();
+        calendar.selected_date = date;
+        calendar.visible_month = first_of_month(date);
+        let refresh_result = refresh_calendar_events(
+            &core,
+            &runtime_for_calendar_save,
+            &mut calendar,
+            &inbox_for_calendar_save.borrow().connected_accounts,
+        );
+        apply_calendar(&app, &calendar, today);
+        editing_event_for_save.set(None);
+        app.set_calendar_event_editing(false);
+        app.set_calendar_editor_open(false);
+        match refresh_result {
+            Ok(()) => app.set_sync_status(UiMessage::plain(
+                "Event saved. Provider sync will run when enabled.",
+            )),
+            Err(error) => app.set_sync_status(UiMessage::detail(
+                "Event saved, but refresh failed: {}",
+                error,
+            )),
+        }
+    });
+
+    // Blitz wakes Slint only when a decoded image/font resource is ready. A
+    // coalesced one-shot gives its message queue time to settle and prevents a
+    // renderer feedback loop; unlike the old repeated timer it has no idle
+    // wakeups.
+    let resource_renderer = Rc::clone(&email_renderer);
+    let resource_app = app.as_weak();
+    let resource_callback_pending = Rc::new(Cell::new(false));
+    app.on_refresh_email_resources(move || {
+        if resource_callback_pending.replace(true) {
+            return;
+        }
+        let renderer = Rc::downgrade(&resource_renderer);
+        let app = resource_app.clone();
+        let pending = Rc::clone(&resource_callback_pending);
+        Timer::single_shot(Duration::from_millis(50), move || {
+            pending.set(false);
+            let Some(renderer) = renderer.upgrade() else {
+                return;
+            };
+            if !renderer.borrow_mut().poll_resources() {
+                return;
+            }
+            let Some(app) = app.upgrade() else {
+                return;
+            };
+            if !use_wgpu {
+                let (width, height) = email_viewport_size(&app);
+                match renderer.borrow_mut().render_cpu_if_needed(
+                    width,
+                    height,
+                    app.window().scale_factor(),
+                ) {
+                    Ok(Some(frame)) => apply_cpu_frame(&app, frame),
+                    Ok(None) => {}
+                    Err(error) => {
+                        app.global::<EmailReader>().set_notice(error.clone().into());
+                        app.set_text_mode(true);
+                        app.set_render_status(UiMessage::detail(
+                            "Email resource render failed: {}",
+                            error,
+                        ));
+                    }
+                }
+            }
+            sync_reader_metadata(&app, &renderer);
+            app.window().request_redraw();
+        });
+    });
+    // Message bodies are fetched lazily by the core. Keep a receiver alive
+    // from startup so opening an uncached rich message cannot miss the event
+    // that replaces its temporary snippet with the real body.
+    let pending_core_updates = Arc::new(Mutex::new(PendingCoreUpdates::default()));
+    let core_updates_wake = UiWake::new(app.as_weak(), |app| app.invoke_drain_core_updates());
+    let device_sync = Rc::new(sync_controller::SyncController::default());
+
+    // Long-running account and OAuth work always stays on Tokio. This bridge
+    // applies only small, already-materialized results on the Slint thread.
+    let (ui_task_raw_tx, ui_task_rx) = bounded_ui_channel::<UiTaskUpdate>();
+    let ui_task_tx = UiSender::new(
+        ui_task_raw_tx,
+        UiWake::new(app.as_weak(), |app| app.invoke_drain_ui_task_updates()),
+    );
+
+    let (message_load_raw_tx, message_load_rx) = bounded_ui_channel::<MessageLoadUpdate>();
+    let message_load_tx = UiSender::new(
+        message_load_raw_tx,
+        UiWake::new(app.as_weak(), |app| app.invoke_drain_message_load_updates()),
+    );
+    // One active read and one replaceable pending selection. Never build a
+    // queue of expanded bodies while the user moves quickly through the list.
+    let (body_requests, body_request_rx) =
+        tokio::sync::watch::channel(None::<(u64, (CoreMailSource, MailMessage, Option<i64>))>);
+    let body_requests = Rc::new(body_requests);
+    let body_generation = Rc::new(Cell::new(0_u64));
+    let body_pending = Rc::new(Cell::new(None::<(i32, Option<i64>, u64)>));
+    let body_updates = message_load_tx.clone();
+    runtime.spawn(latest_load::run(
+        body_request_rx,
+        |(core, row, selected_message_id)| async move {
+            let result = core.load_conversation(&row, selected_message_id).await;
+            (row.id, result)
+        },
+        move |generation, (id, result)| {
+            let updates = body_updates.clone();
+            async move {
+                let _ = updates
+                    .send(MessageLoadUpdate {
+                        generation,
+                        id,
+                        result,
+                    })
+                    .await;
+            }
+        },
+    ));
+    app.global::<EmailReader>()
+        .on_mailbox_text(|name, address| mailbox_text(&name, &address).into());
+    let body_state = Rc::clone(&state);
+    let pending = body_pending.clone();
+    let generation = body_generation.clone();
+    let requests = body_requests.clone();
+    app.global::<EmailReader>().on_ensure_body(move |id| {
+        let load = {
+            let state = body_state.borrow();
+            let selected_row = state
+                .selected_id
+                .and_then(|selected_id| state.messages.iter().find(|row| row.id == selected_id));
+            let request_matches = selected_row.is_some_and(|row| row.id == id)
+                || state
+                    .conversation_messages
+                    .iter()
+                    .any(|message| message.id == id);
+            let selected_message_id = if selected_row.is_some_and(|row| row.id == id) {
+                selected_row.and_then(|row| {
+                    if state.conversation_owner_id == Some(row.id) {
+                        state
+                            .conversation_messages
+                            .get(state.conversation_selected_index)
+                            .map(|message| i64::from(message.id))
+                    } else {
+                        // A restored tab reopens the message it had open.
+                        state
+                            .restore_thread_message
+                            .filter(|(conversation, _)| *conversation == row.id)
+                            .map(|(_, message)| i64::from(message))
+                    }
+                })
+            } else {
+                Some(i64::from(id))
+            };
+            state.core.clone().zip(
+                request_matches
+                    .then(|| selected_row.cloned())
+                    .flatten()
+                    .filter(|row| row.thread_id.is_some())
+                    .map(|row| (row, selected_message_id)),
+            )
+        };
+        if let Some((core, (mut row, selected_message_id))) = load {
+            let request_id = row.id;
+            if pending.get().is_some_and(|(active, message, _)| {
+                active == request_id && message == selected_message_id
+            }) {
+                return;
+            }
+            let next = generation.get().wrapping_add(1);
+            generation.set(next);
+            pending.set(Some((request_id, selected_message_id, next)));
+            row.html = None;
+            row.text = None;
+            requests.send_replace(Some((next, (core, row, selected_message_id))));
+        } else if pending.get().is_some_and(|(active, _, _)| active != id) {
+            generation.set(generation.get().wrapping_add(1));
+            pending.set(None);
+            requests.send_replace(None);
+        }
+    });
+    let (mail_list_raw_tx, mail_list_rx) = bounded_ui_channel::<MailListUpdate>();
+    let mail_list_tx = UiSender::new(
+        mail_list_raw_tx,
+        UiWake::new(app.as_weak(), |app| app.invoke_drain_mail_list_updates()),
+    );
+    let mail_list_rx = Rc::new(RefCell::new(mail_list_rx));
+    let mail_list_refresh_requested = Rc::new(Cell::new(false));
+    let mail_list_refresh_in_progress = Rc::new(Cell::new(false));
+    let mail_pagination_generation = Rc::new(Cell::new(0_u64));
+    let mail_pagination_in_progress = Rc::new(Cell::new(false));
+    let (mail_metadata_raw_tx, mail_metadata_rx) = bounded_ui_channel::<MailMetadataUpdate>();
+    let mail_metadata_tx = UiSender::new(
+        mail_metadata_raw_tx,
+        UiWake::new(app.as_weak(), |app| {
+            app.invoke_drain_mail_metadata_updates()
+        }),
+    );
+    let mail_metadata_rx = Rc::new(RefCell::new(mail_metadata_rx));
+    let mail_metadata_refresh_requested = Rc::new(Cell::new(false));
+    let mail_metadata_refresh_in_progress = Rc::new(Cell::new(false));
+    let (folder_raw_tx, folder_rx) = bounded_ui_channel::<FolderMutationUpdate>();
+    let folder_tx = UiSender::new(
+        folder_raw_tx,
+        UiWake::new(app.as_weak(), |app| app.invoke_drain_folder_updates()),
+    );
+    let folder_rx = Rc::new(RefCell::new(folder_rx));
+    let folder_update_state = Rc::clone(&state);
+    let folder_update_runtime = runtime.clone();
+    let folder_update_app = app.as_weak();
+    app.on_drain_folder_updates(move || {
+        while let Ok(update) = folder_rx.borrow_mut().try_recv() {
+            let Some(app) = folder_update_app.upgrade() else {
+                return;
+            };
+            if let Some(metadata) = update.metadata.filter(|metadata| {
+                snapshot_is_current(&folder_update_state, metadata.account_revision)
+            }) {
+                let mut state = folder_update_state.borrow_mut();
+                // Another mailbox or tab shown since then keeps its place,
+                // unless it is a folder that was just deleted.
+                let shown_removed = matches!(
+                    state.scope,
+                    Scope::Folder(id) if update.removed_folders.contains(&id)
+                );
+                let navigate = shown_removed || state.scope == update.issued_scope;
+                if shown_removed {
+                    state.set_scope(Scope::UNIFIED_INBOX);
+                } else if navigate {
+                    state.set_scope(metadata.scope);
+                }
+                state.set_mail_metadata(metadata);
+                if let Some(parent_id) = update.reveal_parent_id {
+                    state.initialized_sidebar_folders.insert(parent_id);
+                    state.collapsed_folder_ids.remove(&parent_id);
+                }
+                drop(state);
+                // Only leaving a deleted folder starts the list over; the
+                // mailbox the change was made in keeps its rows and position.
+                if !navigate {
+                    refresh_list_metadata(&app, &folder_update_state);
+                } else if let Err(error) = refresh_from_source(
+                    &app,
+                    &folder_update_state,
+                    &folder_update_runtime,
+                    !shown_removed,
+                    &[],
+                ) {
+                    app.set_render_status(UiMessage::detail("Mail refresh failed: {}", error));
+                }
+            }
+            if !update.message.is_empty() {
+                app.set_sync_status(update.message);
+            }
+        }
+    });
+
+    let section_toggle_state = Rc::clone(&state);
+    let section_toggle_app = app.as_weak();
+    app.on_toggle_sidebar_section(move |key, open| {
+        if open {
+            section_toggle_state
+                .borrow_mut()
+                .collapsed_sidebar_sections
+                .remove(key.as_str());
+        } else {
+            section_toggle_state
+                .borrow_mut()
+                .collapsed_sidebar_sections
+                .insert(key.to_string());
+        }
+        let animate = section_toggle_app
+            .upgrade()
+            .is_some_and(|app| app.global::<MotionSettings>().get_movement());
+        refresh_sidebar_with_motion(&section_toggle_state, animate);
+    });
+
+    let folder_toggle_state = Rc::clone(&state);
+    let folder_toggle_app = app.as_weak();
+    app.on_toggle_folder(move |folder_id, expanded| {
+        let folder_id = i64::from(folder_id);
+        if expanded {
+            folder_toggle_state
+                .borrow_mut()
+                .collapsed_folder_ids
+                .remove(&folder_id);
+        } else {
+            folder_toggle_state
+                .borrow_mut()
+                .collapsed_folder_ids
+                .insert(folder_id);
+        }
+        let animate = folder_toggle_app
+            .upgrade()
+            .is_some_and(|app| app.global::<MotionSettings>().get_movement());
+        refresh_sidebar_with_motion(&folder_toggle_state, animate);
+    });
+
+    let folder_filter_state = Rc::clone(&state);
+    app.on_filter_folders(move |query| {
+        folder_filter_state.borrow_mut().folder_filter = query.to_string();
+        refresh_sidebar(&folder_filter_state);
+    });
+
+    let create_folder_state = Rc::clone(&state);
+    let create_folder_runtime = runtime.clone();
+    let create_folder_updates = folder_tx.clone();
+    app.on_create_folder(move |account_id, parent_id, name| {
+        let Some(core) = create_folder_state.borrow().core.clone() else {
+            return;
+        };
+        let scope = create_folder_state.borrow().scope;
+        let updates = create_folder_updates.clone();
+        let name = name.to_string();
+        create_folder_runtime.spawn(async move {
+            let result = core
+                .create_folder(
+                    i64::from(account_id),
+                    (parent_id >= 0).then_some(i64::from(parent_id)),
+                    name,
+                )
+                .await;
+            let metadata = if result.is_ok() {
+                core.load_mail_metadata(scope).await.ok()
+            } else {
+                None
+            };
+            let message = match result {
+                Ok(()) => UiMessage::plain("Folder created."),
+                Err(error) => UiMessage::detail("Could not create folder: {}", error),
+            };
+            let _ = updates
+                .send(FolderMutationUpdate {
+                    message,
+                    metadata,
+                    reveal_parent_id: (parent_id >= 0).then_some(i64::from(parent_id)),
+                    issued_scope: scope,
+                    removed_folders: Vec::new(),
+                })
+                .await;
+        });
+    });
+
+    let rename_folder_state = Rc::clone(&state);
+    let rename_folder_runtime = runtime.clone();
+    let rename_folder_updates = folder_tx.clone();
+    app.on_rename_folder(move |folder_id, name| {
+        let Some(core) = rename_folder_state.borrow().core.clone() else {
+            return;
+        };
+        let scope = rename_folder_state.borrow().scope;
+        let updates = rename_folder_updates.clone();
+        let name = name.to_string();
+        rename_folder_runtime.spawn(async move {
+            let result = core.rename_folder(i64::from(folder_id), name).await;
+            let metadata = if result.is_ok() {
+                core.load_mail_metadata(scope).await.ok()
+            } else {
+                None
+            };
+            let message = match result {
+                Ok(()) => UiMessage::plain("Folder renamed."),
+                Err(error) => UiMessage::detail("Could not rename folder: {}", error),
+            };
+            let _ = updates
+                .send(FolderMutationUpdate {
+                    message,
+                    metadata,
+                    reveal_parent_id: None,
+                    issued_scope: scope,
+                    removed_folders: Vec::new(),
+                })
+                .await;
+        });
+    });
+
+    let delete_folder_state = Rc::clone(&state);
+    let delete_folder_runtime = runtime.clone();
+    let delete_folder_updates = folder_tx;
+    app.on_delete_folder(move |folder_id| {
+        let Some(core) = delete_folder_state.borrow().core.clone() else {
+            return;
+        };
+        let folder_id = i64::from(folder_id);
+        let (current_scope, removed_folders) = {
+            let state = delete_folder_state.borrow();
+            let parents = state
+                .mailboxes
+                .iter()
+                .filter(|mailbox| mailbox.folder_id >= 0)
+                .map(|mailbox| (mailbox.folder_id, mailbox.parent_folder_id))
+                .collect::<HashMap<_, _>>();
+            // The folder and everything under it.
+            let removed_folders = std::iter::once(folder_id)
+                .chain(
+                    parents
+                        .keys()
+                        .copied()
+                        .filter(|&folder| folder != folder_id),
+                )
+                .filter(|&folder| {
+                    let mut candidate = folder;
+                    let mut visited = HashSet::new();
+                    while candidate >= 0 && visited.insert(candidate) {
+                        if candidate == folder_id {
+                            return true;
+                        }
+                        candidate = parents.get(&candidate).copied().unwrap_or(-1);
+                    }
+                    false
+                })
+                .collect::<Vec<_>>();
+            (state.scope, removed_folders)
+        };
+        let selected_folder_is_deleted = matches!(
+            current_scope,
+            Scope::Folder(id) if removed_folders.contains(&id)
+        );
+        let scope = if selected_folder_is_deleted {
+            Scope::UNIFIED_INBOX
+        } else {
+            current_scope
+        };
+        let updates = delete_folder_updates.clone();
+        delete_folder_runtime.spawn(async move {
+            let result = core.delete_folder(folder_id).await;
+            let metadata = if result.is_ok() {
+                core.load_mail_metadata(scope).await.ok()
+            } else {
+                None
+            };
+            let message = match result {
+                Ok(()) => UiMessage::plain("Folder deleted."),
+                Err(error) => UiMessage::detail("Could not delete folder: {}", error),
+            };
+            let _ = updates
+                .send(FolderMutationUpdate {
+                    message,
+                    metadata,
+                    reveal_parent_id: None,
+                    issued_scope: current_scope,
+                    removed_folders,
+                })
+                .await;
+        });
+    });
+    let mail_update_state = Rc::clone(&state);
+    let mail_update_runtime = runtime.clone();
+    let mail_update_app = app.as_weak();
+    let pending_core_updates_for_ui = Arc::clone(&pending_core_updates);
+    let calendar_for_core_updates = Rc::clone(&calendar_state);
+    let mail_list_app = app.as_weak();
+    let mail_list_refresh_in_progress_for_result = Rc::clone(&mail_list_refresh_in_progress);
+    let mail_list_refresh_requested_for_result = Rc::clone(&mail_list_refresh_requested);
+    let mail_pagination_generation_for_result = Rc::clone(&mail_pagination_generation);
+    let mail_pagination_in_progress_for_result = Rc::clone(&mail_pagination_in_progress);
+    app.on_drain_mail_list_updates(move || {
+        while let Ok(update) = mail_list_rx.borrow_mut().try_recv() {
+            let current_scope = mail_update_state.borrow().scope;
+            let current_query = mail_update_state.borrow().query.clone();
+            let Some(app) = mail_update_app.upgrade() else {
+                return;
+            };
+            match update.kind {
+                MailListUpdateKind::Refresh => {
+                    mail_list_refresh_in_progress_for_result.set(false);
+                    let same_view = update.scope == current_scope && update.query == current_query;
+                    let accepted = same_view
+                        && mail_work::accepts_background(
+                            &mail_update_state.borrow(),
+                            update.view_generation,
+                        );
+                    if same_view && !accepted {
+                        // A navigation load started while this read ran and
+                        // may predate the change it carries; read again
+                        // once that load lands.
+                        mail_list_refresh_requested_for_result.set(true);
+                    }
+                    if accepted {
+                        match update.result {
+                            Ok(page) => apply_background_mail_page(
+                                &app,
+                                &mail_update_state,
+                                &mail_update_runtime,
+                                page,
+                                &[],
+                            ),
+                            Err(error) => app.set_render_status(UiMessage::detail(
+                                "Background mail refresh failed: {}",
+                                error,
+                            )),
+                        }
+                    }
+                }
+                MailListUpdateKind::Pagination { cursor, generation } => {
+                    if generation != mail_pagination_generation_for_result.get() {
+                        continue;
+                    }
+                    mail_pagination_in_progress_for_result.set(false);
+                    let still_current = mail_work::accepts_background(
+                        &mail_update_state.borrow(),
+                        update.view_generation,
+                    ) && update.scope == current_scope
+                        && update.query == current_query
+                        && mail_update_state.borrow().next_cursor == Some(cursor);
+                    if still_current {
+                        match update.result {
+                            Ok(page) => {
+                                match append_mail_page(
+                                    &app,
+                                    &mail_update_state,
+                                    &mail_update_runtime,
+                                    cursor,
+                                    page,
+                                ) {
+                                    Ok(()) => {}
+                                    Err(error) => app.set_render_status(UiMessage::detail(
+                                        "Mail pagination failed: {}",
+                                        error,
+                                    )),
+                                }
+                            }
+                            Err(error) => app.set_render_status(UiMessage::detail(
+                                "Mail pagination failed: {}",
+                                error,
+                            )),
+                        }
+                    }
+                    app.set_mail_loading_more(false);
+                    // A live refresh advanced the cursor while this page was
+                    // in flight. Re-check the current viewport so it can
+                    // immediately request the replacement cursor; a
+                    // navigation load still running does that when it lands.
+                    if !still_current && !mail_work::loading(&mail_update_state.borrow()) {
+                        app.set_mail_list_revision(app.get_mail_list_revision().wrapping_add(1));
+                    }
+                }
+                MailListUpdateKind::Earlier { first, generation } => {
+                    if generation != mail_pagination_generation_for_result.get() {
+                        continue;
+                    }
+                    mail_pagination_in_progress_for_result.set(false);
+                    let still_current = mail_work::accepts_background(
+                        &mail_update_state.borrow(),
+                        update.view_generation,
+                    ) && update.scope == current_scope
+                        && update.query == current_query
+                        && mail_update_state
+                            .borrow()
+                            .messages
+                            .first()
+                            .is_some_and(|row| mail::cursor_of(row) == first);
+                    if still_current
+                        && let Err(error) = update.result.map(|page| {
+                            mail_view_model::prepend_mail_page(
+                                &app,
+                                &mail_update_state,
+                                &mail_update_runtime,
+                                page,
+                            )
+                        })
+                    {
+                        app.set_render_status(UiMessage::detail(
+                            "Mail pagination failed: {}",
+                            error,
+                        ));
+                    }
+                }
+            }
+        }
+        if let Some(app) = mail_list_app.upgrade() {
+            // If another core event arrived during the query, this immediately
+            // starts the one coalesced follow-up refresh.
+            app.invoke_drain_core_updates();
+        }
+    });
+
+    let mail_metadata_state = Rc::clone(&state);
+    let mail_metadata_runtime = runtime.clone();
+    let mail_metadata_app = app.as_weak();
+    let mail_metadata_refresh_in_progress_for_result =
+        Rc::clone(&mail_metadata_refresh_in_progress);
+    app.on_drain_mail_metadata_updates(move || {
+        while let Ok(update) = mail_metadata_rx.borrow_mut().try_recv() {
+            mail_metadata_refresh_in_progress_for_result.set(false);
+            let Some(app) = mail_metadata_app.upgrade() else {
+                return;
+            };
+            match update.result {
+                Ok(metadata) => {
+                    if !snapshot_is_current(&mail_metadata_state, metadata.account_revision) {
+                        continue;
+                    }
+                    let mut state = mail_metadata_state.borrow_mut();
+                    // An import created local mail, or its mail was deleted.
+                    let local_mail = metadata.local_mail;
+                    let local_mail_changed =
+                        local_mail != state.local_mail.map(|local| local.account_id);
+                    let note_changed = state.set_mail_metadata(metadata);
+                    drop(state);
+                    if note_changed {
+                        refresh_rows_only(&app, &mail_metadata_state, &mail_metadata_runtime);
+                    }
+                    if local_mail_changed {
+                        // Its section is named at once; its size follows.
+                        apply_local_mail(
+                            &app,
+                            &mail_metadata_state,
+                            local_mail.map(|account_id| flectar_mail_core::models::LocalMail {
+                                account_id,
+                                messages: 0,
+                                bytes: 0,
+                            }),
+                        );
+                        refresh_local_mail(&app, &mail_metadata_state, &mail_metadata_runtime);
+                    }
+                    refresh_list_metadata(&app, &mail_metadata_state);
+                }
+                Err(error) => {
+                    eprintln!("mailbox badge refresh failed: {error}");
+                }
+            }
+            // Start one coalesced follow-up if another mutation arrived while
+            // the grouped count query was running.
+            app.invoke_drain_core_updates();
+        }
+    });
+
+    let mail_update_state = Rc::clone(&state);
+    let mail_update_runtime = runtime.clone();
+    let mail_update_app = app.as_weak();
+    let mail_list_refresh_requested_for_core = Rc::clone(&mail_list_refresh_requested);
+    let mail_list_refresh_in_progress_for_core = Rc::clone(&mail_list_refresh_in_progress);
+    let mail_list_tx_for_core = mail_list_tx.clone();
+    let mail_metadata_refresh_requested_for_core = Rc::clone(&mail_metadata_refresh_requested);
+    let mail_metadata_refresh_in_progress_for_core = Rc::clone(&mail_metadata_refresh_in_progress);
+    let pending_body_for_events = body_pending.clone();
+    let metadata_last_started = Cell::new(None::<std::time::Instant>);
+    let metadata_refresh_timer = slint::Timer::default();
+    let contacts_loaded_for_core = Rc::clone(&contacts_loaded);
+    let contacts_loading_for_core = Rc::clone(&contacts_loading);
+    let contact_state_for_core_updates = Rc::clone(&contact_state);
+    let device_sync_for_core_updates = Rc::clone(&device_sync);
+    let ui_task_tx_for_device_sync = ui_task_tx.clone();
+    app.on_drain_core_updates(move || {
+        let pending = {
+            let mut pending = pending_core_updates_for_ui
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            std::mem::take(&mut *pending)
+        };
+        if pending.all_mail_changed || !pending.changed_threads.is_empty() {
+            mail_list_refresh_requested_for_core.set(true);
+            mail_metadata_refresh_requested_for_core.set(true);
+        }
+        // The end of the list says how much older unread mail is only on
+        // the server; the badge refresh brings it.
+        if pending.server_only_changed {
+            mail_metadata_refresh_requested_for_core.set(true);
+        }
+        let mail_active = mail_update_app
+            .upgrade()
+            .is_some_and(|app| app.get_active_view() == "mail");
+        let metadata_interval = Duration::from_millis(500);
+        let metadata_delay = metadata_last_started
+            .get()
+            .and_then(|started| metadata_interval.checked_sub(started.elapsed()));
+        if mail_active
+            && mail_metadata_refresh_requested_for_core.get()
+            && !mail_metadata_refresh_in_progress_for_core.get()
+            && let Some(delay) = metadata_delay
+            && !metadata_refresh_timer.running()
+        {
+            let app = mail_update_app.clone();
+            metadata_refresh_timer.start(slint::TimerMode::SingleShot, delay, move || {
+                if let Some(app) = app.upgrade() {
+                    app.invoke_drain_core_updates();
+                }
+            });
+        }
+        if mail_active
+            && mail_metadata_refresh_requested_for_core.get()
+            && metadata_delay.is_none()
+            && !mail_metadata_refresh_in_progress_for_core.get()
+            && !mail_work::actions_pending(&mail_update_state.borrow())
+        {
+            let (using_core, core, scope) = {
+                let state = mail_update_state.borrow();
+                (state.using_core, state.core.clone(), state.scope)
+            };
+            if using_core && let Some(core) = core {
+                mail_metadata_refresh_requested_for_core.set(false);
+                mail_metadata_refresh_in_progress_for_core.set(true);
+                metadata_last_started.set(Some(std::time::Instant::now()));
+                let updates = mail_metadata_tx.clone();
+                mail_update_runtime.spawn(async move {
+                    let result = core.load_mail_metadata(scope).await;
+                    let _ = updates.send(MailMetadataUpdate { result }).await;
+                });
+            }
+        }
+        if mail_active
+            && mail_list_refresh_requested_for_core.get()
+            && !mail_list_refresh_in_progress_for_core.get()
+            && !mail_work::actions_pending(&mail_update_state.borrow())
+            && !mail_work::loading(&mail_update_state.borrow())
+        {
+            let (using_core, core, scope, query, start, limit) = {
+                let state = mail_update_state.borrow();
+                (
+                    state.using_core,
+                    state.core.clone(),
+                    state.scope,
+                    state.query.clone(),
+                    state.window_start,
+                    mail_work::refresh_limit(state.messages.len(), &state.query),
+                )
+            };
+            if using_core && let Some(core) = core {
+                mail_list_refresh_requested_for_core.set(false);
+                mail_list_refresh_in_progress_for_core.set(true);
+                let view_generation = mail_work::generation(&mail_update_state.borrow());
+                let updates = mail_list_tx_for_core.clone();
+                mail_update_runtime.spawn(async move {
+                    let result = core.load_page(scope, &query, start, limit, false).await;
+                    let _ = updates
+                        .send(MailListUpdate {
+                            view_generation,
+                            scope,
+                            query,
+                            kind: MailListUpdateKind::Refresh,
+                            result,
+                        })
+                        .await;
+                });
+            }
+        }
+        if !(pending.account_states.is_empty() && pending.caught_up.is_empty())
+            && let Some(app) = mail_update_app.upgrade()
+        {
+            apply_account_states(
+                &app,
+                &mail_update_state,
+                &pending.account_states,
+                &pending.caught_up,
+            );
+        }
+        if let Some(error) = pending.action_error
+            && let Some(app) = mail_update_app.upgrade()
+        {
+            let message = UiMessage::detail("Message action failed: {}", error);
+            app.set_render_status(message.clone());
+            app.set_sync_status(message);
+        }
+        if pending.send_uncertain
+            && let Some(app) = mail_update_app.upgrade()
+        {
+            let message = UiMessage::plain(
+                "Your message may have gone out, but the mail server didn't confirm it. Check Sent before you send it again.",
+            );
+            app.set_render_status(message.clone());
+            app.set_sync_status(message);
+        }
+        if let Some(report) = pending.transfers
+            && let Some(app) = mail_update_app.upgrade()
+        {
+            app.set_render_status(move_picker::transfer_message(&report));
+        }
+        if pending.calendar_changed
+            && let Some(app) = mail_update_app.upgrade()
+            && app.get_active_view() == "settings"
+        {
+            app.invoke_reload_calendar_connections();
+        }
+        if pending.calendar_changed {
+            invitation::refresh();
+        }
+        if pending.calendar_changed
+            && let Some(app) = mail_update_app.upgrade()
+            && app.get_active_view() == "calendar"
+            && let Some(core) = mail_update_state.borrow().core.clone()
+        {
+            let today = Local::now().date_naive();
+            let mut calendar = calendar_for_core_updates.borrow_mut();
+            if refresh_calendar_events(
+                &core,
+                &mail_update_runtime,
+                &mut calendar,
+                &mail_update_state.borrow().connected_accounts,
+            )
+            .is_ok()
+            {
+                apply_calendar(&app, &calendar, today);
+            }
+        }
+        if pending.contacts_changed
+            && let Some(app) = mail_update_app.upgrade()
+        {
+            contacts_loaded_for_core.set(false);
+            if app.get_active_view() == "contacts"
+                && !contacts_loading_for_core.get()
+                && !contacts::has_unsaved_edits(&app, &contact_state_for_core_updates.borrow())
+            {
+                app.invoke_load_contacts();
+            }
+        }
+        if let Some(app) = mail_update_app.upgrade() {
+            let calendar_month = calendar_for_core_updates.borrow().visible_month;
+            device_sync_for_core_updates.apply(
+                &app,
+                &mail_update_state,
+                &mail_update_runtime,
+                &ui_task_tx_for_device_sync,
+                calendar_month,
+                pending.device_sync,
+            );
+        }
+        if !mail_active {
+            return;
+        }
+        let selected_thread = {
+            let state = mail_update_state.borrow();
+            let selected = state.selected_id.and_then(|selected_id| {
+                state
+                    .messages
+                    .iter()
+                    .find(|message| message.id == selected_id)
+            });
+            selected.and_then(|message| message.thread_id)
+        };
+
+        let selected_thread_changed =
+            selected_thread.is_some_and(|thread_id| pending.changed_threads.contains(&thread_id));
+        let selected_body_changed = pending.all_mail_changed || selected_thread_changed;
+        if !selected_body_changed {
+            return;
+        }
+
+        if mail_update_app.upgrade().is_none() {
+            return;
+        }
+        let id = {
+            let mut state = mail_update_state.borrow_mut();
+            let id = state.selected_id;
+            if let Some(row) = state.messages.iter_mut().find(|row| Some(row.id) == id) {
+                row.body_pending = true;
+            }
+            id
+        };
+        if let Some(id) = id
+            && let Some(app) = mail_update_app.upgrade()
+        {
+            // A completion may arrive while the previous database read is
+            // still returning its pending snapshot. Queue a fresh read rather
+            // than losing that only body-ready notification to deduplication.
+            pending_body_for_events.set(None);
+            app.global::<EmailReader>().invoke_ensure_body(id);
+        }
+    });
+
+    // Loading the selected message includes database reads, CID image
+    // expansion, and body-fetch scheduling. Apply its result on the UI thread,
+    // but keep all of that work on Tokio so list input remains responsive.
+    let message_load_rx = Rc::new(RefCell::new(message_load_rx));
+    let message_load_state = Rc::clone(&state);
+    let message_load_runtime = runtime.clone();
+    let message_load_pending_for_ui = body_pending.clone();
+    let message_load_app = app.as_weak();
+    app.on_drain_message_load_updates(move || {
+        while let Ok(update) = message_load_rx.borrow_mut().try_recv() {
+            if !message_load_pending_for_ui
+                .get()
+                .is_some_and(|(id, _, generation)| {
+                    id == update.id && generation == update.generation
+                })
+            {
+                continue;
+            }
+            message_load_pending_for_ui.set(None);
+            let Some(app) = message_load_app.upgrade() else {
+                return;
+            };
+            match update.result {
+                Ok(conversation) => {
+                    let is_selected = {
+                        let mut state = message_load_state.borrow_mut();
+                        let is_selected =
+                            state.selected_id == Some(update.id) && !state.preview_closed;
+                        if is_selected {
+                            // A restored tab reopens the message it had open
+                            // when its conversation first loads.
+                            let restored = state
+                                .restore_thread_message
+                                .take_if(|(conversation, _)| *conversation == update.id)
+                                .filter(|_| state.conversation_owner_id != Some(update.id))
+                                .map(|(_, message)| message);
+                            let selected_message_id = restored.or_else(|| {
+                                state
+                                    .conversation_messages
+                                    .get(state.conversation_selected_index)
+                                    .map(|message| message.id)
+                            });
+                            state.conversation_owner_id = Some(update.id);
+                            state.conversation_messages = conversation.messages;
+                            state.conversation_selected_index = selected_message_id
+                                .and_then(|id| {
+                                    state
+                                        .conversation_messages
+                                        .iter()
+                                        .position(|message| message.id == id)
+                                })
+                                .unwrap_or_else(|| {
+                                    state.conversation_messages.len().saturating_sub(1)
+                                });
+                            let any_body_pending = state
+                                .conversation_messages
+                                .iter()
+                                .any(|message| message.body_pending);
+                            if let Some(current) = state
+                                .messages
+                                .iter_mut()
+                                .find(|current| current.id == update.id)
+                            {
+                                current.body_pending = any_body_pending;
+                            }
+                        }
+                        is_selected
+                    };
+                    // A user may select another row while this load is in flight.
+                    // Keep only the selected thread and project its metadata before
+                    // rendering the one expanded body.
+                    if is_selected
+                        && let Err(error) =
+                            render_current(&app, &message_load_state, &message_load_runtime)
+                    {
+                        app.set_render_status(UiMessage::detail(
+                            "Message refresh failed: {}",
+                            error,
+                        ));
+                    }
+                }
+                Err(error) => {
+                    if message_load_state.borrow().selected_id == Some(update.id) {
+                        app.set_render_status(UiMessage::detail("Message load failed: {}", error));
+                    }
+                }
+            }
+        }
+    });
+
+    // Network/image work wakes Slint only when a bounded result is ready. The
+    // native UI state remains !Send and is touched only by this callback.
+    let favicon_rx = Rc::new(RefCell::new(favicon_rx));
+    let favicon_state = Rc::clone(&state);
+    let favicon_runtime = runtime.clone();
+    let favicon_app = app.as_weak();
+    app.on_drain_favicon_updates(move || {
+        let mut changed = false;
+        loop {
+            let update = match favicon_rx.borrow_mut().try_recv() {
+                Ok(update) => update,
+                Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
+            };
+            let mut state = favicon_state.borrow_mut();
+            if update.generation != state.favicon_generation
+                || update.pixel_sides != state.favicon_pixel_sides
+            {
+                continue;
+            }
+            state.favicon_pending.remove(&update.domain);
+            if !state.remote_images_enabled {
+                continue;
+            }
+            let retry = match update.result {
+                Ok(icons) => {
+                    state.favicon_retry.remove(&update.domain);
+                    let state = &mut *state;
+                    insert_bounded_favicon_result(
+                        &mut state.favicon_icons,
+                        &mut state.favicon_missing,
+                        update.domain,
+                        icons,
+                    );
+                    None
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "sender icon fetch failed; retry scheduled");
+                    let attempts = state
+                        .favicon_retry
+                        .get(&update.domain)
+                        .map_or(1, |retry| retry.attempts.saturating_add(1));
+                    let delay = favicon_retry_delay(attempts);
+                    let retry_at = Instant::now() + delay;
+                    if state.favicon_retry.len() >= MAX_FAVICON_CACHE_ENTRIES
+                        && !state.favicon_retry.contains_key(&update.domain)
+                        && let Some(victim) = state
+                            .favicon_retry
+                            .iter()
+                            .min_by_key(|(_, retry)| retry.retry_at)
+                            .map(|(domain, _)| domain.clone())
+                    {
+                        state.favicon_retry.remove(&victim);
+                    }
+                    state
+                        .favicon_retry
+                        .insert(update.domain.clone(), FaviconRetry { attempts, retry_at });
+                    Some((update.domain, retry_at, delay))
+                }
+            };
+            changed = true;
+            drop(state);
+            if let Some((domain, retry_at, delay)) = retry {
+                let retry_app = favicon_app.clone();
+                let retry_state = Rc::downgrade(&favicon_state);
+                let runtime = favicon_runtime.clone();
+                Timer::single_shot(delay, move || {
+                    let (Some(app), Some(state)) = (retry_app.upgrade(), retry_state.upgrade())
+                    else {
+                        return;
+                    };
+                    let still_current = state
+                        .borrow()
+                        .favicon_retry
+                        .get(&domain)
+                        .is_some_and(|retry| retry.retry_at == retry_at);
+                    if still_current {
+                        if let Some(retry) = state.borrow_mut().favicon_retry.get_mut(&domain) {
+                            retry.retry_at = Instant::now();
+                        }
+                        refresh_rows_only(&app, &state, &runtime);
+                    }
+                });
+            }
+        }
+
+        if let Some(app) = favicon_app.upgrade() {
+            let pixel_sides = (
+                physical_pixel_side(SENDER_AVATAR_SMALL_SIDE, app.window().scale_factor()),
+                physical_pixel_side(SENDER_AVATAR_REGULAR_SIDE, app.window().scale_factor()),
+            );
+            {
+                let mut state = favicon_state.borrow_mut();
+                if state.favicon_pixel_sides != (0, 0) && state.favicon_pixel_sides != pixel_sides {
+                    state.favicon_pixel_sides = pixel_sides;
+                    state.favicon_generation = state.favicon_generation.wrapping_add(1);
+                    state.favicon_icons.clear();
+                    state.favicon_pending.clear();
+                    state.favicon_missing.clear();
+                    changed = true;
+                }
+            }
+            if changed {
+                refresh_rows_only(&app, &favicon_state, &favicon_runtime);
+            }
+        }
+    });
+
+    // OAuth profile photos are first-party account identity, so they are kept
+    // separate from the opt-in sender/body remote-image switch. Like sender
+    // marks, both sizes are rasterized for the current monitor before Slint's
+    // software renderer sees them.
+    let profile_avatar_rx = Rc::new(RefCell::new(profile_avatar_rx));
+    let profile_avatar_state = Rc::clone(&state);
+    let profile_avatar_runtime = runtime.clone();
+    let profile_avatar_app = app.as_weak();
+    app.on_drain_profile_avatar_updates(move || {
+        let mut changed = false;
+        loop {
+            let update = match profile_avatar_rx.borrow_mut().try_recv() {
+                Ok(update) => update,
+                Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
+            };
+            let mut state = profile_avatar_state.borrow_mut();
+            let still_current = state.profile_avatar_pixel_sides == update.pixel_sides
+                && state.connected_accounts.iter().any(|account| {
+                    account.id == update.account_id
+                        && account.avatar_url.as_deref() == Some(update.source_url.as_str())
+                });
+            if !still_current {
+                continue;
+            }
+            state.profile_avatar_pending.remove(&update.account_id);
+            if let Some(images) = update.images {
+                state.profile_avatar_missing.remove(&update.account_id);
+                state
+                    .profile_avatar_images
+                    .insert(update.account_id, images);
+            } else {
+                state.profile_avatar_missing.insert(update.account_id);
+            }
+            changed = true;
+        }
+
+        let Some(app) = profile_avatar_app.upgrade() else {
+            return;
+        };
+        let pixel_sides = (
+            physical_pixel_side(ACCOUNT_AVATAR_SMALL_SIDE, app.window().scale_factor()),
+            physical_pixel_side(ACCOUNT_AVATAR_REGULAR_SIDE, app.window().scale_factor()),
+        );
+        {
+            let mut state = profile_avatar_state.borrow_mut();
+            if state.profile_avatar_pixel_sides != (0, 0)
+                && state.profile_avatar_pixel_sides != pixel_sides
+            {
+                state.profile_avatar_pixel_sides = pixel_sides;
+                state.profile_avatar_images.clear();
+                state.profile_avatar_pending.clear();
+                state.profile_avatar_missing.clear();
+                changed = true;
+            }
+        }
+        if changed {
+            refresh_connected_accounts(&app, &profile_avatar_state);
+            refresh_list_metadata(&app, &profile_avatar_state);
+        }
+        schedule_profile_avatar_fetches(&app, &profile_avatar_state, &profile_avatar_runtime);
+    });
+
+    let (startup_raw_tx, startup_rx) = bounded_ui_channel::<StartupUpdate>();
+    let startup_tx = UiSender::new(
+        startup_raw_tx,
+        UiWake::new(app.as_weak(), |app| app.invoke_drain_startup_updates()),
+    );
+    let product_generation = Rc::new(Cell::new(0_u64));
+    let startup_product_generation = product_generation.clone();
+    let startup_rx = Rc::new(RefCell::new(startup_rx));
+    let startup_state = Rc::clone(&state);
+    let startup_calendar = Rc::clone(&calendar_state);
+    let startup_runtime = runtime.clone();
+    let startup_pending_core_updates = Arc::clone(&pending_core_updates);
+    let startup_core_wake = core_updates_wake.clone();
+    let startup_device_sync = Rc::clone(&device_sync);
+    let startup_notification_host = platform.notifications.clone();
+    let startup_app = app.as_weak();
+    let startup_paths_for_ui = platform.paths.clone();
+    let startup_tray = tray.as_ref().map(|tray| tray.as_weak());
+    let startup_metrics_for_ui = startup_metrics.clone();
+    let startup_benchmark_disable_background = benchmark_disable_background;
+    app.on_drain_startup_updates(move || {
+        while let Ok(update) = startup_rx.borrow_mut().try_recv() {
+            let Some(app) = startup_app.upgrade() else {
+                return;
+            };
+            match update {
+                StartupUpdate::Warm { snapshot, applied } => {
+                    let snapshot = *snapshot;
+                    let saved_at_ms = snapshot.saved_at_ms;
+                    apply_warm_start_snapshot(&app, &startup_state, &startup_runtime, snapshot);
+                    startup_metrics_for_ui.emit_once(
+                        "warm_cache_applied",
+                        serde_json::json!({
+                            "saved_at_ms": saved_at_ms,
+                            "accounts": app.get_connected_accounts().row_count(),
+                            "rows": startup_state.borrow().messages.len(),
+                        }),
+                    );
+                    startup_metrics_for_ui
+                        .schedule_rendered_frame(app.as_weak(), "warm_cache_frame");
+                    Timer::single_shot(Duration::from_millis(16), move || {
+                        let _ = applied.send(());
+                    });
+                }
+                StartupUpdate::Ready(result) => {
+                    let snapshot = match result {
+                        Ok(snapshot) => *snapshot,
+                        Err(error) => {
+                            let diagnostic_id = startup_diagnostic_id(&error);
+                            tracing::error!(%diagnostic_id, error = %error, "mail core startup failed");
+                            app.set_startup_diagnostic_id(diagnostic_id.clone().into());
+                            app.set_startup_error(UiMessage::plain(
+                                "Your local mailbox could not be opened. No account operation was started. Retry, or copy the diagnostics for support.",
+                            ));
+                            app.set_diagnostics_text(
+                                startup_diagnostics(
+                                    &startup_paths_for_ui,
+                                    &diagnostic_id,
+                                    &error,
+                                )
+                                .into(),
+                            );
+                            app.set_sync_status(UiMessage::plain(
+                                "Local storage startup failed.",
+                            ));
+                            app.set_startup_failed(true);
+                            app.set_startup_ready(false);
+                            continue;
+                        }
+                    };
+
+                    let StartupSnapshot {
+                        core,
+                        scope,
+                        page,
+                        remote_images_enabled,
+                        accounts,
+                        account_configs,
+                        local_mail,
+                        settings,
+                    } = snapshot;
+
+                    let allow_remote_images = remote_images_enabled
+                        && cfg!(feature = "remote-content")
+                        && !startup_benchmark_disable_background;
+                    {
+                        let mut state = startup_state.borrow_mut();
+                        state.core = Some(core.clone());
+                        // The first page already shows the saved profile's
+                        // accounts; the scope and sidebar follow them too.
+                        if let Some(settings) = settings.as_ref() {
+                            state.account_presentation =
+                                AccountPresentationSettings::from_settings(settings);
+                        }
+                        let _ = state.sync_profile_accounts();
+                        // The startup scope was already validated for these
+                        // accounts, which also become the source of truth.
+                        let _ = state.set_connected_accounts(accounts);
+                        state.account_configs = account_configs;
+                        state.local_mail = local_mail;
+                        state.set_scope(scope);
+                        state.remote_images_enabled = allow_remote_images;
+                        state.mark_read = settings
+                            .as_ref()
+                            .map(|settings| settings.mark_read)
+                            .unwrap_or_default();
+                        state.grouping = core.grouping();
+                        state.favicon_loader = if allow_remote_images {
+                            match FaviconLoader::new(&startup_paths_for_ui.cache_dir) {
+                                Ok(loader) => Some(loader),
+                                Err(error) => {
+                                    eprintln!("sender icons unavailable: {error}");
+                                    None
+                                }
+                            }
+                        } else {
+                            None
+                        };
+                        if let Some(page) =
+                            page.filter(|page| page.account_count > 0 || local_mail.is_some())
+                        {
+                            state.using_core = true;
+                            if state.scope == Scope::UNIFIED_INBOX {
+                                state.inbox_count = page.messages.len();
+                            }
+                            state.messages = page.messages;
+                            state.list_order = page.order;
+                            state.labels = page.labels;
+                            state.mailboxes = page.mailboxes;
+                            state.unified_mailboxes = page.unified_mailboxes;
+                            state.next_cursor = page.next_cursor;
+                            // Preparing the first HTML body can be much more
+                            // expensive than projecting the mailbox rows. Let
+                            // the shell and list paint first; body hydration is
+                            // demand-driven when the user selects a message.
+                            state.preview_closed = true;
+                        } else {
+                            state.using_core = true;
+                            state.messages.clear();
+                            state.labels.clear();
+                            state.mailboxes.clear();
+                            state.unified_mailboxes.clear();
+                            state.inbox_count = 0;
+                            state.next_cursor = None;
+                            state.selected_id = None;
+                            state.rendered_id = None;
+                        }
+
+                        let configure_result = state
+                            .email_renderer
+                            .borrow_mut()
+                            .configure_resources(
+                                startup_runtime.clone(),
+                                allow_remote_images,
+                            );
+                        if let Err(error) = configure_result {
+                            eprintln!("email images unavailable: {error}");
+                            state.remote_images_enabled = false;
+                            state.favicon_loader = None;
+                        }
+                    }
+
+                    if let Some(settings) = settings.as_ref() {
+                        apply_settings(&app, settings);
+                        if let Some(tray) =
+                            startup_tray.as_ref().and_then(|tray| tray.upgrade())
+                        {
+                            tray.set_enabled(app.get_close_to_tray());
+                        }
+                        // A start in the background, now in the user's
+                        // language.
+                        #[cfg(feature = "flatpak")]
+                        if app.get_close_to_tray() && !app.window().is_visible() {
+                            window_controller::describe_background(&app, &startup_runtime);
+                        }
+                    }
+                    app.set_remote_images_enabled(
+                        startup_state.borrow().remote_images_enabled,
+                    );
+
+                    apply_local_mail(&app, &startup_state, local_mail);
+                    refresh_rows_only(&app, &startup_state, &startup_runtime);
+                    refresh_list_metadata(&app, &startup_state);
+                    app.set_startup_hydrated(true);
+                    app.set_startup_ready(true);
+                    mailto_links::open_pending_soon(&app);
+                    block_sender::refresh();
+                    mail_rules::refresh();
+                    app.invoke_product_changed(app.get_active_view());
+                    app.global::<TabsUi>().invoke_restore_active();
+                    app.set_startup_failed(false);
+                    schedule_profile_avatar_fetches(
+                        &app,
+                        &startup_state,
+                        &startup_runtime,
+                    );
+                    spawn_core_event_listener(
+                        &startup_runtime,
+                        core.clone(),
+                        Arc::clone(&startup_pending_core_updates),
+                        startup_core_wake.clone(),
+                    );
+                    startup_device_sync.attach(&app, &core);
+                    notifications::spawn_dispatcher(
+                        &startup_runtime,
+                        core.file_core(),
+                        startup_notification_host.clone(),
+                    );
+                    #[cfg(desktop)]
+                    agents::core_ready(
+                        &startup_runtime,
+                        &startup_paths_for_ui.data_dir,
+                        core.file_core(),
+                    );
+                    notifications::ui::core_ready();
+                    auto_replies::core_ready(&app, &startup_runtime, core.file_core());
+                    mail_rules::core_ready(&startup_runtime, core.file_core());
+                    translation::core_ready(core.file_core());
+                    ai_features::core_ready();
+                    if !startup_benchmark_disable_background {
+                        core.notify_ui_ready();
+                    }
+                    app.set_sync_status(UiMessage::plain("Local data ready."));
+                    startup_metrics_for_ui.emit_once(
+                        "core_ready",
+                        serde_json::json!({
+                            "rows": startup_state.borrow().messages.len(),
+                            "accounts": startup_state.borrow().connected_accounts.len(),
+                        }),
+                    );
+                    startup_metrics_for_ui
+                        .schedule_rendered_frame(app.as_weak(), "core_ready_frame");
+                    startup_metrics_for_ui.schedule_benchmark_exit(app.as_weak());
+                }
+                StartupUpdate::MailMetadata(result) => match result {
+                    Ok(metadata) => {
+                        let note_changed = startup_state.borrow_mut().set_mail_metadata(metadata);
+                        if note_changed {
+                            refresh_rows_only(&app, &startup_state, &startup_runtime);
+                        }
+                        refresh_list_metadata(&app, &startup_state);
+                    }
+                    Err(error) => {
+                        eprintln!("mailbox totals unavailable: {error}");
+                        refresh_list_metadata(&app, &startup_state);
+                    }
+                },
+                StartupUpdate::Calendar { generation, month, snapshot: StartupCalendarSnapshot {
+                    calendar_connections,
+                    carddav_connections,
+                    calendar_events,
+                    calendar_accounts,
+                    calendar_sources,
+                }} => {
+                    if generation != startup_product_generation.get()
+                        || app.get_active_view() != "calendar"
+                        || month != startup_calendar.borrow().visible_month
+                    {
+                        continue;
+                    }
+                    {
+                        let mut state = startup_state.borrow_mut();
+                        state.calendar_connections = calendar_connections;
+                        state.carddav_connections = carddav_connections;
+                    }
+                    {
+                        let mut calendar = startup_calendar.borrow_mut();
+                        calendar.events = calendar_events;
+                        calendar.accounts = calendar_accounts;
+                        calendar.sources = calendar_sources;
+                        apply_calendar(&app, &calendar, Local::now().date_naive());
+                        calendar::reveal_asked_event(&app, &mut calendar);
+                    }
+                    refresh_connected_accounts(&app, &startup_state);
+                }
+                StartupUpdate::Connections { calendar, contacts } => {
+                    let mut state = startup_state.borrow_mut();
+                    state.calendar_connections = calendar;
+                    state.carddav_connections = contacts;
+                    drop(state);
+                    refresh_connected_accounts(&app, &startup_state);
+                }
+            }
+        }
+        if let Some(app) = startup_app.upgrade() {
+            window_controller::trim_while_hidden(&app);
+        }
+    });
+
+    let product_app = app.as_weak();
+    let product_state = state.clone();
+    let product_calendar = calendar_state.clone();
+    let product_runtime = runtime.clone();
+    let product_updates = startup_tx.clone();
+    let product_contacts = contact_state.clone();
+    let product_contacts_loaded = contacts_loaded.clone();
+    let product_contacts_loading = contacts_loading.clone();
+    let product_contact_generation = contact_load_generation.clone();
+    let product_body_generation = body_generation.clone();
+    let product_body_pending = body_pending.clone();
+    let product_body_requests = body_requests.clone();
+    let connections_state = state.clone();
+    let connections_runtime = runtime.clone();
+    let connections_updates = startup_tx.clone();
+    app.on_reload_calendar_connections(move || {
+        let Some(core) = connections_state.borrow().core.clone() else {
+            return;
+        };
+        let updates = connections_updates.clone();
+        connections_runtime.spawn(async move {
+            let (calendar, contacts) = tokio::join!(
+                core.load_calendar_connections(),
+                core.load_carddav_connections()
+            );
+            // A failed read keeps what Settings shows.
+            if let (Ok(calendar), Ok(contacts)) = (calendar, contacts) {
+                let _ = updates
+                    .send(StartupUpdate::Connections { calendar, contacts })
+                    .await;
+            }
+        });
+    });
+
+    let previous_product = Rc::new(RefCell::new(String::from("mail")));
+    app.on_product_changed(move |view| {
+        let Some(app) = product_app.upgrade() else {
+            return;
+        };
+        let generation = product_generation.get().wrapping_add(1);
+        product_generation.set(generation);
+        let previous = previous_product.replace(view.to_string());
+        let mail_returned = previous != view.as_str() && view == "mail";
+        if previous != view.as_str() {
+            if previous == "mail" {
+                // Tabs keep where mail was before its reader goes.
+                app.global::<TabsUi>().invoke_mail_hidden();
+                product_body_generation.set(product_body_generation.get().wrapping_add(1));
+                product_body_pending.set(None);
+                product_body_requests.send_replace(None);
+                let mut state = product_state.borrow_mut();
+                state.email_renderer.borrow_mut().clear();
+                release_unselected_bodies(&mut state.messages, None);
+                clear_reader_projection(&app);
+                app.set_selected_source("".into());
+                app.set_selected_plain_text("".into());
+                // The next reader starts at the top, and tabs scroll it back.
+                app.set_email_scroll_y(0.0);
+            }
+            if previous == "calendar" {
+                let mut calendar = product_calendar.borrow_mut();
+                calendar.events = Vec::new();
+                calendar.sources = Vec::new();
+                calendar.accounts = Vec::new();
+                app.set_calendar_month_days(Default::default());
+                app.set_calendar_month_bars(Default::default());
+                app.set_calendar_week_days(Default::default());
+                app.set_calendar_week_bars(Default::default());
+                app.set_calendar_timed_blocks(Default::default());
+                app.set_calendar_selected_day_events(Default::default());
+                calendar
+                    .source_rows
+                    .reconcile_by(Vec::new(), |row| row.id, |_, _| true);
+            }
+            if previous == "contacts" {
+                // Invalidate pending pages even when keeping a dirty editor.
+                product_contact_generation.set(product_contact_generation.get().wrapping_add(1));
+                product_contacts_loading.set(false);
+                app.set_contact_loading_more(false);
+                if contacts::release_directory(&app, &mut product_contacts.borrow_mut()) {
+                    product_contacts_loaded.set(false);
+                }
+            }
+            if previous == "files" {
+                app.global::<FilesUi>()
+                    .invoke_command("release-view".into(), "".into(), "".into());
+            }
+        }
+        let Some(core) = product_state.borrow().core.clone() else {
+            return;
+        };
+        let store_core = core.file_core();
+        let active = view.to_string();
+        product_runtime.spawn(async move {
+            if active != "calendar" {
+                let _ = store_core.calendar_db.release_idle_connections().await;
+            }
+            if active != "files" {
+                let _ = store_core.files_db.release_idle_connections().await;
+            }
+            if active != "mail" {
+                let _ = store_core.db.release_idle_connections().await;
+            }
+            // The previous product's models and connections are gone. Give
+            // Slint a moment to drop its view, then return the freed pages.
+            tokio::time::sleep(window_controller::TRIM_DELAY).await;
+            crate::memory::release_free_heap();
+        });
+        if view == "settings" {
+            let updates = product_updates.clone();
+            product_runtime.spawn(async move {
+                let (calendar, contacts) = tokio::join!(
+                    core.load_calendar_connections(),
+                    core.load_carddav_connections()
+                );
+                let _ = updates
+                    .send(StartupUpdate::Connections {
+                        calendar: calendar.unwrap_or_default(),
+                        contacts: contacts.unwrap_or_default(),
+                    })
+                    .await;
+            });
+        } else if view == "calendar" {
+            let month = product_calendar.borrow().visible_month;
+            let accounts = product_state.borrow().connected_accounts.clone();
+            let updates = product_updates.clone();
+            product_runtime.spawn(async move {
+                let snapshot = load_startup_calendar_snapshot(&core, &accounts, month).await;
+                let _ = updates
+                    .send(StartupUpdate::Calendar {
+                        generation,
+                        month,
+                        snapshot,
+                    })
+                    .await;
+            });
+        } else if view == "contacts" {
+            if !contacts::has_unsaved_edits(&app, &product_contacts.borrow()) {
+                app.invoke_load_contacts();
+            }
+        } else if view == "files" {
+            app.global::<FilesUi>()
+                .invoke_command("load".into(), "".into(), "".into());
+        } else if view == "mail" {
+            app.invoke_drain_core_updates();
+            let _ = render_current(&app, &product_state, &product_runtime);
+            if mail_returned {
+                app.global::<TabsUi>().invoke_mail_shown();
+            }
+        }
+    });
+
+    app.set_sync_status(UiMessage::plain("Loading local data…"));
+    let retry_runtime = runtime.clone();
+    let retry_paths = platform.paths.clone();
+    let retry_credentials = platform.credentials.clone();
+    let retry_oauth_redirects = platform.oauth_redirects.clone();
+    let retry_tx = startup_tx.clone();
+    let retry_app = app.as_weak();
+    let retry_metrics = startup_metrics.clone();
+    app.on_retry_startup(move || {
+        if let Some(app) = retry_app.upgrade() {
+            app.set_startup_ready(false);
+            app.set_startup_failed(false);
+            app.set_sync_status(UiMessage::plain("Loading local data…"));
+        }
+        spawn_startup_load(
+            &retry_runtime,
+            retry_paths.clone(),
+            retry_credentials.clone(),
+            retry_oauth_redirects.clone(),
+            retry_tx.clone(),
+            retry_metrics.clone(),
+        );
+    });
+    spawn_startup_load(
+        &runtime,
+        platform.paths.clone(),
+        platform.credentials.clone(),
+        platform.oauth_redirects.clone(),
+        startup_tx,
+        startup_metrics.clone(),
+    );
+
+    render_current(&app, &state, &runtime)?;
+
+    let ui_task_rx = Rc::new(RefCell::new(ui_task_rx));
+    let ui_task_state = Rc::clone(&state);
+    let ui_task_runtime = runtime.clone();
+    let ui_task_app = app.as_weak();
+    let ui_task_tray = tray.as_ref().map(|tray| tray.as_weak());
+    let removal_contacts = contact_state.clone();
+    let removal_contact_generation = contact_load_generation.clone();
+    let removal_contacts_loaded = contacts_loaded.clone();
+    let removal_contacts_loading = contacts_loading.clone();
+    let removal_calendar = calendar_state.clone();
+    let removal_calendar_editing = calendar_editing_event_id.clone();
+    let removal_body_pending = body_pending.clone();
+    let removal_pagination_generation = mail_pagination_generation.clone();
+    let removal_pagination_loading = mail_pagination_in_progress.clone();
+    let removal_metadata_requested = mail_metadata_refresh_requested.clone();
+    app.on_drain_ui_task_updates(move || {
+        loop {
+            let mut update = match ui_task_rx.borrow_mut().try_recv() {
+                Ok(update) => update,
+                Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
+            };
+            let Some(app) = ui_task_app.upgrade() else {
+                return;
+            };
+            if update.finishes_account_setup {
+                app.set_account_setup_in_progress(false);
+            }
+            if update.finishes_oauth {
+                app.set_oauth_in_progress(false);
+                app.set_oauth_authorization_url("".into());
+                app.set_oauth_browser_error(false);
+            }
+            if let Some(enabled) = update.close_to_tray {
+                app.set_close_to_tray(enabled);
+                if let Some(tray) = ui_task_tray.as_ref().and_then(|tray| tray.upgrade()) {
+                    tray.set_enabled(enabled);
+                }
+            }
+            let removed_account_id = update
+                .account_removal
+                .as_ref()
+                .filter(|removal| removal.removed)
+                .map(|removal| removal.account_id);
+            if let Some(account_id) = removed_account_id {
+                // Tabs look up the account's mailboxes before they are dropped.
+                app.global::<TabsUi>()
+                    .invoke_account_removed(account_id.to_string().into());
+                reconcile_removed_account(&mut ui_task_state.borrow_mut(), account_id);
+                removal_body_pending.set(None);
+                removal_pagination_generation
+                    .set(removal_pagination_generation.get().wrapping_add(1));
+                removal_pagination_loading.set(false);
+                app.set_mail_loading_more(false);
+                app.set_mail_page_loading(false);
+                removal_contact_generation.set(removal_contact_generation.get().wrapping_add(1));
+                removal_contacts_loaded.set(false);
+                removal_contacts_loading.set(false);
+                {
+                    let mut contacts = removal_contacts.borrow_mut();
+                    if contacts.scope == format!("Account:{account_id}") {
+                        contacts.scope = "All contacts".into();
+                    }
+                    contacts.begin_core_query();
+                    contacts.account_counts.remove(&account_id);
+                    contacts.total_count = 0;
+                    contacts.favorite_count = 0;
+                }
+                {
+                    let mut calendar = removal_calendar.borrow_mut();
+                    if removal_calendar_editing.get().is_some_and(|id| {
+                        calendar.events.iter().any(|event| {
+                            i64::from(event.id) == id && event.account_id == account_id
+                        })
+                    }) {
+                        removal_calendar_editing.set(None);
+                        app.set_calendar_editor_open(false);
+                    }
+                    calendar
+                        .events
+                        .retain(|event| event.account_id != account_id);
+                    calendar
+                        .sources
+                        .retain(|source| source.account_id != account_id);
+                    calendar
+                        .accounts
+                        .retain(|account| account.id != account_id);
+                }
+            }
+            if let Some(snapshot) = update.accounts.filter(|snapshot| {
+                ui_task_state
+                    .borrow()
+                    .core
+                    .as_ref()
+                    .is_some_and(|core| core.account_revision() == snapshot.revision)
+            }) {
+                ui_task_state.borrow_mut().using_core = true;
+                update_connected_accounts(
+                    &app,
+                    &ui_task_state,
+                    &ui_task_runtime,
+                    snapshot.accounts,
+                    snapshot.configs,
+                );
+            }
+            let mut refresh_account_rows = false;
+            if let Some(mut connections) = update.calendar_connections {
+                let mut state = ui_task_state.borrow_mut();
+                connections.retain(|connection| {
+                    state
+                        .connected_accounts
+                        .iter()
+                        .any(|account| account.id == connection.account_id)
+                });
+                state.calendar_connections = connections;
+                refresh_account_rows = true;
+            }
+            if let Some(connections) = update.carddav_connections {
+                ui_task_state.borrow_mut().carddav_connections = connections;
+                refresh_account_rows = true;
+            }
+            if let Some((account_id, error)) = update.calendar_error {
+                let mut state = ui_task_state.borrow_mut();
+                match error.filter(|error| {
+                    !error.trim().is_empty()
+                        && state
+                            .connected_accounts
+                            .iter()
+                            .any(|account| account.id == account_id)
+                }) {
+                    Some(error) => {
+                        state.calendar_errors.insert(account_id, error);
+                    }
+                    None => {
+                        state.calendar_errors.remove(&account_id);
+                    }
+                }
+                refresh_account_rows = true;
+            }
+            if refresh_account_rows {
+                refresh_connected_accounts(&app, &ui_task_state);
+            }
+            if update.clear_account_form {
+                app.set_account_form_open(false);
+                app.set_incoming_security("tls".into());
+                app.set_smtp_security("tls".into());
+                app.set_trusted_certificate_pem("".into());
+                app.set_account_email("".into());
+                app.set_account_username("".into());
+                app.set_account_password("".into());
+                app.set_account_protocol("imap".into());
+                app.set_jmap_url("".into());
+                app.set_incoming_host("".into());
+                app.set_incoming_port("993".into());
+                app.set_smtp_host("".into());
+                app.set_smtp_port("465".into());
+                app.set_account_sends_mail(true);
+                app.set_incoming_login("automatic".into());
+                app.set_smtp_login("automatic".into());
+                app.set_smtp_username("".into());
+                app.set_smtp_password("".into());
+            }
+            if let Some(removal) = update.account_removal.as_mut().filter(|removal| removal.removed) {
+                let current_page = {
+                    let mut state = ui_task_state.borrow_mut();
+                    if let Some(metadata) = removal.metadata.take().filter(|_| state.has_mail()) {
+                        state.set_mail_metadata(metadata);
+                    }
+                    let current = removal.scope == state.scope && removal.query == state.query;
+                    let has_page = removal.page.is_some();
+                    if current && let Some(mut page) = removal.page.take() {
+                        let selected_id = state.selected_id;
+                        mail_view_model::carry_selected_detail(
+                            &mut state.messages,
+                            &mut page.messages,
+                            selected_id,
+                        );
+                        state.messages = page.messages;
+                        state.list_order = page.order;
+                        state.labels = page.labels;
+                        state.next_cursor = page.next_cursor;
+                    }
+                    current && has_page
+                };
+                refresh_connected_accounts(&app, &ui_task_state);
+                apply_contact_directory(&app, &removal_contacts);
+                if app.get_active_view() == "contacts" {
+                    app.invoke_load_contacts();
+                }
+                app.set_contact_loading_more(false);
+                clear_contact_form(&app);
+                apply_calendar(&app, &removal_calendar.borrow(), Local::now().date_naive());
+                let _ = render_current(&app, &ui_task_state, &ui_task_runtime);
+                if !current_page && ui_task_state.borrow().has_mail() {
+                    let _ = refresh_from_source(&app, &ui_task_state, &ui_task_runtime, false, &[]);
+                }
+                removal_metadata_requested.set(true);
+                app.invoke_drain_core_updates();
+            }
+            if let Some(removal) = update.account_removal.as_ref() {
+                let mut calendar = removal_calendar.borrow_mut();
+                if calendar.visible_month == removal.calendar_month
+                    && let Some(events) = removal.calendar_events.as_ref()
+                {
+                    calendar.events = events.clone();
+                }
+                if let Some(sources) = removal.calendar_sources.as_ref() {
+                    calendar.sources = sources.clone();
+                }
+                calendar.accounts =
+                    calendar::calendar_accounts(&ui_task_state.borrow().connected_accounts);
+                if removal_calendar_editing.get().is_some_and(|id| {
+                    !calendar
+                        .events
+                        .iter()
+                        .any(|event| i64::from(event.id) == id)
+                }) {
+                    removal_calendar_editing.set(None);
+                    app.set_calendar_editor_open(false);
+                }
+                apply_calendar(&app, &calendar, Local::now().date_naive());
+            }
+            if !update.message.is_empty() {
+                app.set_sync_status(update.message);
+            }
+        }
+    });
+
+    register_window_preference_callbacks(&app, tray.as_ref(), &state, &runtime, &ui_task_tx);
+    tabs::register(
+        &app,
+        tabs::TabContext {
+            app: app.as_weak(),
+            state: Rc::clone(&state),
+            runtime: runtime.clone(),
+            calendar: Rc::clone(&calendar_state),
+            mail_pagination_generation: Rc::clone(&mail_pagination_generation),
+            mail_pagination_in_progress: Rc::clone(&mail_pagination_in_progress),
+            path: tabs_path,
+        },
+    );
+
+    app.on_make_account_transfer(DataTransfer::from);
+    app.on_read_account_transfer(|data| data.plain_text().unwrap_or_default());
+
+    let app_weak = app.as_weak();
+    let state_for_account_order = Rc::clone(&state);
+    let runtime_for_account_order = runtime.clone();
+    let ui_task_tx_for_account_order = ui_task_tx.clone();
+    app.on_reorder_account(move |source, target, after| {
+        let Some(app) = app_weak.upgrade() else {
+            return;
+        };
+        let Ok(source_id) = source.as_str().parse::<i64>() else {
+            app.set_sync_status(UiMessage::plain("Could not identify the dragged account."));
+            return;
+        };
+        let target_id = i64::from(target);
+        if source_id == target_id {
+            return;
+        }
+        let Some(core) = state_for_account_order.borrow().core.clone() else {
+            app.set_sync_status(UiMessage::plain(
+                "Account ordering requires local mail data.",
+            ));
+            return;
+        };
+        if !reorder_connected_account_rows(&app, source_id, target_id, after) {
+            app.set_sync_status(UiMessage::plain("Could not find the account to reorder."));
+            return;
+        }
+
+        app.set_sync_status(UiMessage::plain("Saving account order…"));
+        let updates = ui_task_tx_for_account_order.clone();
+        runtime_for_account_order.spawn(async move {
+            let result = core.reorder_account(source_id, target_id, after).await;
+            // Always reload the authoritative order. On failure this also
+            // rolls back the optimistic drag shown by the Slint model.
+            let accounts = core.load_account_snapshot().await.ok();
+            let message = match result {
+                Ok(()) => UiMessage::plain("Account order saved."),
+                Err(error) => UiMessage::detail("Could not save account order: {}", error),
+            };
+            let _ = updates
+                .send(UiTaskUpdate {
+                    message,
+                    accounts,
+                    calendar_connections: None,
+                    carddav_connections: None,
+                    calendar_error: None,
+                    account_removal: None,
+                    clear_account_form: false,
+                    finishes_account_setup: false,
+                    finishes_oauth: false,
+                    close_to_tray: None,
+                })
+                .await;
+        });
+    });
+
+    let app_weak = app.as_weak();
+    let state_for_account_delete = Rc::clone(&state);
+    let runtime_for_account_delete = runtime.clone();
+    let ui_task_tx_for_account_delete = ui_task_tx.clone();
+    let calendar_for_account_delete = calendar_state.clone();
+    app.on_delete_account(move |account_id| {
+        let Some(app) = app_weak.upgrade() else {
+            return;
+        };
+        if app.get_account_setup_in_progress()
+            || app.get_oauth_in_progress()
+            || app.get_oauth_settings_saving()
+        {
+            return;
+        }
+        let account_id = i64::from(account_id);
+        let calendar_month = calendar_for_account_delete.borrow().visible_month;
+        let (core, view, local) = {
+            let state = state_for_account_delete.borrow();
+            let Some(core) = state.core.clone() else {
+                return;
+            };
+            // Mail kept on this device is deleted like an account.
+            let local = state
+                .local_mail
+                .is_some_and(|local| local.account_id == account_id);
+            if !local
+                && !state
+                    .connected_accounts
+                    .iter()
+                    .any(|account| account.id == account_id)
+            {
+                return;
+            }
+            (
+                core,
+                RemovalView::of(&state, account_id, calendar_month),
+                local,
+            )
+        };
+        app.set_account_setup_in_progress(true);
+        app.set_sync_status(if local {
+            UiMessage::plain("Deleting mail on this device…")
+        } else {
+            UiMessage::plain("Removing account…")
+        });
+        let updates = ui_task_tx_for_account_delete.clone();
+        runtime_for_account_delete.spawn(async move {
+            let result = core.remove_account(account_id).await;
+            crate::notifications::accounts_removed();
+            let accounts = core.load_account_snapshot().await.ok();
+            // Core deletion is journaled across stores. A late cleanup error
+            // can occur after the account row was deleted; reflect that fact.
+            let removed = if local {
+                result.is_ok()
+                    || core
+                        .load_local_mail()
+                        .await
+                        .is_ok_and(|local| local.is_none_or(|local| local.account_id != account_id))
+            } else {
+                account_was_removed(account_id, &result, accounts.as_ref())
+            };
+            let removal =
+                read_account_removal(&core, account_id, removed, accounts.as_ref(), view).await;
+            let incomplete = removal.metadata.is_none() || removal.page.is_none();
+            let message = match result {
+                Ok(()) if local && incomplete => {
+                    UiMessage::plain("Mail on this device deleted. Mail refresh will retry.")
+                }
+                Ok(()) if local => UiMessage::plain("Mail on this device deleted."),
+                Err(error) if local && removed => UiMessage::detail(
+                    "Mail on this device deleted; local cleanup needs a retry: {}",
+                    error,
+                ),
+                Err(error) if local => {
+                    UiMessage::detail("Could not delete mail on this device: {}", error)
+                }
+                Ok(()) if incomplete => {
+                    UiMessage::plain("Account removed. Mail refresh will retry.")
+                }
+                Ok(()) => UiMessage::plain("Account removed from this device."),
+                Err(error) if removed => {
+                    UiMessage::detail("Account removed; local cleanup needs a retry: {}", error)
+                }
+                Err(error) => UiMessage::detail("Could not remove account: {}", error),
+            };
+            let _ = updates
+                .send(UiTaskUpdate {
+                    message,
+                    accounts,
+                    account_removal: Some(removal),
+                    calendar_connections: core.load_calendar_connections().await.ok(),
+                    carddav_connections: core.load_carddav_connections().await.ok(),
+                    calendar_error: None,
+                    clear_account_form: false,
+                    finishes_account_setup: true,
+                    finishes_oauth: false,
+                    close_to_tray: None,
+                })
+                .await;
+        });
+    });
+
+    let app_weak = app.as_weak();
+    let state_for_mail_history = Rc::clone(&state);
+    let runtime_for_mail_history = runtime.clone();
+    let ui_task_tx_for_mail_history = ui_task_tx.clone();
+    app.on_save_account_mail_history(move |account_id, value| {
+        let Some(app) = app_weak.upgrade() else {
+            return;
+        };
+        let Some(core) = state_for_mail_history.borrow().core.clone() else {
+            app.set_sync_status(UiMessage::plain("Mail history requires local mail data."));
+            return;
+        };
+        let account_id = i64::from(account_id);
+        let value = value.to_string();
+        app.set_sync_status(UiMessage::plain("Updating mail history…"));
+        let updates = ui_task_tx_for_mail_history.clone();
+        runtime_for_mail_history.spawn(async move {
+            let message = match core.set_account_mail_history(account_id, &value).await {
+                Ok(_) => {
+                    UiMessage::plain("Mail history updated. Background sync is adjusting now.")
+                }
+                Err(error) => UiMessage::detail("Could not update mail history: {}", error),
+            };
+            // Reload on both success and failure so the selector always shows
+            // the authoritative persisted value.
+            let accounts = core.load_account_snapshot().await.ok();
+            let _ = updates
+                .send(UiTaskUpdate {
+                    message,
+                    accounts,
+                    calendar_connections: None,
+                    carddav_connections: None,
+                    calendar_error: None,
+                    account_removal: None,
+                    clear_account_form: false,
+                    finishes_account_setup: false,
+                    finishes_oauth: false,
+                    close_to_tray: None,
+                })
+                .await;
+        });
+    });
+
+    let app_weak = app.as_weak();
+    let state_for_keep_on_server = Rc::clone(&state);
+    let runtime_for_keep_on_server = runtime.clone();
+    let ui_task_tx_for_keep_on_server = ui_task_tx.clone();
+    app.on_save_account_keep_on_server(move |account_id, value| {
+        let Some(app) = app_weak.upgrade() else {
+            return;
+        };
+        let Some(core) = state_for_keep_on_server.borrow().core.clone() else {
+            app.set_sync_status(UiMessage::plain(
+                "Server mail settings require local mail data.",
+            ));
+            return;
+        };
+        let account_id = i64::from(account_id);
+        let value = value.to_string();
+        app.set_sync_status(UiMessage::plain("Updating server mail settings…"));
+        let updates = ui_task_tx_for_keep_on_server.clone();
+        runtime_for_keep_on_server.spawn(async move {
+            let message = match core.set_account_keep_on_server(account_id, &value).await {
+                Ok(()) => UiMessage::plain("Server mail settings updated."),
+                Err(error) => UiMessage::detail("Could not update server mail settings: {}", error),
+            };
+            // Reload either way so the selector shows the saved choice.
+            let accounts = core.load_account_snapshot().await.ok();
+            let _ = updates
+                .send(UiTaskUpdate {
+                    message,
+                    accounts,
+                    calendar_connections: None,
+                    carddav_connections: None,
+                    calendar_error: None,
+                    account_removal: None,
+                    clear_account_form: false,
+                    finishes_account_setup: false,
+                    finishes_oauth: false,
+                    close_to_tray: None,
+                })
+                .await;
+        });
+    });
+
+    let app_weak = app.as_weak();
+    let state_for_subscribed_folders = Rc::clone(&state);
+    let runtime_for_subscribed_folders = runtime.clone();
+    let ui_task_tx_for_subscribed_folders = ui_task_tx.clone();
+    app.on_save_account_subscribed_folders_only(move |account_id, enabled| {
+        let Some(app) = app_weak.upgrade() else {
+            return;
+        };
+        let Some(core) = state_for_subscribed_folders.borrow().core.clone() else {
+            app.set_sync_status(UiMessage::plain("Folder settings require local mail data."));
+            return;
+        };
+        let account_id = i64::from(account_id);
+        app.set_sync_status(UiMessage::plain("Updating folder settings…"));
+        let updates = ui_task_tx_for_subscribed_folders.clone();
+        runtime_for_subscribed_folders.spawn(async move {
+            let message = match core
+                .set_account_subscribed_folders_only(account_id, enabled)
+                .await
+            {
+                Ok(()) => UiMessage::plain("Folder settings updated."),
+                Err(error) => UiMessage::detail("Could not update folder settings: {}", error),
+            };
+            // Reload either way so the switch shows the saved choice.
+            let accounts = core.load_account_snapshot().await.ok();
+            let _ = updates
+                .send(UiTaskUpdate {
+                    message,
+                    accounts,
+                    calendar_connections: None,
+                    carddav_connections: None,
+                    calendar_error: None,
+                    account_removal: None,
+                    clear_account_form: false,
+                    finishes_account_setup: false,
+                    finishes_oauth: false,
+                    close_to_tray: None,
+                })
+                .await;
+        });
+    });
+
+    let app_weak = app.as_weak();
+    let state_for_check_interval = Rc::clone(&state);
+    let runtime_for_check_interval = runtime.clone();
+    let ui_task_tx_for_check_interval = ui_task_tx.clone();
+    app.on_save_account_check_interval(move |account_id, value| {
+        let Some(app) = app_weak.upgrade() else {
+            return;
+        };
+        let Some(core) = state_for_check_interval.borrow().core.clone() else {
+            app.set_sync_status(UiMessage::plain("Sync settings require local mail data."));
+            return;
+        };
+        let account_id = i64::from(account_id);
+        let interval = account_controller::check_interval_from_choice(value.as_str());
+        app.set_sync_status(UiMessage::plain("Updating sync settings…"));
+        let updates = ui_task_tx_for_check_interval.clone();
+        runtime_for_check_interval.spawn(async move {
+            let saved = match interval {
+                Some(interval) => core.set_account_check_interval(account_id, interval).await,
+                None => Err(format!("unsupported check interval: {value}")),
+            };
+            let message = match saved {
+                Ok(()) => UiMessage::plain("Sync settings updated."),
+                Err(error) => UiMessage::detail("Could not update sync settings: {}", error),
+            };
+            // Reload either way so the choice shows what was saved.
+            let accounts = core.load_account_snapshot().await.ok();
+            let _ = updates
+                .send(UiTaskUpdate {
+                    message,
+                    accounts,
+                    calendar_connections: None,
+                    carddav_connections: None,
+                    calendar_error: None,
+                    account_removal: None,
+                    clear_account_form: false,
+                    finishes_account_setup: false,
+                    finishes_oauth: false,
+                    close_to_tray: None,
+                })
+                .await;
+        });
+    });
+
+    let app_weak = app.as_weak();
+    let state_for_name = Rc::clone(&state);
+    let runtime_for_name = runtime.clone();
+    let ui_task_tx_for_name = ui_task_tx.clone();
+    app.on_save_account_name(move |account_id, name| {
+        let Some(app) = app_weak.upgrade() else {
+            return;
+        };
+        let Some(core) = state_for_name.borrow().core.clone() else {
+            app.set_sync_status(UiMessage::plain("Account names require local mail data."));
+            return;
+        };
+        let account_id = i64::from(account_id);
+        app.set_sync_status(UiMessage::plain("Saving the account name…"));
+        let updates = ui_task_tx_for_name.clone();
+        runtime_for_name.spawn(async move {
+            let message = match core.set_account_name(account_id, &name).await {
+                Ok(()) => UiMessage::plain("Account name saved."),
+                Err(error) => UiMessage::detail("Could not save the account name: {}", error),
+            };
+            // Reload either way so the field shows the saved name.
+            let accounts = core.load_account_snapshot().await.ok();
+            let _ = updates
+                .send(UiTaskUpdate {
+                    message,
+                    accounts,
+                    calendar_connections: None,
+                    carddav_connections: None,
+                    calendar_error: None,
+                    account_removal: None,
+                    clear_account_form: false,
+                    finishes_account_setup: false,
+                    finishes_oauth: false,
+                    close_to_tray: None,
+                })
+                .await;
+        });
+    });
+
+    let app_weak = app.as_weak();
+    let state_for_push = Rc::clone(&state);
+    let runtime_for_push = runtime.clone();
+    let ui_task_tx_for_push = ui_task_tx.clone();
+    app.on_save_account_push(move |account_id, enabled| {
+        let Some(app) = app_weak.upgrade() else {
+            return;
+        };
+        let Some(core) = state_for_push.borrow().core.clone() else {
+            app.set_sync_status(UiMessage::plain("Sync settings require local mail data."));
+            return;
+        };
+        let account_id = i64::from(account_id);
+        app.set_sync_status(UiMessage::plain("Updating sync settings…"));
+        let updates = ui_task_tx_for_push.clone();
+        runtime_for_push.spawn(async move {
+            let message = match core.set_account_push(account_id, enabled).await {
+                Ok(()) => UiMessage::plain("Sync settings updated."),
+                Err(error) => UiMessage::detail("Could not update sync settings: {}", error),
+            };
+            // Reload either way so the switch shows the saved choice.
+            let accounts = core.load_account_snapshot().await.ok();
+            let _ = updates
+                .send(UiTaskUpdate {
+                    message,
+                    accounts,
+                    calendar_connections: None,
+                    carddav_connections: None,
+                    calendar_error: None,
+                    account_removal: None,
+                    clear_account_form: false,
+                    finishes_account_setup: false,
+                    finishes_oauth: false,
+                    close_to_tray: None,
+                })
+                .await;
+        });
+    });
+
+    let app_weak = app.as_weak();
+    let state_for_server_timeout = Rc::clone(&state);
+    let runtime_for_server_timeout = runtime.clone();
+    let ui_task_tx_for_server_timeout = ui_task_tx.clone();
+    app.on_save_account_server_timeout(move |account_id, seconds| {
+        let Some(app) = app_weak.upgrade() else {
+            return;
+        };
+        let Some(core) = state_for_server_timeout.borrow().core.clone() else {
+            app.set_sync_status(UiMessage::plain("Sync settings require local mail data."));
+            return;
+        };
+        let account_id = i64::from(account_id);
+        app.set_sync_status(UiMessage::plain("Updating sync settings…"));
+        let updates = ui_task_tx_for_server_timeout.clone();
+        runtime_for_server_timeout.spawn(async move {
+            let saved = match u32::try_from(seconds) {
+                Ok(seconds) => core.set_account_server_timeout(account_id, seconds).await,
+                Err(_) => Err(format!("unsupported server timeout: {seconds}")),
+            };
+            let message = match saved {
+                Ok(()) => UiMessage::plain("Sync settings updated."),
+                Err(error) => UiMessage::detail("Could not update sync settings: {}", error),
+            };
+            // Reload either way so the choice shows what was saved.
+            let accounts = core.load_account_snapshot().await.ok();
+            let _ = updates
+                .send(UiTaskUpdate {
+                    message,
+                    accounts,
+                    calendar_connections: None,
+                    carddav_connections: None,
+                    calendar_error: None,
+                    account_removal: None,
+                    clear_account_form: false,
+                    finishes_account_setup: false,
+                    finishes_oauth: false,
+                    close_to_tray: None,
+                })
+                .await;
+        });
+    });
+
+    let app_weak_for_download = app.as_weak();
+    let state_for_download = Rc::clone(&state);
+    let runtime_for_download = runtime.clone();
+    let ui_task_tx_for_download = ui_task_tx.clone();
+    app.on_save_account_download(move |account_id, value| {
+        let Some(app) = app_weak_for_download.upgrade() else {
+            return;
+        };
+        let Some(core) = state_for_download.borrow().core.clone() else {
+            app.set_sync_status(UiMessage::plain("Sync settings require local mail data."));
+            return;
+        };
+        let account_id = i64::from(account_id);
+        let value = value.to_string();
+        app.set_sync_status(UiMessage::plain("Updating download settings…"));
+        let updates = ui_task_tx_for_download.clone();
+        runtime_for_download.spawn(async move {
+            let message = match core.set_account_download(account_id, &value).await {
+                Ok(()) => UiMessage::plain("Download settings updated."),
+                Err(error) => UiMessage::detail("Could not update download settings: {}", error),
+            };
+            // Reload either way so the choice shows what was saved.
+            let accounts = core.load_account_snapshot().await.ok();
+            let _ = updates
+                .send(UiTaskUpdate {
+                    message,
+                    accounts,
+                    calendar_connections: None,
+                    carddav_connections: None,
+                    calendar_error: None,
+                    account_removal: None,
+                    clear_account_form: false,
+                    finishes_account_setup: false,
+                    finishes_oauth: false,
+                    close_to_tray: None,
+                })
+                .await;
+        });
+    });
+
+    let app_weak = app.as_weak();
+    let state_for_sent_copy_policy = Rc::clone(&state);
+    let runtime_for_sent_copy_policy = runtime.clone();
+    let ui_task_tx_for_sent_copy_policy = ui_task_tx.clone();
+    app.on_save_account_sent_copy_policy(move |account_id, value| {
+        let Some(app) = app_weak.upgrade() else {
+            return;
+        };
+        let Some(core) = state_for_sent_copy_policy.borrow().core.clone() else {
+            app.set_sync_status(UiMessage::plain("Sent copy settings require local mail data."));
+            return;
+        };
+        let account_id = i64::from(account_id);
+        let value = value.to_string();
+        app.set_sync_status(UiMessage::plain("Updating Sent copy settings…"));
+        let updates = ui_task_tx_for_sent_copy_policy.clone();
+        runtime_for_sent_copy_policy.spawn(async move {
+            let message = match core.set_account_sent_copy_policy(account_id, &value).await {
+                Ok(_) => {
+                    UiMessage::plain("Sent copy settings updated.")
+                }
+                Err(error) => UiMessage::detail("Could not update Sent copy settings: {}", error),
+            };
+            // Reload on both success and failure so the selector always shows
+            // the authoritative persisted value.
+            let accounts = core.load_account_snapshot().await.ok();
+            let _ = updates
+                .send(UiTaskUpdate {
+                    message,
+                    accounts,
+                    calendar_connections: None,
+                    carddav_connections: None,
+                    calendar_error: None,
+                    account_removal: None,
+                    clear_account_form: false,
+                    finishes_account_setup: false,
+                    finishes_oauth: false,
+                    close_to_tray: None,
+                })
+                .await;
+        });
+    });
+
+    let app_weak = app.as_weak();
+    let state_for_remote_images = Rc::clone(&state);
+    let runtime_for_remote_images = runtime.clone();
+    let remote_images_cache_dir = platform.paths.cache_dir.clone();
+    app.on_set_remote_images(move |enabled| {
+        let Some(app) = app_weak.upgrade() else {
+            return;
+        };
+        if !cfg!(feature = "remote-content") {
+            app.set_sync_status(UiMessage::plain(
+                "Remote images are unavailable in this minimal build.",
+            ));
+            app.set_remote_images_enabled(false);
+            return;
+        }
+
+        let core = state_for_remote_images.borrow().core.clone();
+        if let Some(core) = core.as_ref()
+            && let Err(error) =
+                runtime_for_remote_images.block_on(core.set_load_remote_images(enabled))
+        {
+            app.set_sync_status(UiMessage::detail(
+                "Could not save remote-image setting: {}",
+                error,
+            ));
+            return;
+        }
+
+        let mut sender_icon_error = None;
+        {
+            let mut state = state_for_remote_images.borrow_mut();
+            state.remote_images_enabled = enabled;
+            state.remote_images_override_id = None;
+            state.favicon_icons.clear();
+            state.favicon_pending.clear();
+            state.favicon_missing.clear();
+            state.favicon_retry.clear();
+            state.favicon_generation = state.favicon_generation.wrapping_add(1);
+            state.favicon_loader = if enabled {
+                match FaviconLoader::new(&remote_images_cache_dir) {
+                    Ok(loader) => Some(loader),
+                    Err(error) => {
+                        sender_icon_error = Some(error);
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+
+            let renderer = Rc::clone(&state.email_renderer);
+            let configure_result = renderer
+                .borrow_mut()
+                .configure_resources(runtime_for_remote_images.clone(), enabled);
+            if let Err(error) = configure_result {
+                state.remote_images_enabled = false;
+                state.favicon_loader = None;
+                if let Some(core) = core.as_ref() {
+                    let _ = runtime_for_remote_images.block_on(core.set_load_remote_images(false));
+                }
+                let _ = renderer
+                    .borrow_mut()
+                    .configure_resources(runtime_for_remote_images.clone(), false);
+                app.set_remote_images_enabled(false);
+                app.set_sync_status(UiMessage::detail("Remote images unavailable: {}", error));
+                return;
+            }
+        }
+
+        app.set_remote_images_enabled(enabled);
+        app.set_sync_status(if let Some(error) = sender_icon_error {
+            UiMessage::detail("Remote sender icons unavailable: {}", error)
+        } else if enabled {
+            UiMessage::plain("Remote body images and sender favicons enabled.")
+        } else {
+            UiMessage::plain("Remote images blocked.")
+        });
+        if let Err(error) =
+            render_current(&app, &state_for_remote_images, &runtime_for_remote_images)
+        {
+            app.set_render_status(UiMessage::detail(
+                "Could not refresh message images: {}",
+                error,
+            ));
+        }
+    });
+
+    let retry_app = app.as_weak();
+    let retry_state = Rc::clone(&state);
+    let retry_runtime = runtime.clone();
+    app.global::<EmailReader>().on_retry_images(move || {
+        let Some(app) = retry_app.upgrade() else {
+            return;
+        };
+        retry_state.borrow().email_renderer.borrow_mut().loaded_key = None;
+        if let Err(error) = render_current(&app, &retry_state, &retry_runtime) {
+            app.set_render_status(UiMessage::detail(
+                "Could not load message images: {}",
+                error,
+            ));
+        }
+    });
+
+    let app_weak = app.as_weak();
+    let state_for_message_images = Rc::clone(&state);
+    let runtime_for_message_images = runtime.clone();
+    app.on_load_remote_images_for_message(move || {
+        let Some(app) = app_weak.upgrade() else {
+            return;
+        };
+        if !cfg!(feature = "remote-content") {
+            app.set_render_status(UiMessage::plain("Remote-image loading is disabled."));
+            return;
+        }
+        {
+            state_for_message_images
+                .borrow()
+                .email_renderer
+                .borrow_mut()
+                .loaded_key = None;
+            let mut state = state_for_message_images.borrow_mut();
+            state.remote_images_override_id = state.selected_id;
+        }
+        if let Err(error) =
+            render_current(&app, &state_for_message_images, &runtime_for_message_images)
+        {
+            app.set_render_status(UiMessage::detail(
+                "Could not load message images: {}",
+                error,
+            ));
+        }
+    });
+
+    // Sync is network-bound and may take many seconds. Run it (including the
+    // expensive exact sidebar recount) on Tokio, then wake Slint once the small
+    // result is ready.
+    let (sync_raw_tx, sync_rx) = bounded_ui_channel::<SyncUpdate>();
+    let sync_tx = UiSender::new(
+        sync_raw_tx,
+        UiWake::new(app.as_weak(), |app| app.invoke_drain_sync_updates()),
+    );
+    let sync_in_progress = Rc::new(Cell::new(false));
+    let sync_rx = Rc::new(RefCell::new(sync_rx));
+    let sync_state = Rc::clone(&state);
+    let sync_runtime = runtime.clone();
+    let sync_progress = Rc::clone(&sync_in_progress);
+    let sync_app = app.as_weak();
+    app.on_drain_sync_updates(move || {
+        while let Ok(update) = sync_rx.borrow_mut().try_recv() {
+            sync_progress.set(false);
+            let Some(app) = sync_app.upgrade() else {
+                return;
+            };
+            app.set_sync_in_progress(false);
+            match update.result {
+                Ok(()) => {
+                    {
+                        let mut state = sync_state.borrow_mut();
+                        state.using_core = true;
+                        if let Some(metadata) = update.metadata.filter(|metadata| {
+                            state.core.as_ref().is_some_and(|core| {
+                                core.account_revision() == metadata.account_revision
+                            })
+                        }) {
+                            state.set_mail_metadata(metadata);
+                        }
+                    }
+                    if let Err(error) =
+                        refresh_from_source(&app, &sync_state, &sync_runtime, true, &[])
+                    {
+                        app.set_sync_status(UiMessage::detail(
+                            "Sync finished, refresh failed: {}",
+                            error,
+                        ));
+                    } else {
+                        app.set_sync_status(UiMessage::plain("Sync complete."));
+                    }
+                }
+                Err(error) => app.set_sync_status(UiMessage::detail("Sync failed: {}", error)),
+            }
+            // The failures this check ended in show on their accounts at once.
+            account_status::checked_on_request(&app, &sync_state, update.accounts.as_deref());
+        }
+    });
+
+    // Manual checks for new mail. The toolbar button and Shift+F5 check every
+    // account, an account's menu that account, and F5 the accounts in view.
+    let start_sync: Rc<dyn Fn(Option<Vec<i64>>)> = {
+        let app_weak = app.as_weak();
+        let state = Rc::clone(&state);
+        let runtime = runtime.clone();
+        let in_progress = Rc::clone(&sync_in_progress);
+        Rc::new(move |accounts: Option<Vec<i64>>| {
+            let Some(app) = app_weak.upgrade() else {
+                return;
+            };
+            if accounts.as_ref().is_some_and(Vec::is_empty) || in_progress.replace(true) {
+                return;
+            }
+            let (core, scope) = {
+                let state = state.borrow();
+                (state.core.clone(), state.scope)
+            };
+            let Some(core) = core else {
+                in_progress.set(false);
+                app.set_sync_status(UiMessage::plain(
+                    "Local mail data is unavailable; preview data is read-only.",
+                ));
+                return;
+            };
+            app.set_sync_in_progress(true);
+            app.set_sync_status(match accounts.as_deref() {
+                Some([_]) => UiMessage::plain("Synchronizing account…"),
+                _ => UiMessage::plain("Synchronizing accounts…"),
+            });
+            let sync_tx = sync_tx.clone();
+            runtime.spawn(async move {
+                let result = core.sync_accounts(accounts.as_deref()).await;
+                let metadata = if result.is_ok() {
+                    core.load_mail_metadata(scope).await.ok()
+                } else {
+                    None
+                };
+                let _ = sync_tx
+                    .send(SyncUpdate {
+                        accounts,
+                        result,
+                        metadata,
+                    })
+                    .await;
+            });
+        })
+    };
+    {
+        let start_sync = Rc::clone(&start_sync);
+        app.on_sync_mail(move || start_sync(None));
+    }
+    {
+        let start_sync = Rc::clone(&start_sync);
+        app.on_sync_account(move |account_id| start_sync(Some(vec![i64::from(account_id)])));
+    }
+    {
+        let state = Rc::clone(&state);
+        app.on_check_mail_in_view(move || {
+            let accounts = state.borrow().accounts_in_view();
+            start_sync(accounts);
+        });
+    }
+
+    let app_weak = app.as_weak();
+    let state_for_check = Rc::clone(&state);
+    let runtime_for_check = runtime.clone();
+    app.on_set_email_checked(move |id, checked| {
+        let Some(app) = app_weak.upgrade() else {
+            return;
+        };
+        let rows = Rc::clone(&state_for_check.borrow().email_rows);
+        let is_visible = (0..rows.row_count())
+            .filter_map(|index| rows.row_data(index))
+            .any(|row| row.id == id);
+        if !is_visible {
+            return;
+        }
+        if checked {
+            state_for_check.borrow_mut().checked_ids.insert(id);
+        } else {
+            state_for_check.borrow_mut().checked_ids.remove(&id);
+        }
+        refresh_rows_only(&app, &state_for_check, &runtime_for_check);
+    });
+
+    let app_weak = app.as_weak();
+    let state_for_check_all = Rc::clone(&state);
+    let runtime_for_check_all = runtime.clone();
+    app.on_set_all_emails_checked(move |checked| {
+        let Some(app) = app_weak.upgrade() else {
+            return;
+        };
+        let rows = Rc::clone(&state_for_check_all.borrow().email_rows);
+        let visible_ids = (0..rows.row_count())
+            .filter_map(|index| rows.row_data(index))
+            .map(|row| row.id)
+            .collect::<Vec<_>>();
+        {
+            let mut state = state_for_check_all.borrow_mut();
+            if checked {
+                state.checked_ids.extend(visible_ids);
+            } else {
+                for id in visible_ids {
+                    state.checked_ids.remove(&id);
+                }
+            }
+        }
+        refresh_rows_only(&app, &state_for_check_all, &runtime_for_check_all);
+    });
+
+    let app_weak = app.as_weak();
+    let state_for_mail_group = Rc::clone(&state);
+    let runtime_for_mail_group = runtime.clone();
+    app.on_toggle_mail_group(move |key| {
+        let Some(app) = app_weak.upgrade() else {
+            return;
+        };
+        if !app.get_group_mail_by_date() {
+            return;
+        }
+        let key = key.to_string();
+        let header_exists = state_for_mail_group
+            .borrow()
+            .mail_list_entries
+            .iter()
+            .any(|entry| entry.is_header && entry.group_key.as_str() == key);
+        if !header_exists {
+            return;
+        }
+        let motion_enabled = app.global::<MotionSettings>().get_movement();
+        let generation = {
+            let mut state = state_for_mail_group.borrow_mut();
+            let (generation, _) = state.mail_groups.toggle(&key);
+            if !motion_enabled {
+                state.mail_groups.finish_transition(&key, generation);
+            }
+            generation
+        };
+        refresh_rows_only(&app, &state_for_mail_group, &runtime_for_mail_group);
+        if motion_enabled {
+            let state = Rc::downgrade(&state_for_mail_group);
+            let runtime = runtime_for_mail_group.clone();
+            let app_weak = app.as_weak();
+            Timer::single_shot(Duration::from_millis(330), move || {
+                let Some(state) = state.upgrade() else {
+                    return;
+                };
+                if state.borrow_mut().mail_groups.finish_transition(&key, generation)
+                    && let Some(app) = app_weak.upgrade()
+                {
+                    refresh_rows_only(&app, &state, &runtime);
+                }
+            });
+        }
+    });
+
+    let app_weak = app.as_weak();
+    let state_for_action = Rc::clone(&state);
+    let runtime_for_action = runtime.clone();
+    app.on_message_action(move |action| {
+        let Some(app) = app_weak.upgrade() else {
+            return;
+        };
+        if let Err(error) =
+            perform_selected_action(&app, &state_for_action, &runtime_for_action, &action)
+        {
+            app.set_render_status(UiMessage::detail("Message action failed: {}", error));
+        }
+    });
+
+    let app_weak = app.as_weak();
+    let state_for_row_action = Rc::clone(&state);
+    let runtime_for_row_action = runtime.clone();
+    app.on_message_action_for_email(move |id, action| {
+        let Some(app) = app_weak.upgrade() else {
+            return;
+        };
+        if let Err(error) = perform_mail_list_action(
+            &app,
+            &state_for_row_action,
+            &runtime_for_row_action,
+            id,
+            &action,
+            action != "delete_permanently",
+        ) {
+            app.set_render_status(UiMessage::detail("Message action failed: {}", error));
+        }
+    });
+
+    let app_weak = app.as_weak();
+    let state_for_bulk_action = Rc::clone(&state);
+    let runtime_for_bulk_action = runtime.clone();
+    app.on_bulk_message_action(move |action| {
+        let Some(app) = app_weak.upgrade() else {
+            return;
+        };
+        let Some(trigger_id) = state_for_bulk_action
+            .borrow()
+            .checked_ids
+            .iter()
+            .next()
+            .copied()
+        else {
+            return;
+        };
+        // The chosen messages, or conversations, go as attachments of a new message.
+        if action == "forward_attachment" {
+            let targets = {
+                let state = state_for_bulk_action.borrow();
+                let mut threads = Vec::new();
+                let mut messages = Vec::new();
+                for id in mail_operation_ids(&state.messages, &state.checked_ids, trigger_id) {
+                    match state
+                        .messages
+                        .iter()
+                        .find(|message| message.id == id)
+                        .and_then(MailTarget::of)
+                    {
+                        Some(MailTarget::Thread(thread)) => threads.push(thread),
+                        Some(MailTarget::Message { id, .. }) => messages.push(id),
+                        None => {}
+                    }
+                }
+                [
+                    flectar_mail_core::models::ActionTarget::Threads(threads),
+                    flectar_mail_core::models::ActionTarget::Messages(messages),
+                ]
+                .into_iter()
+                .filter(|target| match target {
+                    flectar_mail_core::models::ActionTarget::Threads(ids)
+                    | flectar_mail_core::models::ActionTarget::Messages(ids) => !ids.is_empty(),
+                })
+                .collect::<Vec<_>>()
+            };
+            composer::with_composers(|composers| composers.forward_as_attachment(&app, targets));
+            return;
+        }
+        if let Err(error) = perform_mail_list_action(
+            &app,
+            &state_for_bulk_action,
+            &runtime_for_bulk_action,
+            trigger_id,
+            &action,
+            true,
+        ) {
+            app.set_render_status(UiMessage::detail("Message action failed: {}", error));
+        }
+    });
+
+    // "Mark all as read…" from a sidebar row, once confirmed (#234).
+    let app_weak = app.as_weak();
+    let state_for_mark_all = Rc::clone(&state);
+    let runtime_for_mark_all = runtime.clone();
+    app.on_mark_all_read(move |scope| {
+        let Ok(scope) = scope.parse::<Scope>() else {
+            return;
+        };
+        let core = {
+            let state = state_for_mark_all.borrow();
+            state.core.clone().filter(|_| state.using_core)
+        };
+        let Some(core) = core else {
+            return;
+        };
+        let app = app_weak.clone();
+        runtime_for_mark_all.spawn(async move {
+            if let Err(error) = core.mark_all_read(scope).await {
+                let _ = app.upgrade_in_event_loop(move |app| {
+                    app.set_render_status(UiMessage::detail(
+                        "Could not mark all as read: {}",
+                        error,
+                    ));
+                });
+            }
+        });
+    });
+
+    let app_weak = app.as_weak();
+    let state_for_empty_trash = Rc::clone(&state);
+    app.on_empty_trash(move |requested_account_id| {
+        let Some(app) = app_weak.upgrade() else { return; };
+        let request = {
+            let state = state_for_empty_trash.borrow();
+            if !state.using_core { return; }
+            // A negative id empties the trash currently shown.
+            let account_id = match (requested_account_id, state.scope) {
+                (0, _) | (..0, Scope::Unified(StandardMailbox::Trash)) => None,
+                (1.., _) => Some(i64::from(requested_account_id)),
+                (_, Scope::Account { account_id, mailbox: StandardMailbox::Trash }) => Some(account_id),
+                _ => return,
+            };
+            // Every account's trash means every shown account's while a
+            // profile is active.
+            let operations = match (account_id, &state.profile_accounts) {
+                (None, Some(accounts)) => accounts
+                    .iter()
+                    .map(|account| {
+                        (
+                            -1,
+                            MailTarget::Thread(0),
+                            mail_work::Operation::EmptyTrash(Some(*account)),
+                        )
+                    })
+                    .collect(),
+                (account_id, _) => vec![(
+                    -1,
+                    MailTarget::Thread(0),
+                    mail_work::Operation::EmptyTrash(account_id),
+                )],
+            };
+            state.core.clone().map(|core| (core, operations))
+        };
+        let Some((core, operations)) = request else {
+            return;
+        };
+        if let Err(error) = mail_work::enqueue(&state_for_empty_trash, core, operations) {
+            app.set_render_status(UiMessage::detail("Message action failed: {}", error));
+        }
+    });
+
+    let app_weak = app.as_weak();
+    let state_for_label = Rc::clone(&state);
+    app.on_toggle_mail_label(move |label_id, applied| {
+        let Some(app) = app_weak.upgrade() else {
+            return;
+        };
+        let (core, selected_id, target) = {
+            let state = state_for_label.borrow();
+            let target = state
+                .selected_id
+                .and_then(|id| state.messages.iter().find(|message| message.id == id))
+                .and_then(MailTarget::of);
+            (state.core.clone(), state.selected_id, target)
+        };
+        let result = (|| {
+            let core = core.ok_or_else(|| "mail core is unavailable".to_owned())?;
+            let target = target.ok_or_else(|| "no message is selected".to_owned())?;
+            mail_work::enqueue(
+                &state_for_label,
+                core,
+                vec![(
+                    selected_id.unwrap(),
+                    target,
+                    mail_work::Operation::Label(i64::from(label_id), applied),
+                )],
+            )
+        })();
+        if let Err(error) = result {
+            app.set_render_status(UiMessage::detail("Could not update label: {}", error));
+        }
+    });
+
+    let app_weak = app.as_weak();
+    let state_for_save_label = Rc::clone(&state);
+    let runtime_for_save_label = runtime.clone();
+    app.on_save_mail_label(
+        move |label_id, owner_account_id, name, color, global, parent_label_id| {
+        let Some(app) = app_weak.upgrade() else {
+            return;
+        };
+        let (core, target, selected_account_id, parent_path) = {
+            let state = state_for_save_label.borrow();
+            let selected = state
+                .selected_id
+                .and_then(|id| state.messages.iter().find(|message| message.id == id));
+            (
+                state.core.clone(),
+                selected.and_then(MailTarget::of),
+                selected.map(|message| message.account_id),
+                if parent_label_id >= 0 {
+                    state
+                        .labels
+                        .iter()
+                        .find(|label| {
+                            label.id == i64::from(parent_label_id)
+                                && !label.is_auto
+                                && label.owner_account_id == Some(i64::from(owner_account_id))
+                        })
+                        .map(|label| label.name.clone())
+                        .ok_or_else(|| "the parent label no longer exists".to_owned())
+                        .map(Some)
+                } else {
+                    Ok(None)
+                },
+            )
+        };
+        let existing_id = (label_id >= 0).then_some(i64::from(label_id));
+        let color = format!(
+            "#{:02x}{:02x}{:02x}",
+            color.red(),
+            color.green(),
+            color.blue()
+        );
+        let result: Result<bool, String> = (|| {
+            let core = core.ok_or_else(|| "mail core is unavailable".to_owned())?;
+            let parent_path = parent_path?;
+            let leaf = name.trim();
+            if existing_id.is_none() && owner_account_id >= 0 && leaf.contains('/') {
+                return Err(
+                    "label names cannot contain '/'; create each nesting level separately"
+                        .to_owned(),
+                );
+            }
+            let full_name = if existing_id.is_none()
+                && let Some(parent_path) = parent_path
+            {
+                format!("{}/{leaf}", parent_path.trim_end_matches('/'))
+            } else {
+                leaf.to_owned()
+            };
+            let label = runtime_for_save_label.block_on(core.save_label(
+                existing_id,
+                &full_name,
+                color.as_str(),
+                if existing_id.is_none() && !global {
+                    Some(if owner_account_id >= 0 {
+                        i64::from(owner_account_id)
+                    } else {
+                        selected_account_id.ok_or_else(|| {
+                            "select a message before creating an account label".to_owned()
+                        })?
+                    })
+                } else {
+                    None
+                },
+            ))?;
+            if existing_id.is_none() && owner_account_id < 0 {
+                let target = target.ok_or_else(|| "no message is selected".to_owned())?;
+                runtime_for_save_label
+                    .block_on(core.perform_label_action(target, label.id, true))?;
+            }
+            refresh_from_source(
+                &app,
+                &state_for_save_label,
+                &runtime_for_save_label,
+                true,
+                &[],
+            )?;
+            Ok(existing_id.is_some())
+        })();
+        match result {
+            Ok(true) => app.set_render_status(UiMessage::plain("Label updated.")),
+            Ok(false) if owner_account_id >= 0 => {
+                app.set_render_status(UiMessage::plain("Label created."))
+            }
+            Ok(false) => app.set_render_status(UiMessage::plain("Label created and added.")),
+            Err(error) => {
+                app.set_render_status(UiMessage::detail("Could not save label: {}", error))
+            }
+        }
+    },
+    );
+
+    let app_weak = app.as_weak();
+    let state_for_delete_label = Rc::clone(&state);
+    let runtime_for_delete_label = runtime.clone();
+    app.on_delete_mail_label(move |label_id| {
+        let Some(app) = app_weak.upgrade() else {
+            return;
+        };
+        let label_id = i64::from(label_id);
+        let result = (|| {
+            let core = {
+                let state = state_for_delete_label.borrow();
+                let label = state
+                    .labels
+                    .iter()
+                    .find(|label| label.id == label_id)
+                    .ok_or_else(|| "label no longer exists".to_owned())?;
+                if label.is_auto {
+                    return Err("automatic categories cannot be deleted".to_owned());
+                }
+                state
+                    .core
+                    .clone()
+                    .ok_or_else(|| "mail core is unavailable".to_owned())?
+            };
+            runtime_for_delete_label.block_on(core.delete_label(label_id))?;
+            let shown = {
+                let mut state = state_for_delete_label.borrow_mut();
+                // Tabs on the label now reopen at the inbox.
+                state.labels.retain(|label| label.id != label_id);
+                state.scope.label_id() == Some(label_id)
+            };
+            if shown {
+                // The inbox replaces the label's rows, as if chosen in the
+                // sidebar.
+                app.invoke_select_scope(Scope::UNIFIED_INBOX.to_string().into());
+                Ok(())
+            } else {
+                refresh_from_source(
+                    &app,
+                    &state_for_delete_label,
+                    &runtime_for_delete_label,
+                    true,
+                    &[],
+                )
+            }
+        })();
+        match result {
+            Ok(()) => app.set_render_status(UiMessage::plain("Label deleted.")),
+            Err(error) => {
+                app.set_render_status(UiMessage::detail("Could not delete label: {}", error))
+            }
+        }
+    });
+
+    let app_weak = app.as_weak();
+    let state_for_label_search = Rc::clone(&state);
+    app.on_search_mail_labels(move |query| {
+        let Some(app) = app_weak.upgrade() else {
+            return;
+        };
+        let state = state_for_label_search.borrow();
+        let selected = state
+            .selected_id
+            .and_then(|id| state.messages.iter().find(|message| message.id == id));
+        app.set_mail_label_results(ModelRc::new(VecModel::from(make_label_rows(
+            &state.labels,
+            selected,
+            query.as_str(),
+        ))));
+    });
+
+    let app_weak = app.as_weak();
+    let state_for_close_preview = Rc::clone(&state);
+    let runtime_for_close_preview = runtime.clone();
+    app.on_close_preview(move || {
+        let Some(app) = app_weak.upgrade() else {
+            return;
+        };
+        {
+            let mut state = state_for_close_preview.borrow_mut();
+            state.selected_id = None;
+            state.preview_closed = true;
+        }
+        if let Err(error) =
+            render_current(&app, &state_for_close_preview, &runtime_for_close_preview)
+        {
+            app.set_render_status(UiMessage::detail("Could not close preview: {}", error));
+        }
+    });
+
+    let app_weak = app.as_weak();
+    let state_for_print = Rc::clone(&state);
+    app.on_print_message(move || {
+        let Some(app) = app_weak.upgrade() else {
+            return;
+        };
+        match print_selected_message(&state_for_print) {
+            Ok(()) => app.set_render_status(UiMessage::plain("Opened the system print view.")),
+            Err(error) => {
+                app.set_render_status(UiMessage::detail("Could not print message: {}", error))
+            }
+        }
+    });
+
+    let app_weak = app.as_weak();
+    let state_for_browser = Rc::clone(&state);
+    app.on_open_message_in_browser(move || {
+        let Some(app) = app_weak.upgrade() else {
+            return;
+        };
+        match open_selected_message_in_browser(&state_for_browser) {
+            Ok(()) => {
+                app.set_render_status(UiMessage::plain("Opened the message in your browser."))
+            }
+            Err(error) => app.set_render_status(UiMessage::detail(
+                "Could not open message in browser: {}",
+                error,
+            )),
+        }
+    });
+
+    register_settings_preference_callbacks(&app, &state, &runtime);
+    settings_controller::register_update_callbacks(&app, &state, &runtime, &platform.paths.cache_dir);
+    #[cfg(desktop)]
+    agents::register_settings(&app, &state, &runtime);
+
+    account_mail_preferences::register(&app, &state, &runtime);
+    auto_replies::register(&app, &state, &runtime, platform.external_urls.clone());
+    let composers = composer::install(
+        &app,
+        &state,
+        &runtime,
+        platform.documents.clone(),
+        platform.paths.temp_dir(),
+        cfg!(desktop),
+    );
+    mailto_links::install(&app, composers);
+    undo::install(&app, &state, &runtime);
+    unsubscribe::install(&app, &state, &runtime, platform.external_urls.clone());
+    link_services::install(&app, &state, &runtime, platform.external_urls.clone());
+    read_receipts::install(&app, &state, &runtime);
+    folder_roles::install(&app, &state, &runtime);
+    message_source::install(&app, &state, &runtime, platform.documents.clone());
+    translation::install(&app, &state, &runtime);
+    ai_features::install(&app, &state, &runtime);
+    network::install(&app, &state, &runtime);
+    block_sender::install(&app, &state, &runtime);
+    saved_searches::install(&app, &state, &runtime);
+    server_search::install(&app, &state, &runtime);
+    mail_rules::install(&app, &state, &runtime);
+    invitation::install(&app, &state, &calendar_state, &runtime);
+    #[cfg(target_os = "macos")]
+    mailto_links::receive_from_macos(&app);
+    notifications::ui::attach(&app, &state, &runtime, platform.notifications.clone());
+
+    when_picker::register(&app, &state, &runtime);
+    let app_weak = app.as_weak();
+    let state_for_account = Rc::clone(&state);
+    let runtime_for_account = runtime.clone();
+    let ui_task_tx_for_account = ui_task_tx.clone();
+    oauth_browser::register(
+        &app,
+        platform.oauth_redirects.clone(),
+        platform.external_urls.clone(),
+    );
+    mail_setup::register(&app, &runtime, &platform.documents);
+    contact_import::install(
+        &app,
+        &state,
+        &contact_state,
+        &runtime,
+        &platform.documents,
+        platform.paths.temp_dir(),
+    );
+
+    let suggestion_app = app.as_weak();
+    let suggestion_state = Rc::clone(&state);
+    let suggestion_runtime = runtime.clone();
+    app.on_suggest_account_settings(move |email| {
+        let Some(app) = suggestion_app.upgrade() else {
+            return;
+        };
+        let state = suggestion_state.borrow();
+        account_discovery::suggest(
+            &app,
+            &state.account_configs,
+            email.as_str(),
+            &suggestion_runtime,
+        );
+    });
+
+    app.on_add_password_account(
+        move |protocol,
+              email,
+              username,
+              password,
+              jmap_url,
+              incoming_host,
+              incoming_port,
+              smtp_host,
+              smtp_port| {
+            let Some(app) = app_weak.upgrade() else {
+                return;
+            };
+            if app.get_account_setup_in_progress() {
+                return;
+            }
+            let unsupported = || {
+                app.set_sync_status(UiMessage::plain(
+                    "Choose a supported account type and connection security.",
+                ))
+            };
+            let (
+                Some(mail_protocol),
+                Some(incoming_security),
+                Some(smtp_security),
+                Some(incoming_login),
+                Some(smtp_login),
+            ) = (
+                MailProtocol::parse(protocol.as_str()),
+                ConnectionSecurity::parse(app.get_incoming_security().as_str()),
+                ConnectionSecurity::parse(app.get_smtp_security().as_str()),
+                LoginMethod::parse(app.get_incoming_login().as_str()),
+                LoginMethod::parse(app.get_smtp_login().as_str()),
+            )
+            else {
+                unsupported();
+                return;
+            };
+            // An account without an SMTP server only receives mail (#252).
+            let sends_mail = mail_protocol == MailProtocol::Jmap || app.get_account_sends_mail();
+            let port = |value: &str| value.trim().parse::<u16>().ok().filter(|port| *port > 0);
+            let (incoming_port, smtp_port, progress) = match mail_protocol {
+                // JMAP discovers its endpoints; the server ports are unused.
+                MailProtocol::Jmap => (
+                    993,
+                    465,
+                    UiMessage::plain("Discovering JMAP and checking capabilities…"),
+                ),
+                MailProtocol::Imap | MailProtocol::Pop3 => {
+                    let Some(incoming_port) = port(&incoming_port) else {
+                        app.set_sync_status(match mail_protocol {
+                            MailProtocol::Pop3 => {
+                                UiMessage::plain("POP3 port must be between 1 and 65535.")
+                            }
+                            _ => UiMessage::plain("IMAP port must be between 1 and 65535."),
+                        });
+                        return;
+                    };
+                    let smtp_port = if sends_mail {
+                        let Some(smtp_port) = port(&smtp_port) else {
+                            app.set_sync_status(UiMessage::plain(
+                                "SMTP port must be between 1 and 65535.",
+                            ));
+                            return;
+                        };
+                        smtp_port
+                    } else {
+                        0
+                    };
+                    (
+                        incoming_port,
+                        smtp_port,
+                        match (mail_protocol, sends_mail) {
+                            (MailProtocol::Pop3, true) => {
+                                UiMessage::plain("Testing POP3 and SMTP connections…")
+                            }
+                            (MailProtocol::Pop3, false) => {
+                                UiMessage::plain("Testing the POP3 connection…")
+                            }
+                            (_, true) => UiMessage::plain("Testing IMAP and SMTP connections…"),
+                            (_, false) => UiMessage::plain("Testing the IMAP connection…"),
+                        },
+                    )
+                }
+                MailProtocol::Gmail | MailProtocol::Local => {
+                    unsupported();
+                    return;
+                }
+            };
+            let Some(core) = state_for_account.borrow().core.clone() else {
+                app.set_sync_status(UiMessage::plain(
+                    "Local mail data is unavailable. Retry startup.",
+                ));
+                return;
+            };
+            app.set_sync_status(progress);
+            let args = AddPasswordAccountArgs {
+                email: email.to_string(),
+                display_name: None,
+                username: username.to_string(),
+                password: password.to_string(),
+                mail_protocol,
+                jmap_url: jmap_url.to_string(),
+                incoming_host: incoming_host.to_string(),
+                incoming_port,
+                smtp_host: if sends_mail {
+                    smtp_host.to_string()
+                } else {
+                    String::new()
+                },
+                smtp_port,
+                // Empty keeps the saved one, or the account's password.
+                smtp_password: Some(app.get_smtp_password().to_string())
+                    .filter(|password| !password.is_empty()),
+                connection: MailConnectionSettings {
+                    trusted_certificate_pem: app.get_trusted_certificate_pem().to_string(),
+                    incoming_login,
+                    smtp_login,
+                    smtp_username: Some(app.get_smtp_username().trim().to_owned())
+                        .filter(|username| !username.is_empty()),
+                    ..MailConnectionSettings::new(incoming_security, smtp_security)
+                },
+            };
+            app.set_account_setup_in_progress(true);
+            let updates = ui_task_tx_for_account.clone();
+            runtime_for_account.spawn(async move {
+                let update = match core.add_password_account(args).await {
+                    Ok(account) => {
+                        // The account actor starts its first sync as soon as it
+                        // is created. Waiting for that potentially enormous
+                        // mailbox here would only hold the setup UI hostage.
+                        let accounts = core.load_account_snapshot().await.ok();
+                        UiTaskUpdate {
+                            message: UiMessage::detail(
+                                "Connected {}. Initial sync is running in the background.",
+                                account.email,
+                            ),
+                            accounts,
+                            calendar_connections: None,
+                            carddav_connections: None,
+                            calendar_error: None,
+                            account_removal: None,
+                            clear_account_form: true,
+                            finishes_account_setup: true,
+                            finishes_oauth: false,
+                            close_to_tray: None,
+                        }
+                    }
+                    Err(error) => UiTaskUpdate {
+                        message: UiMessage::detail("Account setup failed: {}", error),
+                        accounts: None,
+                        calendar_connections: None,
+                        carddav_connections: None,
+                        calendar_error: None,
+                        account_removal: None,
+                        clear_account_form: false,
+                        finishes_account_setup: true,
+                        finishes_oauth: false,
+                        close_to_tray: None,
+                    },
+                };
+                let _ = updates.send(update).await;
+            });
+        },
+    );
+
+    let app_weak = app.as_weak();
+    let state_for_oauth = Rc::clone(&state);
+    let runtime_for_oauth = runtime.clone();
+    let ui_task_tx_for_oauth = ui_task_tx.clone();
+    let opener_for_oauth = platform.external_urls.clone();
+    app.on_start_oauth(move |provider| {
+        let Some(app) = app_weak.upgrade() else {
+            return;
+        };
+        if app.get_oauth_settings_saving() {
+            return;
+        }
+        if app.get_oauth_in_progress() {
+            app.set_sync_status(UiMessage::plain(
+                "Another browser authorization is already in progress; finish it or choose Cancel.",
+            ));
+            return;
+        }
+        let provider = match Provider::parse(provider.as_str()) {
+            Some(provider @ (Provider::Gmail | Provider::Microsoft)) => provider,
+            Some(Provider::Generic) | None => {
+                app.set_sync_status(UiMessage::plain("Choose Gmail or Outlook OAuth."));
+                return;
+            }
+        };
+        let Some(core) = state_for_oauth.borrow().core.clone() else {
+            app.set_sync_status(UiMessage::plain(
+                "Local mail data is unavailable. Retry startup.",
+            ));
+            return;
+        };
+        startup::refresh_oauth_availability(&app);
+        if flectar_mail_core::oauth::providers::resolve_credentials(provider).is_err() {
+            app.set_sync_status(UiMessage::plain(
+                "Add app keys in Sign-in settings to enable this provider.",
+            ));
+            return;
+        }
+        app.set_oauth_authorization_url("".into());
+        app.set_oauth_browser_error(false);
+        app.set_oauth_in_progress(true);
+        let connect_calendar = app.get_connect_calendar_on_add();
+        app.set_sync_status(UiMessage::plain(
+            "Complete sign-in in your browser, or choose Cancel here.",
+        ));
+        let updates = ui_task_tx_for_oauth.clone();
+        let browser_app = app.as_weak();
+        let opener = opener_for_oauth.clone();
+        runtime_for_oauth.spawn(async move {
+            let result = core
+                .start_oauth_with_calendar(provider, connect_calendar, move |url| {
+                    oauth_browser::begin(browser_app.clone(), url, opener.clone())
+                })
+                .await;
+            let update = match result {
+                Ok(account) => {
+                    let accounts = core.load_account_snapshot().await.ok();
+                    UiTaskUpdate {
+                        message: UiMessage::detail(
+                            "Connected {}. Initial sync is running in the background.",
+                            account.email,
+                        ),
+                        accounts,
+                        calendar_connections: core.load_calendar_connections().await.ok(),
+                        carddav_connections: core.load_carddav_connections().await.ok(),
+                        calendar_error: None,
+                        account_removal: None,
+                        clear_account_form: false,
+                        finishes_account_setup: false,
+                        finishes_oauth: true,
+                        close_to_tray: None,
+                    }
+                }
+                Err(error) => UiTaskUpdate {
+                    message: UiMessage::detail("OAuth failed: {}", error),
+                    accounts: None,
+                    calendar_connections: None,
+                    carddav_connections: None,
+                    calendar_error: None,
+                    account_removal: None,
+                    clear_account_form: false,
+                    finishes_account_setup: false,
+                    finishes_oauth: true,
+                    close_to_tray: None,
+                },
+            };
+            let _ = updates.send(update).await;
+        });
+    });
+
+    let app_weak = app.as_weak();
+    let state_for_reauth = Rc::clone(&state);
+    let runtime_for_reauth = runtime.clone();
+    let ui_task_tx_for_reauth = ui_task_tx.clone();
+    let opener_for_reauth = platform.external_urls.clone();
+    app.on_reauth_account(move |account_id| {
+        let Some(app) = app_weak.upgrade() else {
+            return;
+        };
+        if app.get_oauth_settings_saving() {
+            return;
+        }
+        if app.get_oauth_in_progress() {
+            app.set_sync_status(UiMessage::plain(
+                "Another browser authorization is already in progress; finish it or choose Cancel.",
+            ));
+            return;
+        }
+        let Some(core) = state_for_reauth.borrow().core.clone() else {
+            app.set_sync_status(UiMessage::plain(
+                "Local mail data is unavailable. Retry startup.",
+            ));
+            return;
+        };
+        app.set_oauth_authorization_url("".into());
+        app.set_oauth_browser_error(false);
+        app.set_oauth_in_progress(true);
+        app.set_sync_status(UiMessage::plain(
+            "Complete sign-in in your browser, or choose Cancel here.",
+        ));
+        let updates = ui_task_tx_for_reauth.clone();
+        let browser_app = app.as_weak();
+        let opener = opener_for_reauth.clone();
+        runtime_for_reauth.spawn(async move {
+            let result = core
+                .reauth_account(i64::from(account_id), move |url| {
+                    oauth_browser::begin(browser_app.clone(), url, opener.clone())
+                })
+                .await;
+            let update = match result {
+                Ok(account) => {
+                    let accounts = core.load_account_snapshot().await.ok();
+                    UiTaskUpdate {
+                        message: UiMessage::detail(
+                            "Reconnected {}. Synchronization is resuming.",
+                            account.email,
+                        ),
+                        accounts,
+                        calendar_connections: core.load_calendar_connections().await.ok(),
+                        carddav_connections: core.load_carddav_connections().await.ok(),
+                        calendar_error: None,
+                        account_removal: None,
+                        clear_account_form: false,
+                        finishes_account_setup: false,
+                        finishes_oauth: true,
+                        close_to_tray: None,
+                    }
+                }
+                Err(error) => UiTaskUpdate {
+                    message: UiMessage::detail("Reconnection failed: {}", error),
+                    accounts: None,
+                    calendar_connections: None,
+                    carddav_connections: None,
+                    calendar_error: None,
+                    account_removal: None,
+                    clear_account_form: false,
+                    finishes_account_setup: false,
+                    finishes_oauth: true,
+                    close_to_tray: None,
+                },
+            };
+            let _ = updates.send(update).await;
+        });
+    });
+
+    let app_weak = app.as_weak();
+    let state_for_oauth_cancel = Rc::clone(&state);
+    app.on_cancel_oauth(move || {
+        let Some(app) = app_weak.upgrade() else {
+            return;
+        };
+        if let Some(core) = state_for_oauth_cancel.borrow().core.as_ref() {
+            core.cancel_oauth();
+            app.set_sync_status(UiMessage::plain("Cancelling browser sign-in…"));
+        }
+    });
+
+    let app_weak = app.as_weak();
+    let state_for_calendar_connect = Rc::clone(&state);
+    let runtime_for_calendar_connect = runtime.clone();
+    let updates_for_calendar_connect = ui_task_tx.clone();
+    let opener_for_calendar_connect = platform.external_urls.clone();
+    app.on_connect_account_calendar(move |account_id| {
+        let Some(app) = app_weak.upgrade() else {
+            return;
+        };
+        if app.get_oauth_settings_saving() {
+            return;
+        }
+        if app.get_oauth_in_progress() {
+            app.set_sync_status(UiMessage::plain(
+                "Another browser authorization is already in progress; finish it or choose Cancel.",
+            ));
+            return;
+        }
+        let (core, provider) = {
+            let state = state_for_calendar_connect.borrow();
+            let Some(core) = state.core.clone() else {
+                app.set_sync_status(UiMessage::plain("Calendar core is unavailable."));
+                return;
+            };
+            let Some(provider) = state
+                .connected_accounts
+                .iter()
+                .find(|account| account.id == i64::from(account_id))
+                .map(|account| account.provider)
+            else {
+                app.set_sync_status(UiMessage::plain("Account no longer exists."));
+                return;
+            };
+            (core, provider)
+        };
+        app.set_oauth_authorization_url("".into());
+        app.set_oauth_browser_error(false);
+        app.set_oauth_in_progress(true);
+        app.set_sync_status(UiMessage::plain(
+            "Authorize calendar access in your browser.",
+        ));
+        let updates = updates_for_calendar_connect.clone();
+        let browser_app = app.as_weak();
+        let opener = opener_for_calendar_connect.clone();
+        runtime_for_calendar_connect.spawn(async move {
+            let result = core
+                .connect_provider_calendar(i64::from(account_id), provider, move |url| {
+                    oauth_browser::begin(browser_app.clone(), url, opener.clone())
+                })
+                .await;
+            let connections = core.load_calendar_connections().await.ok();
+            let calendar_error = Some((i64::from(account_id), result.as_ref().err().cloned()));
+            let message = match result {
+                Ok(_) => UiMessage::plain("Calendar connected and initial sync started."),
+                Err(error) => UiMessage::detail("Could not connect calendar: {}", error),
+            };
+            let _ = updates
+                .send(UiTaskUpdate {
+                    message,
+                    accounts: None,
+                    calendar_connections: connections,
+                    carddav_connections: None,
+                    calendar_error,
+                    account_removal: None,
+                    clear_account_form: false,
+                    finishes_account_setup: false,
+                    finishes_oauth: true,
+                    close_to_tray: None,
+                })
+                .await;
+        });
+    });
+
+    let state_for_calendar_toggle = Rc::clone(&state);
+    let runtime_for_calendar_toggle = runtime.clone();
+    let updates_for_calendar_toggle = ui_task_tx.clone();
+    app.on_set_calendar_connection_enabled(move |connection_id, enabled| {
+        let Some(core) = state_for_calendar_toggle.borrow().core.clone() else {
+            return;
+        };
+        let updates = updates_for_calendar_toggle.clone();
+        runtime_for_calendar_toggle.spawn(async move {
+            let message = match core
+                .set_calendar_connection_enabled(i64::from(connection_id), enabled)
+                .await
+            {
+                Ok(_) => {
+                    if enabled {
+                        UiMessage::plain("Calendar sync enabled.")
+                    } else {
+                        UiMessage::plain("Calendar sync paused.")
+                    }
+                }
+                Err(error) => UiMessage::detail("Could not update calendar sync: {}", error),
+            };
+            let connections = core.load_calendar_connections().await.ok();
+            let _ = updates
+                .send(UiTaskUpdate {
+                    message,
+                    accounts: None,
+                    calendar_connections: connections,
+                    carddav_connections: None,
+                    calendar_error: None,
+                    account_removal: None,
+                    clear_account_form: false,
+                    finishes_account_setup: false,
+                    finishes_oauth: false,
+                    close_to_tray: None,
+                })
+                .await;
+        });
+    });
+
+    let state_for_calendar_removal = Rc::clone(&state);
+    let runtime_for_calendar_removal = runtime.clone();
+    let updates_for_calendar_removal = ui_task_tx.clone();
+    app.on_remove_calendar_connection(move |connection_id| {
+        let Some(core) = state_for_calendar_removal.borrow().core.clone() else {
+            return;
+        };
+        let updates = updates_for_calendar_removal.clone();
+        runtime_for_calendar_removal.spawn(async move {
+            let message = match core
+                .remove_calendar_connection(i64::from(connection_id))
+                .await
+            {
+                Ok(()) => UiMessage::plain("Calendar removed."),
+                Err(error) => UiMessage::detail("Could not remove calendar: {}", error),
+            };
+            let connections = core.load_calendar_connections().await.ok();
+            let _ = updates
+                .send(UiTaskUpdate {
+                    message,
+                    accounts: None,
+                    calendar_connections: connections,
+                    carddav_connections: None,
+                    calendar_error: None,
+                    account_removal: None,
+                    clear_account_form: false,
+                    finishes_account_setup: false,
+                    finishes_oauth: false,
+                    close_to_tray: None,
+                })
+                .await;
+        });
+    });
+
+    let state_for_caldav = Rc::clone(&state);
+    let runtime_for_caldav = runtime.clone();
+    let updates_for_caldav = ui_task_tx.clone();
+    let app_for_caldav = app.as_weak();
+    app.on_connect_caldav(move |account_id, connection_id, url, username, password| {
+        let Some(app) = app_for_caldav.upgrade() else {
+            return;
+        };
+        if app.get_caldav_connecting() {
+            return;
+        }
+        let Some(core) = state_for_caldav.borrow().core.clone() else {
+            app.set_sync_status(UiMessage::plain("Calendar storage is unavailable."));
+            return;
+        };
+        app.set_caldav_connecting(true);
+        let updates = updates_for_caldav.clone();
+        let app = app_for_caldav.clone();
+        runtime_for_caldav.spawn(async move {
+            let result = core
+                .connect_caldav(
+                    i64::from(account_id),
+                    (connection_id > 0).then_some(i64::from(connection_id)),
+                    url.to_string(),
+                    username.to_string(),
+                    password.to_string(),
+                )
+                .await;
+            let connected = result.is_ok();
+            let message = match result {
+                Ok(_) => UiMessage::plain("CalDAV connected and initial sync started."),
+                Err(error) => UiMessage::detail("Could not connect CalDAV: {}", error),
+            };
+            let _ = app.upgrade_in_event_loop(move |app| {
+                app.set_caldav_connecting(false);
+                // Close the form only when it still shows this connection.
+                if connected
+                    && app.get_caldav_account_id() == account_id
+                    && app.get_caldav_connection_id() == connection_id
+                {
+                    app.set_caldav_account_id(-1);
+                    app.set_caldav_connection_id(-1);
+                    app.set_caldav_password("".into());
+                }
+            });
+            let connections = core.load_calendar_connections().await.ok();
+            let _ = updates
+                .send(UiTaskUpdate {
+                    message,
+                    accounts: None,
+                    calendar_connections: connections,
+                    carddav_connections: None,
+                    calendar_error: None,
+                    account_removal: None,
+                    clear_account_form: false,
+                    finishes_account_setup: false,
+                    finishes_oauth: false,
+                    close_to_tray: None,
+                })
+                .await;
+        });
+    });
+
+    let state_for_carddav = Rc::clone(&state);
+    let runtime_for_carddav = runtime.clone();
+    let updates_for_carddav = ui_task_tx.clone();
+    let app_for_carddav = app.as_weak();
+    app.on_connect_carddav(move |account_id, url, username, password| {
+        let Some(app) = app_for_carddav.upgrade() else {
+            return;
+        };
+        if app.get_carddav_connecting() {
+            return;
+        }
+        let Some(core) = state_for_carddav.borrow().core.clone() else {
+            return;
+        };
+        app.set_carddav_connecting(true);
+        let updates = updates_for_carddav.clone();
+        let app = app_for_carddav.clone();
+        runtime_for_carddav.spawn(async move {
+            let result = core
+                .connect_carddav(
+                    i64::from(account_id),
+                    url.to_string(),
+                    username.to_string(),
+                    password.to_string(),
+                )
+                .await;
+            let connected = result.is_ok();
+            let message = match result {
+                Ok(_) => UiMessage::plain("CardDAV connected and initial sync started."),
+                Err(error) => UiMessage::detail("Could not connect CardDAV: {}", error),
+            };
+            let _ = app.upgrade_in_event_loop(move |app| {
+                app.set_carddav_connecting(false);
+                // Close the dialog only when it still shows this account.
+                if connected && app.get_carddav_account_id() == account_id {
+                    app.set_carddav_account_id(-1);
+                    app.set_carddav_password("".into());
+                    app.set_carddav_manage_existing(false);
+                }
+            });
+            let connections = core.load_carddav_connections().await.ok();
+            let _ = updates
+                .send(UiTaskUpdate {
+                    message,
+                    accounts: None,
+                    calendar_connections: None,
+                    carddav_connections: connections,
+                    calendar_error: None,
+                    account_removal: None,
+                    clear_account_form: false,
+                    finishes_account_setup: false,
+                    finishes_oauth: false,
+                    close_to_tray: None,
+                })
+                .await;
+        });
+    });
+
+    let state_for_carddav_toggle = Rc::clone(&state);
+    let runtime_for_carddav_toggle = runtime.clone();
+    let updates_for_carddav_toggle = ui_task_tx.clone();
+    app.on_set_account_carddav_enabled(move |account_id, enabled| {
+        let Some(core) = state_for_carddav_toggle.borrow().core.clone() else {
+            return;
+        };
+        let updates = updates_for_carddav_toggle.clone();
+        runtime_for_carddav_toggle.spawn(async move {
+            let message = match core
+                .set_account_carddav_enabled(i64::from(account_id), enabled)
+                .await
+            {
+                Ok(()) if enabled => UiMessage::plain("CardDAV sync enabled."),
+                Ok(()) => UiMessage::plain("CardDAV sync paused."),
+                Err(error) => UiMessage::detail("Could not update CardDAV sync: {}", error),
+            };
+            let connections = core.load_carddav_connections().await.ok();
+            let _ = updates
+                .send(UiTaskUpdate {
+                    message,
+                    accounts: None,
+                    calendar_connections: None,
+                    carddav_connections: connections,
+                    calendar_error: None,
+                    account_removal: None,
+                    clear_account_form: false,
+                    finishes_account_setup: false,
+                    finishes_oauth: false,
+                    close_to_tray: None,
+                })
+                .await;
+        });
+    });
+
+    let state_for_carddav_disconnect = Rc::clone(&state);
+    let runtime_for_carddav_disconnect = runtime.clone();
+    let updates_for_carddav_disconnect = ui_task_tx.clone();
+    app.on_disconnect_carddav(move |account_id| {
+        let Some(core) = state_for_carddav_disconnect.borrow().core.clone() else {
+            return;
+        };
+        let updates = updates_for_carddav_disconnect.clone();
+        runtime_for_carddav_disconnect.spawn(async move {
+            let message = match core.disconnect_carddav(i64::from(account_id)).await {
+                Ok(()) => UiMessage::plain("CardDAV disconnected."),
+                Err(error) => UiMessage::detail("Could not disconnect CardDAV: {}", error),
+            };
+            let connections = core.load_carddav_connections().await.ok();
+            let _ = updates
+                .send(UiTaskUpdate {
+                    message,
+                    accounts: None,
+                    calendar_connections: None,
+                    carddav_connections: connections,
+                    calendar_error: None,
+                    account_removal: None,
+                    clear_account_form: false,
+                    finishes_account_setup: false,
+                    finishes_oauth: false,
+                    close_to_tray: None,
+                })
+                .await;
+        });
+    });
+
+    settings_controller::register_oauth_settings_callbacks(&app, &state, &runtime);
+
+    register_data_management_callbacks(
+        &app,
+        &platform.paths,
+        &platform.documents,
+        &state,
+        &runtime,
+        &ui_task_tx,
+        &contact_state,
+        &contacts_loaded,
+        &contacts_loading,
+        &contact_load_generation,
+        &calendar_state,
+    );
+
+    import_controller::register_import_callbacks(&app, &platform.documents, &state, &runtime);
+    device_sync.register(
+        &app,
+        &state,
+        &runtime,
+        platform.external_urls.clone(),
+        platform.documents.clone(),
+        platform.paths.temp_dir(),
+    );
+
+    register_renderer_input_callbacks(
+        &app,
+        &email_renderer,
+        use_wgpu,
+        platform.external_urls.clone(),
+    );
+    let state_for_report = Rc::clone(&state);
+    rendering_report::register(
+        &app,
+        move || {
+            state_for_report
+                .borrow()
+                .core
+                .as_ref()
+                .map(|core| core.file_core())
+        },
+        &runtime,
+        platform.documents.clone(),
+        platform.paths.temp_dir(),
+        platform.external_urls.clone(),
+    );
+
+    let app_weak = app.as_weak();
+    let state_for_search = Rc::clone(&state);
+    let runtime_for_search = runtime.clone();
+    let mail_pagination_generation_for_search = Rc::clone(&mail_pagination_generation);
+    let mail_pagination_in_progress_for_search = Rc::clone(&mail_pagination_in_progress);
+    app.on_search_changed(move |query| {
+        let Some(app) = app_weak.upgrade() else {
+            return;
+        };
+        mail_pagination_generation_for_search
+            .set(mail_pagination_generation_for_search.get().wrapping_add(1));
+        mail_pagination_in_progress_for_search.set(false);
+        app.set_mail_loading_more(false);
+        {
+            let mut state = state_for_search.borrow_mut();
+            state.query = query.to_string();
+            state.pending_selection = None;
+            state.pending_selection_opens = false;
+            state.restore_thread_message = None;
+            state.mail_groups.clear();
+            state.page = 1;
+            state.next_cursor = None;
+            state.selected_id = None;
+            state.checked_ids.clear();
+            state.preview_closed = false;
+        }
+        if let Err(error) =
+            refresh_from_source(&app, &state_for_search, &runtime_for_search, false, &[])
+        {
+            app.set_render_status(UiMessage::detail("Mail refresh failed: {}", error));
+        }
+    });
+
+    let app_weak = app.as_weak();
+    let state_for_filter = Rc::clone(&state);
+    let runtime_for_filter = runtime.clone();
+    app.on_set_search_filter(move |filter| {
+        let Some(app) = app_weak.upgrade() else {
+            return;
+        };
+        {
+            let mut state = state_for_filter.borrow_mut();
+            state.search_filter = filter.to_string();
+            state.mail_groups.clear();
+            state.page = 1;
+            state.selected_id = None;
+            state.checked_ids.clear();
+        }
+        if let Err(error) = render_current(&app, &state_for_filter, &runtime_for_filter) {
+            app.set_render_status(UiMessage::detail("Mail filter failed: {}", error));
+        }
+    });
+
+    // Turning a list around is like opening it again: it starts over at the
+    // top, in the new order, and keeps that order from now on.
+    let app_weak = app.as_weak();
+    let state_for_order = Rc::clone(&state);
+    let runtime_for_order = runtime.clone();
+    let mail_pagination_generation_for_order = Rc::clone(&mail_pagination_generation);
+    let mail_pagination_in_progress_for_order = Rc::clone(&mail_pagination_in_progress);
+    app.on_set_mail_oldest_first(move |oldest_first| {
+        let Some(app) = app_weak.upgrade() else {
+            return;
+        };
+        let order = if oldest_first {
+            ListOrder::OldestFirst
+        } else {
+            ListOrder::NewestFirst
+        };
+        let (core, scope) = {
+            let state = state_for_order.borrow();
+            (state.core.clone().filter(|_| state.using_core), state.scope)
+        };
+        let Some(core) = core else {
+            return;
+        };
+        if !core.set_order(scope, order) {
+            return;
+        }
+        mail_pagination_generation_for_order
+            .set(mail_pagination_generation_for_order.get().wrapping_add(1));
+        mail_pagination_in_progress_for_order.set(false);
+        app.set_mail_loading_more(false);
+        {
+            let mut state = state_for_order.borrow_mut();
+            state.list_order = state.list_order_for_view();
+            state.pending_selection = None;
+            state.pending_selection_opens = false;
+            state.restore_thread_message = None;
+            state.mail_groups.clear();
+            state.page = 1;
+            state.next_cursor = None;
+            state.selected_id = None;
+            state.checked_ids.clear();
+            state.preview_closed = false;
+        }
+        if let Err(error) =
+            refresh_from_source(&app, &state_for_order, &runtime_for_order, false, &[])
+        {
+            app.set_render_status(UiMessage::detail("Mail refresh failed: {}", error));
+        }
+        let app = app.as_weak();
+        runtime_for_order.spawn(async move {
+            if let Err(error) = core.save_order(scope, order).await {
+                let _ = app.upgrade_in_event_loop(move |app| {
+                    app.set_render_status(UiMessage::detail(
+                        "Could not save the order of this list: {}",
+                        error,
+                    ));
+                });
+            }
+        });
+    });
+
+    let app_weak = app.as_weak();
+    let state_for_scope = Rc::clone(&state);
+    let runtime_for_scope = runtime.clone();
+    let mail_metadata_refresh_requested_for_scope = Rc::clone(&mail_metadata_refresh_requested);
+    let mail_pagination_generation_for_scope = Rc::clone(&mail_pagination_generation);
+    let mail_pagination_in_progress_for_scope = Rc::clone(&mail_pagination_in_progress);
+    app.on_select_scope(move |scope| {
+        let Some(app) = app_weak.upgrade() else {
+            return;
+        };
+        mail_pagination_generation_for_scope
+            .set(mail_pagination_generation_for_scope.get().wrapping_add(1));
+        mail_pagination_in_progress_for_scope.set(false);
+        app.set_mail_loading_more(false);
+        {
+            let mut state = state_for_scope.borrow_mut();
+            // An unknown key cannot come from the sidebar; keep the inbox
+            // reachable rather than presenting a list for no mailbox.
+            state.set_scope(scope.parse().unwrap_or(Scope::UNIFIED_INBOX));
+            state.pending_selection = None;
+            state.pending_selection_opens = false;
+            state.restore_thread_message = None;
+            state.mail_groups.clear();
+            state.page = 1;
+            state.next_cursor = None;
+            state.selected_id = None;
+            state.checked_ids.clear();
+            state.preview_closed = false;
+        }
+        if let Err(error) =
+            refresh_from_source(&app, &state_for_scope, &runtime_for_scope, false, &[])
+        {
+            app.set_render_status(UiMessage::detail("Mail refresh failed: {}", error));
+        }
+        mail_metadata_refresh_requested_for_scope.set(true);
+        app.invoke_drain_core_updates();
+    });
+
+    let app_weak = app.as_weak();
+    let state_for_profile = Rc::clone(&state);
+    let runtime_for_profile = runtime.clone();
+    let mail_metadata_refresh_requested_for_profile = Rc::clone(&mail_metadata_refresh_requested);
+    let mail_pagination_generation_for_profile = Rc::clone(&mail_pagination_generation);
+    let mail_pagination_in_progress_for_profile = Rc::clone(&mail_pagination_in_progress);
+    // Showing another profile's accounts is like choosing a mailbox: the list
+    // starts over, and the sidebar and counts follow.
+    app.on_mail_profile_changed(move || {
+        let Some(app) = app_weak.upgrade() else {
+            return;
+        };
+        {
+            let mut state = state_for_profile.borrow_mut();
+            // With one account, the unified mailboxes go by its name.
+            let single_account = state.mail_accounts().len() == 1;
+            if !state.sync_profile_accounts() {
+                return;
+            }
+            let scope = match state.scope {
+                Scope::Account { mailbox, .. } if single_account => Scope::Unified(mailbox),
+                scope => scope,
+            };
+            state.set_scope(scope);
+            state.pending_selection = None;
+            state.pending_selection_opens = false;
+            state.restore_thread_message = None;
+            state.mail_groups.clear();
+            state.page = 1;
+            state.next_cursor = None;
+            state.selected_id = None;
+            state.checked_ids.clear();
+            state.preview_closed = false;
+            // Accounts the profile leaves out leave the sidebar at once; those
+            // it adds arrive with the counts.
+            let shown = state.profile_accounts.clone();
+            state.mailboxes.retain(|mailbox| {
+                shown
+                    .as_ref()
+                    .is_none_or(|accounts| accounts.binary_search(&mailbox.account_id).is_ok())
+            });
+            prefer_shown_compose_account(&app, &state);
+        }
+        mail_pagination_generation_for_profile
+            .set(mail_pagination_generation_for_profile.get().wrapping_add(1));
+        mail_pagination_in_progress_for_profile.set(false);
+        app.set_mail_loading_more(false);
+        if let Err(error) =
+            refresh_from_source(&app, &state_for_profile, &runtime_for_profile, false, &[])
+        {
+            app.set_render_status(UiMessage::detail("Mail refresh failed: {}", error));
+        }
+        refresh_sidebar(&state_for_profile);
+        mail_metadata_refresh_requested_for_profile.set(true);
+        app.invoke_drain_core_updates();
+    });
+
+    let app_weak = app.as_weak();
+    let state_for_more = Rc::clone(&state);
+    let runtime_for_more = runtime.clone();
+    let mail_list_tx_for_more = mail_list_tx.clone();
+    let mail_pagination_generation_for_more = Rc::clone(&mail_pagination_generation);
+    let mail_pagination_in_progress_for_more = Rc::clone(&mail_pagination_in_progress);
+    app.on_load_more(move || {
+        let Some(app) = app_weak.upgrade() else {
+            return;
+        };
+        if mail_pagination_in_progress_for_more.replace(true) {
+            return;
+        }
+        let (using_core, core, scope, query, cursor) = {
+            let state = state_for_more.borrow();
+            (
+                state.using_core,
+                state.core.clone(),
+                state.scope,
+                state.query.clone(),
+                state.next_cursor,
+            )
+        };
+
+        if !using_core {
+            let mut state = state_for_more.borrow_mut();
+            state.page = state.page.saturating_add(1);
+            drop(state);
+            refresh_rows_only(&app, &state_for_more, &runtime_for_more);
+            refresh_list_metadata(&app, &state_for_more);
+            app.set_mail_list_revision(app.get_mail_list_revision().wrapping_add(1));
+            mail_pagination_in_progress_for_more.set(false);
+            return;
+        }
+        let (Some(core), Some(cursor)) = (core, cursor) else {
+            mail_pagination_in_progress_for_more.set(false);
+            refresh_list_metadata(&app, &state_for_more);
+            return;
+        };
+
+        let generation = mail_pagination_generation_for_more.get();
+        app.set_mail_loading_more(true);
+        let view_generation = mail_work::generation(&state_for_more.borrow());
+        let updates = mail_list_tx_for_more.clone();
+        runtime_for_more.spawn(async move {
+            let result = core
+                .load_page(scope, &query, Some(cursor), PAGE_SIZE as i64, false)
+                .await;
+            let _ = updates
+                .send(MailListUpdate {
+                    view_generation,
+                    scope,
+                    query,
+                    kind: MailListUpdateKind::Pagination { cursor, generation },
+                    result,
+                })
+                .await;
+        });
+    });
+
+    // A list opened further down shows the rows before its first one on
+    // request, read toward the list's start.
+    let state_for_earlier = Rc::clone(&state);
+    let runtime_for_earlier = runtime.clone();
+    let mail_list_tx_for_earlier = mail_list_tx.clone();
+    let mail_pagination_generation_for_earlier = Rc::clone(&mail_pagination_generation);
+    let mail_pagination_in_progress_for_earlier = Rc::clone(&mail_pagination_in_progress);
+    app.on_load_earlier_mail(move || {
+        let (core, scope, first) = {
+            let state = state_for_earlier.borrow();
+            (
+                state.core.clone().filter(|_| state.using_core),
+                state.scope,
+                state
+                    .window_start
+                    .and(state.messages.first().map(mail::cursor_of)),
+            )
+        };
+        let (Some(core), Some(first)) = (core, first) else {
+            return;
+        };
+        if mail_pagination_in_progress_for_earlier.replace(true) {
+            return;
+        }
+        let generation = mail_pagination_generation_for_earlier.get();
+        let view_generation = mail_work::generation(&state_for_earlier.borrow());
+        let updates = mail_list_tx_for_earlier.clone();
+        runtime_for_earlier.spawn(async move {
+            let result = core.load_earlier(scope, first, PAGE_SIZE as i64).await;
+            let _ = updates
+                .send(MailListUpdate {
+                    view_generation,
+                    scope,
+                    query: String::new(),
+                    kind: MailListUpdateKind::Earlier { first, generation },
+                    result,
+                })
+                .await;
+        });
+    });
+
+    // Automatic read marking must never wait for SQLite or a page refresh
+    // inside the pointer callback. A bounded, serial worker preserves requests.
+    // A conversation's row marks the conversation read; a single message's
+    // row marks only that message.
+    let (mark_read_tx, mut mark_read_rx) =
+        tokio::sync::mpsc::channel::<(CoreMailSource, MailTarget)>(64);
+    let (read_result_tx, read_result_rx) = bounded_ui_channel::<(MailTarget, Result<(), String>)>();
+    let read_results = UiSender::new(
+        read_result_tx,
+        UiWake::new(app.as_weak(), |app| app.invoke_drain_read_updates()),
+    );
+    runtime.spawn(async move {
+        while let Some((core, target)) = mark_read_rx.recv().await {
+            let result = core
+                .perform_message_action(target, "mark_read")
+                .await
+                .map(|_| ());
+            let _ = read_results.send((target, result)).await;
+        }
+    });
+    let pending_reads = Rc::new(RefCell::new(HashSet::new()));
+    let pending_reads_for_results = pending_reads.clone();
+    let read_result_rx = Rc::new(RefCell::new(read_result_rx));
+    let read_app = app.as_weak();
+    app.on_drain_read_updates(move || {
+        while let Ok((target, result)) = read_result_rx.borrow_mut().try_recv() {
+            pending_reads_for_results.borrow_mut().remove(&target);
+            // Successful mutations publish CoreEvent updates, which use the
+            // existing asynchronous list refresh and preserve the current selection.
+            if let Err(error) = result
+                && let Some(app) = read_app.upgrade()
+            {
+                app.set_render_status(UiMessage::detail(
+                    "Could not mark message as read: {}",
+                    error,
+                ));
+            }
+        }
+    });
+
+    let app_weak = app.as_weak();
+    let state_for_selection = Rc::clone(&state);
+    let runtime_for_selection = runtime.clone();
+    app.on_select_email(move |id| {
+        let Some(app) = app_weak.upgrade() else {
+            return;
+        };
+        // Opening another message ends the wait for the one before, which
+        // stays unread.
+        read_marking::cancel();
+        let read_target = {
+            let state = state_for_selection.borrow();
+            state
+                .mark_read
+                .delay()
+                .filter(|_| state.using_core)
+                .zip(state.core.clone())
+                .zip(
+                    state
+                        .messages
+                        .iter()
+                        .find(|row| row.id == id && row.unread)
+                        .and_then(MailTarget::of),
+                )
+        };
+        match select_message(&app, &state_for_selection, &runtime_for_selection, id) {
+            Ok(_) => {}
+            Err(error) => {
+                app.set_render_status(UiMessage::detail("Message load failed: {}", error));
+                return;
+            }
+        };
+        let Some(((delay, core), target)) = read_target else {
+            return;
+        };
+        let mark = {
+            let app = app.as_weak();
+            let mark_read_tx = mark_read_tx.clone();
+            let pending_reads = Rc::clone(&pending_reads);
+            move || {
+                if ui_dispatch::enqueue_once(&mark_read_tx, &pending_reads, target, (core, target))
+                    .is_err()
+                    && let Some(app) = app.upgrade()
+                {
+                    app.set_render_status(UiMessage::detail(
+                        "Could not mark message as read: {}",
+                        "read queue is busy; reopen the message to retry",
+                    ));
+                }
+            }
+        };
+        if delay.is_zero() {
+            mark();
+            return;
+        }
+        // Only a message still open when the wait ends counts as read.
+        let state = Rc::downgrade(&state_for_selection);
+        read_marking::after(delay, move || {
+            if state
+                .upgrade()
+                .is_some_and(|state| state.borrow().selected_id == Some(id))
+            {
+                mark();
+            }
+        });
+    });
+
+    let app_weak = app.as_weak();
+    let state_for_thread_selection = Rc::clone(&state);
+    let runtime_for_thread_selection = runtime.clone();
+    app.on_select_thread_message(move |index| {
+        let Some(app) = app_weak.upgrade() else {
+            return;
+        };
+        if let Err(error) = select_thread_message(
+            &app,
+            &state_for_thread_selection,
+            &runtime_for_thread_selection,
+            index,
+        ) {
+            app.set_render_status(UiMessage::detail("Message load failed: {}", error));
+        }
+    });
+
+    if use_wgpu {
+        // Slint can retain a deferred window-surface error without
+        // immediately exiting its event loop. Bound that otherwise blank-window
+        // startup; normal GPU rendering marks completion in the notifier above.
+        // A start in the tray creates the surface when the window first opens.
+        let completed = gpu_startup_completed.clone();
+        let error = gpu_startup_error.clone();
+        window_controller::when_first_shown(&app, move || {
+            Timer::single_shot(Duration::from_secs(15), move || {
+                if !completed.get() {
+                    error.borrow_mut().get_or_insert_with(|| {
+                        "GPU did not produce its first frame within 15 seconds".into()
+                    });
+                    let _ = slint::quit_event_loop();
+                }
+            });
+        });
+    }
+
+    // A mailbox left open overnight must promote its date sections and row
+    // timestamps without waiting for a network sync or a folder change.
+    let date_refresh_state = Rc::clone(&state);
+    let date_refresh_runtime = runtime.clone();
+    let date_refresh_app = app.as_weak();
+    let date_refresh_calendar = Rc::clone(&calendar_state);
+    let last_local_date = Cell::new(Local::now().date_naive());
+    let date_refresh_timer = Timer::default();
+    date_refresh_timer.start(
+        slint::TimerMode::Repeated,
+        Duration::from_secs(60),
+        move || {
+            let today = Local::now().date_naive();
+            if today != last_local_date.replace(today)
+                && let Some(app) = date_refresh_app.upgrade()
+            {
+                refresh_rows_only(&app, &date_refresh_state, &date_refresh_runtime);
+                apply_calendar(&app, &date_refresh_calendar.borrow(), today);
+            } else if let Some(app) = date_refresh_app.upgrade()
+                && app.get_active_view() == "calendar"
+                && app.get_calendar_view_mode() == "agenda"
+                && !app.get_render_suspended()
+            {
+                calendar::apply_agenda(
+                    &app,
+                    &date_refresh_calendar.borrow(),
+                    today,
+                    Local::now().time(),
+                );
+            }
+        },
+    );
+
+    let visibility_app = app.as_weak();
+    let visibility_renderer = email_renderer.clone();
+    app.on_suspend_rendering(move |suspended| {
+        let Some(app) = visibility_app.upgrade() else {
+            return;
+        };
+        if app.get_render_suspended() == suspended {
+            return;
+        }
+        app.set_render_suspended(suspended);
+        visibility_renderer.borrow_mut().set_suspended(suspended);
+        composer::main_window_suspended(suspended);
+        if suspended {
+            app.set_email_tiles(ModelRc::default());
+        } else {
+            if !use_wgpu {
+                let (width, height) = email_viewport_size(&app);
+                match visibility_renderer.borrow_mut().render_cpu_if_needed(
+                    width,
+                    height,
+                    app.window().scale_factor(),
+                ) {
+                    Ok(Some(frame)) => apply_cpu_frame(&app, frame),
+                    Ok(None) => {}
+                    Err(error) => app.set_render_status(UiMessage::detail(
+                        "Email resource render failed: {}",
+                        error,
+                    )),
+                }
+            }
+        }
+    });
+
+    // Memory pressure from the system: free what the screen doesn't need and
+    // is cheap to rebuild, then the database caches, then free heap pages.
+    // The handler lives in a thread-local past this function, so like pending
+    // timers it holds the app's state weakly.
+    let pressure_app = app.as_weak();
+    let pressure_renderer = Rc::downgrade(&email_renderer);
+    let pressure_state = Rc::downgrade(&state);
+    let pressure_runtime = runtime.clone();
+    memory::on_memory_pressure(move |level| {
+        let (Some(app), Some(renderer), Some(state)) = (
+            pressure_app.upgrade(),
+            pressure_renderer.upgrade(),
+            pressure_state.upgrade(),
+        ) else {
+            return;
+        };
+        let until = std::time::Instant::now() + memory::PRESSURE_WINDOW;
+        if renderer.borrow_mut().release_caches(until) {
+            let tiles = renderer.borrow().retained_tiles();
+            mail_render_projection::retain_email_tiles(&app, tiles);
+        }
+        mail_view_model::release_sender_images();
+        let core = state.borrow().core.clone();
+        pressure_runtime.spawn(async move {
+            if let Some(core) = core {
+                let _ = core.file_core().release_cache_memory().await;
+            }
+            memory::release_heap(level);
+        });
+    });
+    memory::watch_pressure(&runtime);
+    let idle_renderer = Rc::downgrade(&email_renderer);
+    memory::on_ui_idle(move || {
+        if let Some(renderer) = idle_renderer.upgrade()
+            && let Ok(mut renderer) = renderer.try_borrow_mut()
+        {
+            renderer.release_paint_buffers();
+        }
+    });
+
+    if start_hidden {
+        app.invoke_suspend_rendering(true);
+    }
+
+    // The main window is already shown above and the independently compiled
+    // tray participates in the same process-wide event loop. This is Slint's
+    // documented multi-component pattern; calling AppWindow::run() here would
+    // redundantly show the main window a second time. A start in the tray has
+    // no visible window, so only an explicit quit may end the loop. Neither
+    // does the Flatpak's closed window, with no tray icon to keep the loop
+    // running in the background; every way out of the app quits explicitly.
+    startup_metrics.emit("event_loop_entered", serde_json::Value::Null);
+    let event_loop_result = if benchmark_tray || start_hidden || cfg!(feature = "flatpak") {
+        slint::run_event_loop_until_quit()
+    } else {
+        slint::run_event_loop()
+    };
+    // Timers stop with the event loop, so a pending tab save is written now.
+    app.global::<TabsUi>().invoke_flush();
+    // So are the messages still being written.
+    composer::save_open_messages();
+    // Messages sent with an undo delay leave now, not at the next start.
+    undo::send_before_exit(&runtime);
+    // Agents can't reach a closing app, and its endpoint goes with it.
+    #[cfg(desktop)]
+    agents::shutdown();
+    let core = state.borrow().core.as_ref().map(CoreMailSource::file_core);
+    notifications::withdraw_before_exit(&runtime, core, platform.notifications.clone());
+    // The runtime ends with this function.
+    notifications::core_closed();
+    event_loop_result.map_err(|error| {
+        renderer_preferences::startup_error(error, use_wgpu && !gpu_startup_completed.get())
+    })?;
+    if let Some(error) = gpu_startup_error.borrow_mut().take() {
+        return Err(Box::new(renderer_preferences::GpuStartupError(error)));
+    }
+    Ok(())
+}
+
+/// Put the bundled outline emoji face in Parley's dedicated emoji slot.
+///
+/// Slint's software renderer does not reliably rasterize the color emoji fonts
+/// supplied by every platform. Parley already detects emoji clusters while
+/// shaping mixed text, so configuring its generic family keeps the normal UI
+/// font and emoji font separate without rewriting folder names into image runs.
+fn configure_emoji_font_fallback() -> Result<(), Box<dyn std::error::Error>> {
+    use slint::fontique_012::fontique::{Blob, GenericFamily};
+
+    const NOTO_EMOJI: &[u8] = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/resources/fonts/noto-emoji/NotoEmoji[wght].ttf"
+    ));
+
+    let mut fonts = slint::fontique_012::shared_collection();
+    let noto_emoji = fonts
+        .register_fonts(Blob::new(Arc::new(NOTO_EMOJI)), None)
+        .first()
+        .map(|(family, _)| *family)
+        .ok_or_else(|| std::io::Error::other("bundled Noto Emoji font is invalid"))?;
+    fonts.set_generic_families(GenericFamily::Emoji, std::iter::once(noto_emoji));
+    Ok(())
+}
+
+#[cfg(test)]
+mod calendar_tests {
+    use super::*;
+
+    #[test]
+    fn week_starts_on_monday() {
+        let sunday = NaiveDate::from_ymd_opt(2026, 8, 23).unwrap();
+        assert_eq!(
+            start_of_week(sunday),
+            NaiveDate::from_ymd_opt(2026, 8, 17).unwrap()
+        );
+    }
+
+    #[test]
+    fn month_navigation_crosses_year_boundaries() {
+        let december = NaiveDate::from_ymd_opt(2026, 12, 1).unwrap();
+        assert_eq!(
+            calendar::shift_month(december, 1),
+            NaiveDate::from_ymd_opt(2027, 1, 1).unwrap()
+        );
+        assert_eq!(
+            calendar::shift_month(december, -12),
+            NaiveDate::from_ymd_opt(2025, 12, 1).unwrap()
+        );
+    }
+
+    #[test]
+    fn local_calendar_starts_empty_until_database_load() {
+        let today = NaiveDate::from_ymd_opt(2026, 8, 23).unwrap();
+        let state = LocalCalendarState::new(today);
+        assert!(state.events.is_empty());
+        assert_eq!(state.selected_date, today);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sender_icon_retry_delay_is_bounded() {
+        assert_eq!(favicon_retry_delay(1), Duration::from_secs(60));
+        assert_eq!(favicon_retry_delay(2), Duration::from_secs(120));
+        assert_eq!(favicon_retry_delay(7), Duration::from_secs(3600));
+        assert_eq!(favicon_retry_delay(u8::MAX), Duration::from_secs(3600));
+    }
+
+    fn model_values(model: &VecModel<i32>) -> Vec<i32> {
+        model.iter().collect()
+    }
+
+    #[test]
+    fn retained_list_model_reconciles_pages_and_live_head_changes() {
+        let model = VecModel::from(vec![1, 2, 3]);
+
+        reconcile_model_rows(&model, vec![1, 2, 3, 4, 5], |value| *value);
+        assert_eq!(model_values(&model), [1, 2, 3, 4, 5]);
+
+        // A new first row and a bounded refresh that drops the old tail are
+        // the combination that used to make a scrolled ListView jump.
+        reconcile_model_rows(&model, vec![0, 1, 2, 3, 4], |value| *value);
+        assert_eq!(model_values(&model), [0, 1, 2, 3, 4]);
+
+        reconcile_model_rows(&model, vec![0, 2, 3, 4], |value| *value);
+        assert_eq!(model_values(&model), [0, 2, 3, 4]);
+    }
+
+    #[test]
+    fn unchanged_and_reordered_refreshes_do_not_clone_all_retained_rows() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+
+        #[derive(Default)]
+        struct CloneCounts {
+            live: AtomicUsize,
+            peak: AtomicUsize,
+        }
+
+        impl CloneCounts {
+            fn add(&self) {
+                let live = self.live.fetch_add(1, Ordering::Relaxed) + 1;
+                self.peak.fetch_max(live, Ordering::Relaxed);
+            }
+        }
+
+        struct Row {
+            id: usize,
+            payload: String,
+            counts: Arc<CloneCounts>,
+        }
+
+        impl Row {
+            fn new(id: usize, counts: &Arc<CloneCounts>) -> Self {
+                counts.add();
+                Self {
+                    id,
+                    payload: "x".repeat(1024),
+                    counts: counts.clone(),
+                }
+            }
+        }
+
+        impl Clone for Row {
+            fn clone(&self) -> Self {
+                self.counts.add();
+                Self {
+                    id: self.id,
+                    payload: self.payload.clone(),
+                    counts: self.counts.clone(),
+                }
+            }
+        }
+
+        impl Drop for Row {
+            fn drop(&mut self) {
+                self.counts.live.fetch_sub(1, Ordering::Relaxed);
+            }
+        }
+
+        let counts = Arc::new(CloneCounts::default());
+        let model = VecModel::from(
+            (0..1_000)
+                .map(|id| Row::new(id, &counts))
+                .collect::<Vec<_>>(),
+        );
+        let rows = (0..1_000)
+            .map(|id| Row::new(id, &counts))
+            .collect::<Vec<_>>();
+        let initial_live = counts.live.load(Ordering::Relaxed);
+        counts.peak.store(initial_live, Ordering::Relaxed);
+
+        reconcile_model_rows_by(&model, rows, |row| row.id, |a, b| a.payload == b.payload);
+
+        assert_eq!(model.row_count(), 1_000);
+        assert!(
+            counts.peak.load(Ordering::Relaxed) <= initial_live + 2,
+            "refresh should hold only one temporary row clone at a time"
+        );
+
+        let mut reordered = (0..1_000)
+            .map(|id| Row::new(id, &counts))
+            .collect::<Vec<_>>();
+        reordered.swap(0, 1);
+        let initial_live = counts.live.load(Ordering::Relaxed);
+        counts.peak.store(initial_live, Ordering::Relaxed);
+
+        reconcile_model_rows_by(
+            &model,
+            reordered,
+            |row| row.id,
+            |a, b| a.payload == b.payload,
+        );
+
+        assert_eq!(model.row_count(), 1_000);
+        assert_eq!(model.row_data(0).unwrap().id, 1);
+        assert_eq!(model.row_data(1).unwrap().id, 0);
+        assert!(
+            counts.peak.load(Ordering::Relaxed) <= initial_live + 2,
+            "reorder should not clone every retained row payload"
+        );
+    }
+
+    #[test]
+    fn checked_trigger_expands_mail_operations_in_visible_order() {
+        let messages = fixture_messages();
+        let checked = HashSet::from([messages[2].id, messages[0].id]);
+
+        assert_eq!(
+            mail_operation_ids(&messages, &checked, messages[0].id),
+            [messages[0].id, messages[2].id]
+        );
+    }
+
+    #[test]
+    fn unchecked_trigger_keeps_mail_operation_single() {
+        let messages = fixture_messages();
+        let checked = HashSet::from([messages[0].id, messages[1].id]);
+
+        assert_eq!(
+            mail_operation_ids(&messages, &checked, messages[2].id),
+            [messages[2].id]
+        );
+    }
+
+    #[test]
+    fn unified_inbox_combines_only_incoming_messages() {
+        let mut messages = fixture_messages();
+        messages[1].folder = "Sent".into();
+        messages[2].folder = "Archive".into();
+        let filtered = filtered_messages(&messages, Scope::UNIFIED_INBOX, "", "All mail", None);
+
+        assert_eq!(filtered.len(), messages.len() - 2);
+        assert!(filtered.iter().all(|email| email.folder == "Inbox"));
+        assert!(
+            filtered
+                .iter()
+                .any(|email| email.account == "Flectar Support")
+        );
+        assert!(filtered.iter().any(|email| email.account == "Flectar"));
+    }
+
+    #[test]
+    fn folder_scope_and_search_can_be_combined() {
+        let messages = fixture_messages();
+        let flectar = messages
+            .iter()
+            .find(|message| message.account == "Flectar")
+            .unwrap()
+            .account_id;
+        let scope = Scope::Account {
+            account_id: flectar,
+            mailbox: StandardMailbox::Inbox,
+        };
+        let filtered = filtered_messages(&messages, scope, "calendar", "All mail", None);
+
+        assert_eq!(filtered.len(), 2);
+        assert!(filtered.iter().all(|email| email.sender == "Google Calendar"));
+    }
+
+    #[test]
+    fn unified_folders_and_search_filters_are_applied() {
+        let mut messages = fixture_messages();
+        for message in &mut messages {
+            message.starred = false;
+            message.has_attachments = false;
+        }
+        messages[0].starred = true;
+        messages[1].has_attachments = true;
+
+        let starred = filtered_messages(
+            &messages,
+            Scope::Unified(StandardMailbox::Starred),
+            "",
+            "All mail",
+            None,
+        );
+        let attachments =
+            filtered_messages(&messages, Scope::UNIFIED_INBOX, "", "Has attachments", None);
+
+        assert_eq!(starred.len(), 1);
+        assert_eq!(starred[0].id, messages[0].id);
+        assert_eq!(attachments.len(), 1);
+        assert_eq!(attachments[0].id, messages[1].id);
+    }
+
+    #[test]
+    fn every_fixture_account_gets_the_standard_mailboxes_in_order() {
+        let mailboxes = fixture_mailboxes(&fixture_messages());
+        let account = mailboxes
+            .iter()
+            .find(|mailbox| mailbox.is_account)
+            .expect("fixture account");
+        let labels: Vec<&str> = mailboxes
+            .iter()
+            .filter(|mailbox| !mailbox.is_account && mailbox.context == account.context)
+            .take(7)
+            .map(|mailbox| mailbox.label.as_str())
+            .collect();
+
+        assert_eq!(
+            labels,
+            [
+                "Inbox", "Starred", "Sent", "Archive", "Spam", "Trash", "Drafts"
+            ]
+        );
+    }
+
+    #[test]
+    fn account_starred_scope_filters_within_the_account() {
+        let mut messages = fixture_messages();
+        messages[0].starred = true;
+        let scope = Scope::Account {
+            account_id: messages[0].account_id,
+            mailbox: StandardMailbox::Starred,
+        };
+        let filtered = filtered_messages(&messages, scope, "", "All mail", None);
+
+        assert!(filtered.iter().any(|message| message.id == messages[0].id));
+        assert!(
+            filtered
+                .iter()
+                .all(|message| message.account_id == messages[0].account_id && message.starred)
+        );
+    }
+
+    #[test]
+    fn empty_mail_preview_has_an_explicit_placeholder() {
+        assert_eq!(display_preview(""), "(No content)");
+        assert_eq!(display_preview(" \n\t"), "(No content)");
+        assert_eq!(display_preview("Message body"), "Message body");
+    }
+
+    #[test]
+    fn contact_search_uses_only_the_recipient_being_typed() {
+        assert_eq!(compose_recipient_query("Ada <ada@example.com>, ma"), "ma");
+        assert_eq!(compose_recipient_query("one@example.com;  Lin"), "Lin");
+        assert_eq!(compose_recipient_query("   "), "");
+    }
+
+    #[test]
+    fn selecting_a_contact_replaces_the_active_token() {
+        let contact = flectar_mail_core::models::Address {
+            name: Some("Maya Chen".to_owned()),
+            email: "maya@example.com".to_owned(),
+        };
+
+        assert_eq!(
+            complete_compose_recipient("ada@example.com, ma", &contact),
+            "ada@example.com, Maya Chen <maya@example.com>, "
+        );
+    }
+
+    #[test]
+    fn preview_window_size_uses_logical_phone_dimensions() {
+        let size = parse_preview_window_size("390x844").expect("phone preview size");
+        assert_eq!((size.width, size.height), (390.0, 844.0));
+        assert!(parse_preview_window_size("390-by-844").is_err());
+        assert!(parse_preview_window_size("0x844").is_err());
+    }
+
+    #[test]
+    fn language_preferences_use_the_bundled_catalog_name() {
+        assert_eq!(normalized_language_preference("ru"), "ru");
+        assert_eq!(normalized_language_preference("ru-RU"), "ru");
+        assert_eq!(normalized_language_preference("ru_RU"), "ru");
+        assert_eq!(normalized_language_preference("zh_Hans"), "zh_Hans");
+        assert_eq!(normalized_language_preference("zh-Hans"), "zh_Hans");
+        assert_eq!(normalized_language_preference("zh"), "zh_Hans");
+        assert_eq!(normalized_language_preference("unknown"), "system");
+    }
+
+    #[test]
+    fn language_system_locales_select_only_compatible_bundled_catalogs() {
+        for (locale, expected) in [
+            ("es_MX.UTF-8", Some("es")),
+            ("tr-TR", Some("tr")),
+            ("ru", Some("ru")),
+            ("ru_RU.UTF-8", Some("ru")),
+            ("ru-RU", Some("ru")),
+            ("ru_UA", Some("ru")),
+            ("RU-ru", Some("ru")),
+            ("zh", Some("zh_Hans")),
+            ("zh_CN.UTF-8", Some("zh_Hans")),
+            ("zh-Hans-CN", Some("zh_Hans")),
+            ("zh_SG", Some("zh_Hans")),
+            ("zh-Hans-TW", Some("zh_Hans")),
+            ("zh_TW", None),
+            ("zh_HK", None),
+            ("zh_MO", None),
+            ("zh-Hant-CN", None),
+            ("en_US", None),
+        ] {
+            assert_eq!(bundled_language_for_locale(locale), expected, "{locale}");
+        }
+    }
+
+    #[test]
+    fn standard_mailboxes_are_named_in_the_selected_language() {
+        use slint::platform::{
+            Platform, WindowAdapter,
+            software_renderer::{MinimalSoftwareWindow, RepaintBufferType},
+        };
+
+        struct Headless;
+        impl Platform for Headless {
+            fn create_window_adapter(&self) -> Result<Rc<dyn WindowAdapter>, slint::PlatformError> {
+                Ok(MinimalSoftwareWindow::new(RepaintBufferType::NewBuffer))
+            }
+        }
+        slint::platform::set_platform(Box::new(Headless)).unwrap();
+        let app = AppWindow::new().unwrap();
+        let words = app.global::<MailboxWords>();
+        let title = |role, account: &str, unified| {
+            words.invoke_title(
+                MailboxTitle {
+                    role,
+                    account: account.into(),
+                    unified,
+                },
+                "Receipts".into(),
+            )
+        };
+
+        slint::select_bundled_translation("en").unwrap();
+        for mailbox in StandardMailbox::ALL {
+            assert_eq!(words.invoke_name(mailbox.role()), mailbox.label());
+            assert_eq!(
+                title(mailbox.role(), "", true),
+                Scope::Unified(mailbox).to_string()
+            );
+        }
+        assert_eq!(title(MailboxRole::Inbox, "Person", false), "Person / Inbox");
+        assert_eq!(title(MailboxRole::Other, "", false), "Other");
+        assert_eq!(title(MailboxRole::Snoozed, "", false), "Snoozed");
+        assert_eq!(title(MailboxRole::Scheduled, "", false), "Scheduled");
+        assert_eq!(title(MailboxRole::None, "Person", true), "Receipts");
+        // The automatic categories are named by their roles as well.
+        for category in flectar_mail_core::autolabel::Category::ALL {
+            let role = mail_scope::category_role(category);
+            assert_eq!(words.invoke_name(role), category.default_name());
+            assert_eq!(title(role, "", false), category.default_name());
+        }
+        // A conversation's labels are read in the order the chips show them:
+        // its categories first.
+        let note = |categories: &[MailboxRole], text: &str| {
+            words.invoke_label_note(
+                ModelRc::new(VecModel::from(categories.to_vec())),
+                text.into(),
+            )
+        };
+        assert_eq!(note(&[], ""), "");
+        assert_eq!(note(&[], "Travel"), ", Travel");
+        assert_eq!(note(&[MailboxRole::News], ""), ", News");
+        assert_eq!(
+            note(&[MailboxRole::News, MailboxRole::Pitch], "Travel · Work"),
+            ", News · Pitch · Travel · Work"
+        );
+
+        // Chosen in Settings, or followed from the system.
+        let chosen = normalized_language_preference("zh_Hans");
+        let system = bundled_language_for_locale("zh-Hans-CN").unwrap();
+        for language in [chosen, system] {
+            slint::select_bundled_translation(language).unwrap();
+            let inbox = words.invoke_name(MailboxRole::Inbox);
+            assert_ne!(inbox, "Inbox");
+            assert_eq!(
+                title(MailboxRole::Inbox, "Person", false),
+                format!("Person / {inbox}")
+            );
+            assert_eq!(title(MailboxRole::None, "", false), "Receipts");
+            // Whatever a catalog calls the categories, a title names one by
+            // the same words as its role.
+            for category in flectar_mail_core::autolabel::Category::ALL {
+                let role = mail_scope::category_role(category);
+                let name = words.invoke_name(role);
+                assert_eq!(title(role, "", false), name);
+            }
+        }
+    }
+
+    #[test]
+    fn privacy_policy_opens_in_the_ui_language() {
+        for (language, url) in [
+            ("en", "https://flectar.com/mail/privacy/"),
+            ("es", "https://flectar.com/es/mail/privacy/"),
+            ("ru", "https://flectar.com/ru/mail/privacy/"),
+            ("tr", "https://flectar.com/tr/mail/privacy/"),
+            ("zh_Hans", "https://flectar.com/zh-hans/mail/privacy/"),
+            // A catalog the site has no translated policy for.
+            ("de", "https://flectar.com/mail/privacy/"),
+        ] {
+            assert_eq!(privacy_policy_url(language), url, "{language}");
+        }
+    }
+
+    #[test]
+    fn favicon_cache_is_bounded_by_entries_and_decoded_bytes() {
+        fn images(bytes: usize) -> FaviconImages {
+            FaviconImages {
+                small: FaviconImage {
+                    width: 1,
+                    height: 1,
+                    pixels: vec![0; bytes / 2].into(),
+                },
+                regular: FaviconImage {
+                    width: 1,
+                    height: 1,
+                    pixels: vec![0; bytes - bytes / 2].into(),
+                },
+            }
+        }
+
+        let mut icons = HashMap::new();
+        let mut missing = HashSet::new();
+        insert_bounded_favicon_result_with_limits(
+            &mut icons,
+            &mut missing,
+            "one.test".into(),
+            Some(images(8)),
+            2,
+            12,
+        );
+        insert_bounded_favicon_result_with_limits(
+            &mut icons,
+            &mut missing,
+            "two.test".into(),
+            Some(images(8)),
+            2,
+            12,
+        );
+        assert_eq!(icons.len(), 1);
+        assert!(icons.values().map(favicon_bytes).sum::<usize>() <= 12);
+
+        insert_bounded_favicon_result_with_limits(
+            &mut icons,
+            &mut missing,
+            "missing.test".into(),
+            None,
+            2,
+            12,
+        );
+        insert_bounded_favicon_result_with_limits(
+            &mut icons,
+            &mut missing,
+            "another-missing.test".into(),
+            None,
+            2,
+            12,
+        );
+        assert!(icons.len() + missing.len() <= 2);
+    }
+}
+
+/// Mobile hosts release preview bytes/bitmaps and request cooperative native
+/// cancellation when backgrounded or under memory pressure.
+#[cfg(mobile)]
+pub fn suspend_file_preview() {
+    files_controller::suspend();
+    attachment_controller::suspend();
+}

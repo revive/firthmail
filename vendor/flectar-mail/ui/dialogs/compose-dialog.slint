@@ -1,0 +1,35 @@
+import { AppTheme } from "../design-system.slint";
+import { BoundComposer, ComposerUi } from "../components/composer-ui.slint";
+import { WindowChrome } from "../window-chrome.slint";
+
+// The composer inside the main window, where every message starts. On the
+// desktop it can move into a ComposerWindow of its own.
+export component ComposeDialog inherits Rectangle {
+    in property <bool> compact: false;
+    in property <bool> attachment-picker-supported: true;
+    in property <string> notice;
+    callback back-requested();
+
+    back-requested => { composer.back-requested(); }
+
+    visible: ComposerUi.open;
+    background: root.compact ? AppTheme.surface : #00000066;
+    z: 9000;
+
+    // Keep the workspace visible for context, but make the composer modal so
+    // clicks and keyboard focus cannot leak into the message list behind it.
+    if !root.compact : TouchArea { }
+
+    // The desktop panel stays below integrated window controls.
+    private property <length> controls-inset: WindowChrome.controls-visible ? WindowChrome.band-height : 0px;
+
+    composer := BoundComposer {
+        x: root.compact ? 0px : (parent.width - self.width) / 2;
+        y: root.compact ? 0px : root.controls-inset + (parent.height - root.controls-inset - self.height) / 2;
+        width: root.compact ? parent.width : min(820px, parent.width - 64px);
+        height: root.compact ? parent.height : min(700px, parent.height - root.controls-inset - 64px);
+        compact: root.compact;
+        attachment-picker-supported: root.attachment-picker-supported;
+        notice: root.notice;
+    }
+}

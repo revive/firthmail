@@ -1,0 +1,37 @@
+[workspace]
+resolver = "2"
+members = ["tools/ost2eml", "vendor/outlook-pst-ost", "apps/desktop/src-tauri"]
+
+# flectar-mail-core inherits these from its own workspace root; workspace
+# inheritance resolves against THIS root when the crate is used as a path
+# dependency, so the table is mirrored here.
+[workspace.dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "io-util", "fs"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+anyhow = "1"
+tracing = "0.1"
+chrono = { version = "0.4", features = ["serde"] }
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "AGPL-3.0-only"
+
+# flectar-mail-core pulls two crates from the flectar/mail-sync-client git
+# repository; that git endpoint is unreliable on this network, so the same
+# rev is vendored under vendor/ and patched in.
+[patch."https://github.com/flectar/mail-sync-client"]
+flectar-mail-sync-client = { path = "vendor/flectar-mail-sync-client/crates/flectar-mail-sync-client" }
+flectar-mail-sync-crypto = { path = "vendor/flectar-mail-sync-client/crates/flectar-mail-sync-crypto" }
+
+# The engine builds on flectar's patched jmap-client, whose builder takes the
+# app's proxy and TLS settings (crates.io 0.4.x has no `.proxy()`).
+[patch.crates-io]
+jmap-client = { path = "vendor/flectar-mail/crates/jmap-client" }
+
+[profile.release]
+lto = "thin"
+strip = true
+codegen-units = 1

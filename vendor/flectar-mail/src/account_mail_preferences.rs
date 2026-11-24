@@ -1,0 +1,1457 @@
+//! Native account signature and OpenPGP controls.
+use super::*;
+use flectar_mail_core::{
+    Core,
+    mail_security::{MailSecurity, OpenedMessage},
+    models::{
+        AccountConfig, AccountSettings, AutomaticCopies, MessageFormat, SenderIdentity,
+        SenderIdentitySource, Settings, Signature, SignatureDefaults,
+    },
+    sender_identities::{ManualIdentityPolicy, manual_identity_policy},
+};
+use slint::SharedString;
+use std::{cell::Cell, future::Future};
+
+thread_local! {
+    /// The account's sender addresses as Settings last listed them, with its
+    /// settings, which a search lists again from (#252).
+    static IDENTITIES: RefCell<Option<(AccountSettings, Vec<SenderIdentity>)>> =
+        const { RefCell::new(None) };
+}
+
+/// Async work is owned by a profile/account generation. A removed account or
+/// replaced core must never receive a late settings or decrypted-content result.
+#[derive(Clone)]
+struct UiWork {
+    runtime: tokio::runtime::Handle,
+    generation: Rc<Cell<u64>>,
+}
+impl UiWork {
+    fn spawn<T: Send + 'static>(
+        &self,
+        app: &AppWindow,
+        busy: bool,
+        work: impl Future<Output = Result<T, String>> + Send + 'static,
+        apply: impl FnOnce(AppWindow, Result<T, String>) + 'static,
+    ) {
+        if busy {
+            app.global::<AccountMailPreferences>().set_busy(true);
+        }
+        let weak = app.as_weak();
+        let generation = self.generation.clone();
+        let expected = generation.get();
+        let task = self.runtime.spawn(work);
+        let abort = task.abort_handle();
+        if let Err(error) = slint::spawn_local(async move {
+            let result = task.await.unwrap_or_else(|e| Err(e.to_string()));
+            if generation.get() != expected {
+                return;
+            }
+            if let Some(app) = weak.upgrade() {
+                if busy {
+                    app.global::<AccountMailPreferences>().set_busy(false);
+                }
+                apply(app, result);
+            }
+        }) {
+            abort.abort();
+            let ui = app.global::<AccountMailPreferences>();
+            if busy {
+                ui.set_busy(false);
+            }
+            ui.set_status(error.to_string().into());
+        }
+    }
+}
+
+async fn preferences(
+    core: &Core,
+) -> Result<(Settings, Vec<flectar_mail_core::models::AccountConfig>), String> {
+    let settings = core.get_settings().await.map_err(|e| e.to_string())?;
+    let configs = core
+        .list_account_configs()
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok((settings, configs))
+}
+
+fn core(state: &Rc<RefCell<InboxState>>) -> Option<Arc<Core>> {
+    state
+        .borrow()
+        .core
+        .as_ref()
+        .map(|s| s.account_preferences_core())
+}
+fn status(app: &AppWindow, result: Result<(), String>, success: &str) {
+    app.global::<AccountMailPreferences>()
+        .set_status(match result {
+            Ok(()) => success.into(),
+            Err(e) => e.into(),
+        });
+}
+/// A signature written in the composer was saved: Settings shows it, chosen, when it still
+/// shows that signature's account.
+pub(super) fn signature_saved(app: &AppWindow, saved: &Signature, settings: &Settings) {
+    let ui = app.global::<AccountMailPreferences>();
+    if i64::from(ui.get_account_id()) != saved.account_id {
+        return;
+    }
+    project(app, settings, saved.account_id);
+    let index = choices(settings, saved.account_id)
+        .iter()
+        .position(|signature| signature.id == saved.id)
+        .unwrap_or(0);
+    ui.invoke_edit_signature(index as i32);
+    ui.set_status("Signature saved.".into());
+}
+
+pub(super) fn choices(settings: &Settings, account_id: i64) -> Vec<Signature> {
+    settings
+        .signature_list
+        .iter()
+        .filter(|s| s.account_id == account_id)
+        .cloned()
+        .collect()
+}
+fn project(app: &AppWindow, settings: &Settings, account_id: i64) {
+    let ui = app.global::<AccountMailPreferences>();
+    let signatures = choices(settings, account_id);
+    ui.set_signatures(ModelRc::new(VecModel::from(
+        signatures
+            .iter()
+            .map(|s| SignatureChoice {
+                id: s.id.clone().into(),
+                name: s.name.clone().into(),
+                text: crate::rich_compose::signature_preview(&s.html).into(),
+            })
+            .collect::<Vec<_>>(),
+    )));
+    ui.set_signature_names(ModelRc::new(VecModel::from(
+        signatures
+            .iter()
+            .map(|s| SharedString::from(&s.name))
+            .collect::<Vec<_>>(),
+    )));
+    let mut names = vec![SharedString::from("No signature")];
+    names.extend(signatures.iter().map(|s| SharedString::from(&s.name)));
+    ui.set_default_names(ModelRc::new(VecModel::from(names)));
+    let defaults = settings
+        .signature_defaults
+        .get(&account_id.to_string())
+        .cloned()
+        .unwrap_or_default();
+    let index = |id: Option<String>| {
+        signatures
+            .iter()
+            .position(|s| Some(&s.id) == id.as_ref())
+            .map_or(0, |i| i as i32 + 1)
+    };
+    ui.set_new_index(index(defaults.new_id));
+    ui.set_reply_index(index(defaults.reply_id));
+}
+
+pub(super) fn identity_label(identity: &SenderIdentity) -> String {
+    match identity
+        .display_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+    {
+        Some(name) if !name.eq_ignore_ascii_case(&identity.email) => {
+            format!("{name}  <{}>", identity.email)
+        }
+        _ => identity.email.clone(),
+    }
+}
+
+/// Concrete addresses that may be offered as From. Wildcard identities are
+/// authorizations shown in settings, not addresses.
+fn verified_identities(identities: &[SenderIdentity]) -> Vec<SenderIdentity> {
+    identities
+        .iter()
+        .filter(|identity| identity.is_selectable())
+        .cloned()
+        .collect()
+}
+
+fn identity_rows(
+    identities: &[SenderIdentity],
+    settings: &AccountSettings,
+) -> Vec<SenderIdentityRow> {
+    identities
+        .iter()
+        .map(|identity| {
+            let own = settings
+                .identity_copies
+                .get(&identity.email.trim().to_lowercase());
+            (identity, own)
+        })
+        .map(|(identity, own)| SenderIdentityRow {
+            email: identity.email.clone().into(),
+            name: identity
+                .display_name
+                .as_deref()
+                .filter(|name| !name.trim().eq_ignore_ascii_case(&identity.email))
+                .unwrap_or_default()
+                .into(),
+            reply_to: identity.reply_to_email.clone().unwrap_or_default().into(),
+            primary: identity.is_primary,
+            manual: identity.source == SenderIdentitySource::Manual,
+            pending: !identity.is_verified(),
+            wildcard: identity.is_wildcard(),
+            delivery: identity.delivery_status.as_str().into(),
+            error: identity.delivery_error.clone().unwrap_or_default().into(),
+            cc: own
+                .map(|own| automatic_copies::text(&own.cc))
+                .unwrap_or_default()
+                .into(),
+            bcc: own
+                .map(|own| automatic_copies::text(&own.bcc))
+                .unwrap_or_default()
+                .into(),
+            provider_bcc: automatic_copies::text(&identity.bcc).into(),
+        })
+        .collect()
+}
+
+/// List the account's sender addresses that Settings' search matches, so
+/// many at most (#252).
+fn list_identities(ui: &AccountMailPreferences<'_>) {
+    IDENTITIES.with_borrow(|listed| {
+        let Some((settings, identities)) = listed else {
+            return;
+        };
+        let labels = identities
+            .iter()
+            .map(|identity| (identity_label(identity), identity.email.clone()))
+            .collect::<Vec<_>>();
+        let pairs = labels
+            .iter()
+            .map(|(label, email)| (label.as_str(), email.as_str()))
+            .collect::<Vec<_>>();
+        let (shown, matches) = sender_picker::matching(
+            &pairs,
+            &ui.get_sender_identity_query(),
+            sender_picker::LISTED_AT_MOST,
+        );
+        let shown = shown
+            .into_iter()
+            .map(|index| identities[index].clone())
+            .collect::<Vec<_>>();
+        ui.set_sender_identity_rows(ModelRc::new(VecModel::from(identity_rows(
+            &shown, settings,
+        ))));
+        ui.set_sender_identity_count(i32::try_from(identities.len()).unwrap_or(i32::MAX));
+        ui.set_sender_identity_match_count(i32::try_from(matches).unwrap_or(i32::MAX));
+    });
+}
+
+/// The copies every message written from the account starts with, as
+/// Settings shows them (#252).
+fn project_copies(ui: &AccountMailPreferences<'_>, copies: &AutomaticCopies) {
+    ui.set_copies_cc(automatic_copies::text(&copies.cc).into());
+    ui.set_copies_bcc(automatic_copies::text(&copies.bcc).into());
+}
+
+/// What Settings' Cc and Bcc fields `cc` and `bcc` hold, or why they hold
+/// something else.
+fn typed_copies(cc: &str, bcc: &str) -> Result<AutomaticCopies, String> {
+    Ok(AutomaticCopies {
+        cc: automatic_copies::parse(cc)?,
+        bcc: automatic_copies::parse(bcc)?,
+    })
+}
+
+fn policy_name(config: &AccountConfig) -> &'static str {
+    match manual_identity_policy(config) {
+        ManualIdentityPolicy::Any => "any",
+        ManualIdentityPolicy::WithinWildcard => "wildcard",
+        ManualIdentityPolicy::Never => "never",
+    }
+}
+
+fn clear_sender_form(ui: &AccountMailPreferences<'_>) {
+    ui.set_sender_form_email("".into());
+    ui.set_sender_form_name("".into());
+    ui.set_sender_form_reply_to("".into());
+    ui.set_sender_form_cc("".into());
+    ui.set_sender_form_bcc("".into());
+    ui.set_sender_form_editing(false);
+    ui.set_sender_form_provider(false);
+}
+
+fn project_identities(
+    app: &AppWindow,
+    config: &AccountConfig,
+    identities: &[SenderIdentity],
+    refresh_warning: Option<&str>,
+) {
+    let ui = app.global::<AccountMailPreferences>();
+    let verified = verified_identities(identities);
+    let choices = verified
+        .iter()
+        .map(|identity| SenderIdentityChoice {
+            email: identity.email.clone().into(),
+            label: identity_label(identity).into(),
+        })
+        .collect::<Vec<_>>();
+    ui.set_sender_identity_names(ModelRc::new(VecModel::from(
+        choices
+            .iter()
+            .map(|identity| identity.label.clone())
+            .collect::<Vec<_>>(),
+    )));
+    ui.set_sender_identities(ModelRc::new(VecModel::from(choices)));
+    IDENTITIES.set(Some((config.settings.clone(), identities.to_vec())));
+    list_identities(&ui);
+    ui.set_sender_identity_policy(policy_name(config).into());
+    let configured = config.settings.default_sender_email.as_deref();
+    let index = configured
+        .and_then(|email| {
+            verified
+                .iter()
+                .position(|identity| identity.email.eq_ignore_ascii_case(email))
+        })
+        .or_else(|| {
+            verified
+                .iter()
+                .position(|identity| identity.is_provider_default)
+        })
+        .or_else(|| verified.iter().position(|identity| identity.is_primary))
+        .unwrap_or(0);
+    ui.set_default_sender_index(i32::try_from(index).unwrap_or(0));
+    let status = if let Some(warning) = refresh_warning {
+        format!("Using cached identities: {warning}")
+    } else {
+        String::new()
+    };
+    ui.set_sender_identity_status(status.into());
+}
+
+/// Re-read identities after a local edit without another provider refresh.
+async fn local_identities(
+    core: &Core,
+    account_id: i64,
+) -> Result<(AccountConfig, Vec<SenderIdentity>), String> {
+    let identities = core
+        .list_sender_identities(account_id)
+        .await
+        .map_err(|error| error.to_string())?;
+    let config = core
+        .list_account_configs()
+        .await
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .find(|config| config.id == account_id)
+        .ok_or_else(|| "the account is no longer connected".to_owned())?;
+    Ok((config, identities))
+}
+
+async fn refreshed_preferences(
+    core: &Core,
+    account_id: i64,
+) -> Result<
+    (
+        Settings,
+        Vec<AccountConfig>,
+        Vec<SenderIdentity>,
+        Option<String>,
+    ),
+    String,
+> {
+    let (identities, warning) = match core.refresh_sender_identities(account_id).await {
+        Ok(identities) => (identities, None),
+        Err(error) => (
+            core.list_sender_identities(account_id)
+                .await
+                .map_err(|cached_error| cached_error.to_string())?,
+            Some(error.to_string()),
+        ),
+    };
+    let (settings, configs) = preferences(core).await?;
+    Ok((settings, configs, identities, warning))
+}
+
+/// The composer reads saved identities so opening it never waits on the
+/// network. Account sync keeps them current and submission re-validates the
+/// chosen From address.
+pub(super) async fn cached_preferences(
+    core: &Core,
+    account_id: i64,
+) -> Result<(Settings, Vec<AccountConfig>, Vec<SenderIdentity>), String> {
+    let identities = core
+        .list_sender_identities(account_id)
+        .await
+        .map_err(|error| error.to_string())?;
+    let (settings, configs) = preferences(core).await?;
+    Ok((settings, configs, identities))
+}
+
+pub(super) fn register(
+    app: &AppWindow,
+    state: &Rc<RefCell<InboxState>>,
+    runtime: &tokio::runtime::Handle,
+) {
+    let ui = app.global::<AccountMailPreferences>();
+    ui.set_desktop_supported(!cfg!(mobile));
+    let tasks = UiWork {
+        runtime: runtime.clone(),
+        generation: Rc::new(Cell::new(0)),
+    };
+    let context_state = state.clone();
+    let context_generation = tasks.generation.clone();
+    let context = Rc::new(RefCell::new((
+        core(state),
+        state
+            .borrow()
+            .connected_accounts
+            .iter()
+            .map(|a| a.id)
+            .collect::<Vec<_>>(),
+    )));
+    let weak = app.as_weak();
+    ui.on_context_changed(move || {
+        let current_core = core(&context_state);
+        let accounts = context_state
+            .borrow()
+            .connected_accounts
+            .iter()
+            .map(|a| a.id)
+            .collect::<Vec<_>>();
+        let mut previous = context.borrow_mut();
+        let same_core = match (&previous.0, &current_core) {
+            (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+            (None, None) => true,
+            _ => false,
+        };
+        if same_core && previous.1 == accounts {
+            return;
+        }
+        *previous = (current_core, accounts);
+        context_generation.set(context_generation.get().wrapping_add(1));
+        let Some(app) = weak.upgrade() else {
+            return;
+        };
+        let ui = app.global::<AccountMailPreferences>();
+        ui.set_busy(false);
+        ui.set_account_id(-1);
+        ui.set_account_label("".into());
+        ui.set_signatures(ModelRc::default());
+        ui.set_signature_names(ModelRc::default());
+        ui.set_default_names(ModelRc::default());
+        ui.set_sender_identities(ModelRc::default());
+        ui.set_sender_identity_names(ModelRc::default());
+        ui.set_default_sender_index(0);
+        ui.set_sender_identity_status("".into());
+        ui.set_sender_identity_rows(ModelRc::default());
+        ui.set_sender_identity_policy("never".into());
+        clear_sender_form(&ui);
+        ui.invoke_edit_signature(-1);
+        ui.set_fingerprint("".into());
+        ui.set_recipient_keys("".into());
+        ui.set_key_inventory("".into());
+        ui.set_status("".into());
+        ui.invoke_close_reader();
+        ui.invoke_composer_reset();
+    });
+    let weak = app.as_weak();
+    let state_load = state.clone();
+    let work = tasks.clone();
+    ui.on_load(move |id| {
+        let Some(app) = weak.upgrade() else { return };
+        let Some(core) = core(&state_load) else {
+            return;
+        };
+        let ui = app.global::<AccountMailPreferences>();
+        if ui.get_busy() {
+            return;
+        }
+        let (replies_core, replies_runtime) = (Arc::clone(&core), work.runtime.clone());
+        work.spawn(
+            &app,
+            true,
+            async move { refreshed_preferences(&core, i64::from(id)).await },
+            move |app, result| {
+                let ui = app.global::<AccountMailPreferences>();
+                match result {
+                    Ok((settings, configs, identities, warning)) => {
+                        if let Some(config) = configs.iter().find(|c| c.id == i64::from(id)) {
+                            ui.set_account_id(id);
+                            ui.set_account_label(config.email.clone().into());
+                            ui.set_status("".into());
+                            ui.set_key_inventory("".into());
+                            project(&app, &settings, config.id);
+                            clear_sender_form(&ui);
+                            ui.set_sender_identity_query("".into());
+                            project_identities(&app, config, &identities, warning.as_deref());
+                            project_copies(&ui, &config.settings.copies);
+                            ui.invoke_edit_signature(-1);
+                            ui.set_message_format_index(i32::from(
+                                config.settings.message_format == MessageFormat::PlainText,
+                            ));
+                            ui.set_plain_text_replies(config.settings.plain_text_replies);
+                            ui.set_request_read_receipts(config.settings.request_read_receipts);
+                            crate::auto_replies::load_tab(
+                                &app,
+                                &replies_runtime,
+                                replies_core,
+                                config,
+                            );
+                            let p = &config.settings.security;
+                            ui.set_fingerprint(p.signing_fingerprint.clone().into());
+                            ui.set_sign(p.sign_by_default);
+                            ui.set_encrypt(p.require_encryption);
+                            ui.set_recipient_keys(
+                                p.recipient_keys
+                                    .iter()
+                                    .map(|(e, k)| format!("{e}={k}"))
+                                    .collect::<Vec<_>>()
+                                    .join("\n")
+                                    .into(),
+                            );
+                        }
+                    }
+                    Err(e) => ui.set_status(e.into()),
+                }
+            },
+        );
+    });
+    let weak = app.as_weak();
+    let state_message_format = state.clone();
+    let work = tasks.clone();
+    ui.on_save_message_format(move || {
+        let Some(app) = weak.upgrade() else { return };
+        let ui = app.global::<AccountMailPreferences>();
+        if ui.get_account_id() <= 0 {
+            return;
+        }
+        let Some(core) = core(&state_message_format) else {
+            return;
+        };
+        let account_id = i64::from(ui.get_account_id());
+        let format = if ui.get_message_format_index() == 1 {
+            MessageFormat::PlainText
+        } else {
+            MessageFormat::Formatted
+        };
+        let plain_text_replies = ui.get_plain_text_replies();
+        work.spawn(
+            &app,
+            false,
+            async move {
+                core.set_account_message_format(account_id, format, plain_text_replies)
+                    .await
+                    .map_err(|error| error.to_string())
+            },
+            |app, result| {
+                if let Err(error) = result {
+                    app.global::<AccountMailPreferences>()
+                        .set_status(error.into());
+                }
+            },
+        );
+    });
+    let weak = app.as_weak();
+    let state_read_receipts = state.clone();
+    let work = tasks.clone();
+    ui.on_save_read_receipt_requests(move || {
+        let Some(app) = weak.upgrade() else { return };
+        let ui = app.global::<AccountMailPreferences>();
+        if ui.get_account_id() <= 0 {
+            return;
+        }
+        let Some(core) = core(&state_read_receipts) else {
+            return;
+        };
+        let account_id = i64::from(ui.get_account_id());
+        let request = ui.get_request_read_receipts();
+        work.spawn(
+            &app,
+            false,
+            async move {
+                core.set_account_read_receipt_requests(account_id, request)
+                    .await
+                    .map_err(|error| error.to_string())
+            },
+            |app, result| {
+                if let Err(error) = result {
+                    app.global::<AccountMailPreferences>()
+                        .set_status(error.into());
+                }
+            },
+        );
+    });
+    let weak = app.as_weak();
+    let state_refresh_identities = state.clone();
+    let work = tasks.clone();
+    ui.on_refresh_sender_identities(move || {
+        let Some(app) = weak.upgrade() else { return };
+        let ui = app.global::<AccountMailPreferences>();
+        if ui.get_busy() || ui.get_account_id() <= 0 {
+            return;
+        }
+        let account_id = i64::from(ui.get_account_id());
+        let Some(core) = core(&state_refresh_identities) else {
+            return;
+        };
+        work.spawn(
+            &app,
+            true,
+            async move { refreshed_preferences(&core, account_id).await },
+            move |app, result| match result {
+                Ok((_settings, configs, identities, warning)) => {
+                    if let Some(config) = configs.iter().find(|config| config.id == account_id) {
+                        project_identities(&app, config, &identities, warning.as_deref());
+                        app.global::<AccountMailPreferences>()
+                            .set_status("Sender identities refreshed.".into());
+                    }
+                }
+                Err(error) => app
+                    .global::<AccountMailPreferences>()
+                    .set_status(error.into()),
+            },
+        );
+    });
+    let weak = app.as_weak();
+    let state_sender_default = state.clone();
+    let work = tasks.clone();
+    ui.on_save_default_sender(move || {
+        let Some(app) = weak.upgrade() else { return };
+        let ui = app.global::<AccountMailPreferences>();
+        if ui.get_busy() || ui.get_account_id() <= 0 {
+            return;
+        }
+        let Some(identity) = usize::try_from(ui.get_default_sender_index())
+            .ok()
+            .and_then(|index| ui.get_sender_identities().row_data(index))
+        else {
+            ui.set_status("Choose a verified sender identity.".into());
+            return;
+        };
+        let account_id = i64::from(ui.get_account_id());
+        let Some(core) = core(&state_sender_default) else {
+            return;
+        };
+        work.spawn(
+            &app,
+            true,
+            async move {
+                core.set_default_sender_identity(account_id, identity.email.to_string())
+                    .await
+                    .map_err(|error| error.to_string())
+            },
+            |app, result| status(&app, result, "Default sender identity saved."),
+        );
+    });
+    let weak = app.as_weak();
+    let state_save_sender = state.clone();
+    let work = tasks.clone();
+    ui.on_save_sender_identity(move || {
+        let Some(app) = weak.upgrade() else { return };
+        let ui = app.global::<AccountMailPreferences>();
+        if ui.get_busy() || ui.get_account_id() <= 0 {
+            return;
+        }
+        let account_id = i64::from(ui.get_account_id());
+        let Some(core) = core(&state_save_sender) else {
+            return;
+        };
+        let email = ui.get_sender_form_email().to_string();
+        let optional = |value: SharedString| {
+            let value = value.trim().to_owned();
+            (!value.is_empty()).then_some(value)
+        };
+        let name = optional(ui.get_sender_form_name());
+        let reply_to = optional(ui.get_sender_form_reply_to());
+        let editing = ui.get_sender_form_editing();
+        // An address the provider gives keeps its name and reply-to address.
+        let provider = ui.get_sender_form_provider();
+        let copies = match typed_copies(&ui.get_sender_form_cc(), &ui.get_sender_form_bcc()) {
+            Ok(copies) => copies,
+            Err(error) => {
+                ui.set_status(translated(
+                    &app,
+                    &UiMessage::detail("Could not save the copies: {}", error),
+                ));
+                return;
+            }
+        };
+        work.spawn(
+            &app,
+            true,
+            async move {
+                let email = if provider {
+                    email
+                } else {
+                    core.save_sender_identity(account_id, email, name, reply_to)
+                        .await
+                        .map_err(|error| error.to_string())?
+                        .email
+                };
+                core.set_automatic_copies(account_id, Some(email), copies)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                local_identities(&core, account_id).await
+            },
+            move |app, result| {
+                let ui = app.global::<AccountMailPreferences>();
+                match result {
+                    Ok((config, identities)) => {
+                        clear_sender_form(&ui);
+                        project_identities(&app, &config, &identities, None);
+                        if provider {
+                            ui.set_status(translated(&app, &UiMessage::plain("Copies saved.")));
+                        } else {
+                            ui.set_status(
+                                if editing {
+                                    "Sender address saved."
+                                } else {
+                                    "Sender address added. It can now be chosen in the composer."
+                                }
+                                .into(),
+                            );
+                        }
+                    }
+                    Err(error) => ui.set_status(error.into()),
+                }
+            },
+        );
+    });
+    let weak = app.as_weak();
+    ui.on_edit_sender_identity(move |email| {
+        let Some(app) = weak.upgrade() else { return };
+        let ui = app.global::<AccountMailPreferences>();
+        let Some(row) = ui
+            .get_sender_identity_rows()
+            .iter()
+            .find(|row| !row.wildcard && row.email == email)
+        else {
+            return;
+        };
+        ui.set_sender_form_provider(!row.manual);
+        ui.set_sender_form_email(row.email);
+        ui.set_sender_form_name(row.name);
+        ui.set_sender_form_reply_to(row.reply_to);
+        ui.set_sender_form_cc(row.cc);
+        ui.set_sender_form_bcc(row.bcc);
+        ui.set_sender_form_editing(true);
+    });
+    let weak = app.as_weak();
+    ui.on_clear_sender_form(move || {
+        if let Some(app) = weak.upgrade() {
+            clear_sender_form(&app.global::<AccountMailPreferences>());
+        }
+    });
+    let weak = app.as_weak();
+    ui.on_sender_identity_search(move |_| {
+        if let Some(app) = weak.upgrade() {
+            list_identities(&app.global::<AccountMailPreferences>());
+        }
+    });
+    let weak = app.as_weak();
+    ui.on_default_sender_search(move |query| {
+        let Some(app) = weak.upgrade() else { return };
+        let ui = app.global::<AccountMailPreferences>();
+        let choices = ui
+            .get_sender_identities()
+            .iter()
+            .map(|choice| (choice.label.to_string(), choice.email.to_string()))
+            .collect::<Vec<_>>();
+        let (rows, matches) = sender_picker::rows(&choices, &query);
+        ui.set_default_sender_matches(ModelRc::new(VecModel::from(rows)));
+        ui.set_default_sender_match_count(i32::try_from(matches).unwrap_or(i32::MAX));
+    });
+    let weak = app.as_weak();
+    let state_copies = state.clone();
+    let work = tasks.clone();
+    ui.on_save_copies(move || {
+        let Some(app) = weak.upgrade() else { return };
+        let ui = app.global::<AccountMailPreferences>();
+        if ui.get_busy() || ui.get_account_id() <= 0 {
+            return;
+        }
+        let account_id = i64::from(ui.get_account_id());
+        let Some(core) = core(&state_copies) else {
+            return;
+        };
+        let copies = match typed_copies(&ui.get_copies_cc(), &ui.get_copies_bcc()) {
+            Ok(copies) => copies,
+            Err(error) => {
+                ui.set_status(translated(
+                    &app,
+                    &UiMessage::detail("Could not save the copies: {}", error),
+                ));
+                return;
+            }
+        };
+        work.spawn(
+            &app,
+            true,
+            async move {
+                core.set_automatic_copies(account_id, None, copies)
+                    .await
+                    .map_err(|error| error.to_string())
+            },
+            move |app, result| {
+                let ui = app.global::<AccountMailPreferences>();
+                match result {
+                    Ok(saved) => {
+                        project_copies(&ui, &saved);
+                        ui.set_status(translated(&app, &UiMessage::plain("Copies saved.")));
+                    }
+                    Err(error) => ui.set_status(translated(
+                        &app,
+                        &UiMessage::detail("Could not save the copies: {}", error),
+                    )),
+                }
+            },
+        );
+    });
+    let weak = app.as_weak();
+    let state_remove_sender = state.clone();
+    let work = tasks.clone();
+    ui.on_remove_sender_identity(move |email| {
+        let Some(app) = weak.upgrade() else { return };
+        let ui = app.global::<AccountMailPreferences>();
+        if ui.get_busy() || ui.get_account_id() <= 0 {
+            return;
+        }
+        let account_id = i64::from(ui.get_account_id());
+        let Some(core) = core(&state_remove_sender) else {
+            return;
+        };
+        let email = email.to_string();
+        work.spawn(
+            &app,
+            true,
+            async move {
+                core.remove_sender_identity(account_id, email)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                local_identities(&core, account_id).await
+            },
+            move |app, result| {
+                let ui = app.global::<AccountMailPreferences>();
+                match result {
+                    Ok((config, identities)) => {
+                        if ui.get_sender_form_editing() {
+                            clear_sender_form(&ui);
+                        }
+                        project_identities(&app, &config, &identities, None);
+                        ui.set_status("Sender address removed.".into());
+                    }
+                    Err(error) => ui.set_status(error.into()),
+                }
+            },
+        );
+    });
+    let weak = app.as_weak();
+    ui.on_edit_signature(move |index| {
+        let Some(app) = weak.upgrade() else { return };
+        let ui = app.global::<AccountMailPreferences>();
+        let signature = usize::try_from(index)
+            .ok()
+            .and_then(|i| ui.get_signatures().row_data(i));
+        ui.set_editing_index(index);
+        ui.set_editing_id(signature.as_ref().map(|s| s.id.clone()).unwrap_or_default());
+        ui.set_signature_text(signature.map(|s| s.text).unwrap_or_default());
+    });
+    let weak = app.as_weak();
+    let state_open = state.clone();
+    let work = tasks.clone();
+    ui.on_open_signature(move |new| {
+        let Some(app) = weak.upgrade() else { return };
+        let Some(core) = core(&state_open) else {
+            return;
+        };
+        let ui = app.global::<AccountMailPreferences>();
+        if ui.get_busy() {
+            return;
+        }
+        let account_id = i64::from(ui.get_account_id());
+        if new {
+            crate::composer::edit_signature(&app, account_id, None);
+            return;
+        }
+        let id = ui.get_editing_id().to_string();
+        work.spawn(
+            &app,
+            true,
+            async move { core.get_settings().await.map_err(|e| e.to_string()) },
+            move |app, result| match result {
+                Ok(settings) => {
+                    if let Some(signature) = choices(&settings, account_id)
+                        .into_iter()
+                        .find(|signature| signature.id == id)
+                    {
+                        crate::composer::edit_signature(&app, account_id, Some(signature));
+                    }
+                }
+                Err(e) => app.global::<AccountMailPreferences>().set_status(e.into()),
+            },
+        );
+    });
+    let weak = app.as_weak();
+    let state_delete = state.clone();
+    let work = tasks.clone();
+    ui.on_delete_signature(move || {
+        let Some(app) = weak.upgrade() else { return };
+        let Some(core) = core(&state_delete) else {
+            return;
+        };
+        let ui = app.global::<AccountMailPreferences>();
+        if ui.get_busy() {
+            return;
+        }
+        let id = i64::from(ui.get_account_id());
+        let signature = ui.get_editing_id().to_string();
+        work.spawn(
+            &app,
+            true,
+            async move {
+                core.delete_signature(id, signature)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                core.get_settings().await.map_err(|e| e.to_string())
+            },
+            move |app, result| match result {
+                Ok(settings) => {
+                    project(&app, &settings, id);
+                    app.global::<AccountMailPreferences>()
+                        .invoke_edit_signature(-1);
+                    status(
+                        &app,
+                        Ok(()),
+                        "Signature deleted; affected defaults cleared.",
+                    );
+                }
+                Err(e) => status(&app, Err(e), ""),
+            },
+        );
+    });
+    let weak = app.as_weak();
+    let state_defaults = state.clone();
+    let work = tasks.clone();
+    ui.on_save_defaults(move || {
+        let Some(app) = weak.upgrade() else { return };
+        let Some(core) = core(&state_defaults) else {
+            return;
+        };
+        let ui = app.global::<AccountMailPreferences>();
+        if ui.get_busy() {
+            return;
+        }
+        let id = |index: i32| {
+            usize::try_from(index - 1)
+                .ok()
+                .and_then(|i| ui.get_signatures().row_data(i))
+                .map(|s| s.id.to_string())
+        };
+        let account = i64::from(ui.get_account_id());
+        let defaults = SignatureDefaults {
+            new_id: id(ui.get_new_index()),
+            reply_id: id(ui.get_reply_index()),
+        };
+        work.spawn(
+            &app,
+            true,
+            async move {
+                core.set_signature_defaults(account, defaults)
+                    .await
+                    .map_err(|e| e.to_string())
+            },
+            |app, result| status(&app, result, "Signature defaults saved."),
+        );
+    });
+    let weak = app.as_weak();
+    let state_security = state.clone();
+    let work = tasks.clone();
+    ui.on_save_security(move || {
+        let Some(app) = weak.upgrade() else { return };
+        let Some(core) = core(&state_security) else {
+            return;
+        };
+        let ui = app.global::<AccountMailPreferences>();
+        if ui.get_busy() {
+            return;
+        }
+        let mut policy = MailSecurity {
+            signing_fingerprint: ui.get_fingerprint().to_string(),
+            sign_by_default: ui.get_sign(),
+            require_encryption: ui.get_encrypt(),
+            ..Default::default()
+        };
+        for line in ui
+            .get_recipient_keys()
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+        {
+            let Some((email, key)) = line.split_once('=') else {
+                ui.set_status("Use one email=full-fingerprint per line.".into());
+                return;
+            };
+            if policy
+                .recipient_keys
+                .insert(email.trim().to_lowercase(), key.trim().to_owned())
+                .is_some()
+            {
+                ui.set_status("Remove duplicate recipient addresses.".into());
+                return;
+            }
+        }
+        let id = i64::from(ui.get_account_id());
+        work.spawn(
+            &app,
+            true,
+            async move {
+                core.set_mail_security(id, policy)
+                    .await
+                    .map_err(|e| e.to_string())
+            },
+            |app, result| status(&app, result, "OpenPGP settings saved."),
+        );
+    });
+    register_keys_and_reader(app, state, &tasks);
+}
+
+fn show_message(app: &AppWindow, message: OpenedMessage, memory: &Arc<std::sync::Mutex<Vec<u8>>>) {
+    *memory.lock().unwrap() = message.mime;
+    let ui = app.global::<AccountMailPreferences>();
+    ui.set_reader_text(message.text.into());
+    ui.set_reader_status(message.status.into());
+    ui.set_reader_open(true);
+}
+fn register_keys_and_reader(app: &AppWindow, state: &Rc<RefCell<InboxState>>, tasks: &UiWork) {
+    let memory = Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+    let reader_generation = Rc::new(Cell::new(0_u64));
+    let ui = app.global::<AccountMailPreferences>();
+    let weak = app.as_weak();
+    let work = tasks.clone();
+    let opened = memory.clone();
+    let generation = reader_generation.clone();
+    ui.on_key_action(move |action| {
+        let Some(app) = weak.upgrade() else { return };
+        let ui = app.global::<AccountMailPreferences>();
+        if ui.get_busy() || ui.get_account_id() < 0 { return; }
+        let key = ui.get_fingerprint().to_string();
+        let email = ui.get_account_label().to_string();
+        let opened = opened.clone();
+        let generation = generation.clone();
+        let expected = generation.get();
+        work.spawn(&app, true, async move { key_action(action.as_str(), &key, &email).await }, move |app, result| {
+            let ui = app.global::<AccountMailPreferences>();
+            match result {
+                Ok(KeyResult::Generated(key)) => { ui.set_fingerprint(key.into()); ui.set_status("Key created. Back up your private key and revocation certificate in GnuPG, then save OpenPGP settings.".into()); }
+                Ok(KeyResult::Inventory(text)) => {
+                    ui.set_key_inventory(text.into());
+                    ui.set_status("Keys loaded. Verify fingerprints before trusting recipient keys.".into());
+                }
+                Ok(KeyResult::Message(message)) if generation.get() == expected => show_message(&app, message, &opened),
+                Ok(KeyResult::Message(_)) => {},
+                Ok(KeyResult::Done(text)) => ui.set_status(text.into()),
+                Err(e) => ui.set_status(e.into()),
+            }
+        });
+    });
+    let weak = app.as_weak();
+    let work = tasks.clone();
+    let state = state.clone();
+    let opened = memory.clone();
+    let generation = reader_generation.clone();
+    ui.on_read_message(move || {
+        let Some(app) = weak.upgrade() else { return };
+        let Some(core) = core(&state) else { return };
+        let Some((selected_id, target)) = ({
+            let state = state.borrow();
+            state
+                .selected_id
+                .and_then(|id| state.messages.iter().find(|m| m.id == id))
+                .and_then(|m| crate::mail::MailTarget::of(m).map(|target| (m.id, target)))
+        }) else {
+            return;
+        };
+        let ui = app.global::<AccountMailPreferences>();
+        if ui.get_busy() {
+            return;
+        }
+        ui.set_reader_text("".into());
+        ui.set_reader_status("Opening OpenPGP message…".into());
+        ui.set_reader_open(true);
+        *opened.lock().unwrap() = Vec::new();
+        let opened = opened.clone();
+        let state = state.clone();
+        let generation = generation.clone();
+        let expected = generation.get();
+        work.spawn(
+            &app,
+            true,
+            async move {
+                // A conversation opens its newest message; a single message's
+                // row, that message.
+                let message_id = match target {
+                    crate::mail::MailTarget::Message { id, .. } => id,
+                    crate::mail::MailTarget::Thread(thread_id) => {
+                        core.get_latest_thread_body(thread_id)
+                            .await
+                            .map_err(|e| e.to_string())?
+                            .id
+                    }
+                };
+                core.open_openpgp_message(message_id)
+                    .await
+                    .map_err(|e| e.to_string())
+            },
+            move |app, result| {
+                if generation.get() != expected || state.borrow().selected_id != Some(selected_id) {
+                    return;
+                }
+                match result {
+                    Ok(message) => show_message(&app, message, &opened),
+                    Err(e) => app
+                        .global::<AccountMailPreferences>()
+                        .set_reader_status(e.into()),
+                }
+            },
+        );
+    });
+    let memory_close = memory.clone();
+    let weak = app.as_weak();
+    let generation = reader_generation.clone();
+    ui.on_close_reader(move || {
+        generation.set(generation.get().wrapping_add(1));
+        *memory_close.lock().unwrap() = Vec::new();
+        if let Some(app) = weak.upgrade() {
+            let ui = app.global::<AccountMailPreferences>();
+            ui.set_reader_open(false);
+            ui.set_reader_text("".into());
+            ui.set_reader_status("".into());
+        }
+    });
+    let weak = app.as_weak();
+    let work = tasks.clone();
+    ui.on_export_message(move || {
+        let Some(app) = weak.upgrade() else { return };
+        if app.global::<AccountMailPreferences>().get_busy() {
+            return;
+        }
+        let data = memory.lock().unwrap().clone();
+        if data.is_empty() {
+            return;
+        }
+        let generation = reader_generation.clone();
+        let expected = generation.get();
+        work.spawn(&app, true, export_message(data), move |app, result| {
+            if generation.get() == expected
+                && let Err(e) = result
+            {
+                app.global::<AccountMailPreferences>()
+                    .set_reader_status(e.into());
+            }
+        });
+    });
+}
+
+// Mobile keeps the shared UI result interface, but key actions return an
+// unsupported-platform error until a native OpenPGP backend is available.
+#[cfg_attr(mobile, allow(dead_code))]
+enum KeyResult {
+    Generated(String),
+    Inventory(String),
+    Message(OpenedMessage),
+    Done(String),
+}
+#[cfg(desktop)]
+async fn key_action(action: &str, fingerprint: &str, email: &str) -> Result<KeyResult, String> {
+    let gpg = flectar_mail_core::mail_security::Gpg::default();
+    match action {
+        "generate" => gpg
+            .generate_key(email)
+            .await
+            .map(KeyResult::Generated)
+            .map_err(|e| e.to_string()),
+        "list" => {
+            let secret = gpg.list_keys(true).await.map_err(|e| e.to_string())?;
+            let public = gpg.list_keys(false).await.map_err(|e| e.to_string())?;
+            let display = |listing: &str| {
+                listing
+                    .lines()
+                    .filter_map(|line| {
+                        let f: Vec<_> = line.split(':').collect();
+                        match f.first().copied()? {
+                            "pub" => Some("Public key".to_owned()),
+                            "sec" => Some("Private key".to_owned()),
+                            "fpr" => f.get(9).map(|s| format!("  {s}")),
+                            "uid" => f.get(9).map(|s| {
+                                format!("  {}", flectar_mail_core::mail_security::decode_colon(s))
+                            }),
+                            _ => None,
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            };
+            Ok(KeyResult::Inventory(format!(
+                "{}\n\n{}",
+                display(&secret),
+                display(&public)
+            )))
+        }
+        "import" | "open" => {
+            let Some(file) = rfd::AsyncFileDialog::new()
+                .set_title(if action == "import" {
+                    "Import OpenPGP key"
+                } else {
+                    "Open OpenPGP message"
+                })
+                .pick_file()
+                .await
+            else {
+                return Ok(KeyResult::Done("Cancelled.".into()));
+            };
+            let limit = if action == "import" {
+                1024 * 1024
+            } else {
+                100 * 1024 * 1024
+            };
+            let input = tokio::fs::File::open(file.path())
+                .await
+                .map_err(|e| e.to_string())?;
+            use tokio::io::AsyncReadExt;
+            let mut data = Vec::new();
+            input
+                .take(limit + 1)
+                .read_to_end(&mut data)
+                .await
+                .map_err(|e| e.to_string())?;
+            if data.len() as u64 > limit {
+                return Err("File exceeds the size limit.".into());
+            }
+            if action == "import" {
+                gpg.import_key(&data).await.map_err(|e| e.to_string())?;
+                Ok(KeyResult::Done(
+                    "Key imported. Verify its fingerprint before trusting it.".into(),
+                ))
+            } else {
+                gpg.open_message(&data, None)
+                    .await
+                    .map(KeyResult::Message)
+                    .map_err(|e| e.to_string())
+            }
+        }
+        "export" => {
+            let data = gpg
+                .export_public_key(fingerprint)
+                .await
+                .map_err(|e| e.to_string())?;
+            if let Some(file) = rfd::AsyncFileDialog::new()
+                .set_file_name("public-key.asc")
+                .save_file()
+                .await
+            {
+                file.write(&data).await.map_err(|e| e.to_string())?;
+                Ok(KeyResult::Done("Public key exported.".into()))
+            } else {
+                Ok(KeyResult::Done("Cancelled.".into()))
+            }
+        }
+        _ => Err("Unknown key action.".into()),
+    }
+}
+#[cfg(mobile)]
+async fn key_action(_: &str, _: &str, _: &str) -> Result<KeyResult, String> {
+    Err("OpenPGP requires desktop GnuPG.".into())
+}
+#[cfg(desktop)]
+async fn export_message(data: Vec<u8>) -> Result<(), String> {
+    if let Some(file) = rfd::AsyncFileDialog::new()
+        .set_title("Save decrypted message (contains private content)")
+        .set_file_name("decrypted-message.eml")
+        .save_file()
+        .await
+    {
+        file.write(&data).await.map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+#[cfg(mobile)]
+async fn export_message(_: Vec<u8>) -> Result<(), String> {
+    Err("Message export is unavailable on this platform.".into())
+}
+
+/// The verified identities a composer may send from. A reply to an address
+/// under a server wildcard (`*@domain`) answers from that exact address.
+pub(super) fn selectable_identities(
+    all: Vec<SenderIdentity>,
+    requested: &str,
+) -> Vec<SenderIdentity> {
+    let mut selectable = verified_identities(&all);
+    if !requested.is_empty()
+        && !selectable
+            .iter()
+            .any(|identity| identity.email.eq_ignore_ascii_case(requested))
+        && let Some(wildcard) = all.iter().find(|identity| {
+            identity.is_verified() && identity.is_wildcard() && identity.authorizes(requested)
+        })
+    {
+        selectable.push(SenderIdentity {
+            email: requested.to_owned(),
+            is_primary: false,
+            is_provider_default: false,
+            ..wildcard.clone()
+        });
+    }
+    selectable
+}
+
+/// The sender a composer starts with: the address it was asked for, the
+/// account's default, the provider's default, then the primary address.
+pub(super) fn sender_index(
+    identities: &[SenderIdentity],
+    requested: &str,
+    default_email: Option<&str>,
+) -> usize {
+    (!requested.is_empty())
+        .then(|| {
+            identities
+                .iter()
+                .position(|identity| identity.email.eq_ignore_ascii_case(requested))
+        })
+        .flatten()
+        .or_else(|| {
+            default_email.and_then(|email| {
+                identities
+                    .iter()
+                    .position(|identity| identity.email.eq_ignore_ascii_case(email))
+            })
+        })
+        .or_else(|| {
+            identities
+                .iter()
+                .position(|identity| identity.is_provider_default)
+        })
+        .or_else(|| identities.iter().position(|identity| identity.is_primary))
+        .unwrap_or(0)
+}
+
+/// What the composer says about end-to-end encryption for its account.
+pub(super) fn security_summary(policy: &MailSecurity) -> &'static str {
+    if policy.require_encryption {
+        if policy.sign_by_default {
+            "OpenPGP: encryption required · digitally signed"
+        } else {
+            "OpenPGP: encryption required"
+        }
+    } else if policy.sign_by_default {
+        "OpenPGP: digitally signed · not encrypted"
+    } else {
+        "Message is not end-to-end encrypted"
+    }
+}
+
+pub(super) fn remove_managed_signature(body: &str, managed: Option<&str>) -> Result<String, ()> {
+    match managed {
+        None => Ok(body.to_owned()),
+        Some(block) if body.matches(block).count() == 1 => Ok(body.replacen(block, "", 1)),
+        Some(_) if body.is_empty() => Ok(String::new()),
+        Some(_) => Err(()),
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn asynchronous_results_are_discarded_after_account_context_changes() {
+        use slint::platform::{EventLoopProxy, Platform, WindowAdapter};
+        use std::sync::mpsc;
+        struct Proxy(mpsc::Sender<Box<dyn FnOnce() + Send>>);
+        impl EventLoopProxy for Proxy {
+            fn quit_event_loop(&self) -> Result<(), slint::EventLoopError> {
+                Ok(())
+            }
+            fn invoke_from_event_loop(
+                &self,
+                event: Box<dyn FnOnce() + Send>,
+            ) -> Result<(), slint::EventLoopError> {
+                self.0
+                    .send(event)
+                    .map_err(|_| slint::EventLoopError::EventLoopTerminated)
+            }
+        }
+        struct Headless(mpsc::Sender<Box<dyn FnOnce() + Send>>);
+        impl Platform for Headless {
+            fn create_window_adapter(&self) -> Result<Rc<dyn WindowAdapter>, slint::PlatformError> {
+                Ok(
+                    slint::platform::software_renderer::MinimalSoftwareWindow::new(
+                        slint::platform::software_renderer::RepaintBufferType::ReusedBuffer,
+                    ),
+                )
+            }
+            fn new_event_loop_proxy(&self) -> Option<Box<dyn EventLoopProxy>> {
+                Some(Box::new(Proxy(self.0.clone())))
+            }
+        }
+        struct Delivered(Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for Delivered {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        let (events, receiver) = mpsc::channel();
+        slint::platform::set_platform(Box::new(Headless(events))).unwrap();
+        let app = AppWindow::new().unwrap();
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let tasks = UiWork {
+            runtime: runtime.handle().clone(),
+            generation: Rc::new(Cell::new(0)),
+        };
+        let (release, waiting) = tokio::sync::oneshot::channel();
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let payload = Delivered(dropped.clone());
+        tasks.spawn(
+            &app,
+            true,
+            async move {
+                waiting.await.unwrap();
+                Ok(payload)
+            },
+            |_, _| panic!("removed account received private content"),
+        );
+        assert!(app.global::<AccountMailPreferences>().get_busy());
+        tasks.generation.set(1);
+        release.send(()).unwrap();
+        while !dropped.load(std::sync::atomic::Ordering::SeqCst) {
+            receiver
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap()();
+        }
+        // A stale result must not release a newer operation's busy indicator.
+        assert!(app.global::<AccountMailPreferences>().get_busy());
+        let applied = Rc::new(Cell::new(false));
+        let applied2 = applied.clone();
+        tasks.spawn(&app, true, async { Ok(()) }, move |app, result| {
+            result.unwrap();
+            assert!(!app.global::<AccountMailPreferences>().get_busy());
+            applied2.set(true);
+        });
+        while !applied.get() {
+            receiver
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap()();
+        }
+    }
+
+    #[test]
+    fn switching_signature_preserves_edits_and_rejects_ambiguous_replacement() {
+        let block = "\n\n-- \nZoë";
+        assert_eq!(
+            remove_managed_signature(&format!("Reply{block}\n\n> Quote"), Some(block)),
+            Ok("Reply\n\n> Quote".into())
+        );
+        assert!(remove_managed_signature("Reply\n\n-- \nEdited", Some(block)).is_err());
+        assert!(remove_managed_signature(&format!("{block}{block}"), Some(block)).is_err());
+    }
+}

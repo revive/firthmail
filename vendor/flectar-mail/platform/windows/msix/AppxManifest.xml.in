@@ -1,0 +1,102 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Microsoft Store package manifest. scripts/build-msix.py fills in the
+     package version and processor architecture. -->
+<Package
+  xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"
+  xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10"
+  xmlns:uap3="http://schemas.microsoft.com/appx/manifest/uap/windows10/3"
+  xmlns:uap5="http://schemas.microsoft.com/appx/manifest/uap/windows10/5"
+  xmlns:uap10="http://schemas.microsoft.com/appx/manifest/uap/windows10/10"
+  xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities"
+  xmlns:com="http://schemas.microsoft.com/appx/manifest/com/windows10"
+  xmlns:desktop="http://schemas.microsoft.com/appx/manifest/desktop/windows10"
+  IgnorableNamespaces="uap uap3 uap5 uap10 rescap com desktop">
+
+  <!-- Package identity reserved in Partner Center (Product management >
+       Product identity). These are placeholders until the name is reserved;
+       docs/microsoft-store.md explains how to replace them. -->
+  <Identity
+    Name="Flectar.FlectarMail"
+    Publisher="CN=00000000-0000-0000-0000-000000000000"
+    Version="@VERSION@"
+    ProcessorArchitecture="@ARCHITECTURE@" />
+
+  <Properties>
+    <DisplayName>Flectar Mail</DisplayName>
+    <PublisherDisplayName>Flectar</PublisherDisplayName>
+    <Logo>Assets\StoreLogo.png</Logo>
+  </Properties>
+
+  <!-- uap10:Parameters, which starts the sign-in launch in the background,
+       needs Windows 10 version 2004. -->
+  <Dependencies>
+    <TargetDeviceFamily Name="Windows.Desktop" MinVersion="10.0.19041.0" MaxVersionTested="10.0.26100.0" />
+  </Dependencies>
+
+  <!-- The languages of the bundled translations; en-US is the default. -->
+  <Resources>
+    <Resource Language="en-US" />
+    <Resource Language="da" />
+    <Resource Language="de" />
+    <Resource Language="es" />
+    <Resource Language="fr" />
+    <Resource Language="it" />
+    <Resource Language="ja" />
+    <Resource Language="nl" />
+    <Resource Language="ru" />
+    <Resource Language="tr" />
+    <Resource Language="zh-Hans" />
+  </Resources>
+
+  <Applications>
+    <Application Id="FlectarMail" Executable="flectar-mail.exe" EntryPoint="Windows.FullTrustApplication">
+      <uap:VisualElements
+        DisplayName="Flectar Mail"
+        Description="Native, offline-first email client"
+        BackgroundColor="transparent"
+        Square150x150Logo="Assets\Square150x150Logo.png"
+        Square44x44Logo="Assets\Square44x44Logo.png" />
+      <Extensions>
+        <!-- Packaged apps cannot use the Run registry key, whose writes
+             Windows keeps private to the package. src/autostart.rs enables
+             this task instead; its TaskId must match. -->
+        <uap5:Extension
+          Category="windows.startupTask"
+          Executable="flectar-mail.exe"
+          EntryPoint="Windows.FullTrustApplication"
+          uap10:Parameters="--background">
+          <uap5:StartupTask TaskId="FlectarMailStartup" Enabled="false" DisplayName="Flectar Mail" />
+        </uap5:Extension>
+        <!-- Offered as the default email app in Settings > Apps > Default
+             apps. The link is the whole command line after the option, as
+             src/mailto_links.rs requires. Packaged apps cannot register this
+             in the registry: their writes stay private to the package. -->
+        <uap3:Extension Category="windows.protocol">
+          <uap3:Protocol Name="mailto" Parameters="--mailto &quot;%1&quot;">
+            <uap:DisplayName>mailto</uap:DisplayName>
+            <uap:Logo>Assets\Square44x44Logo.png</uap:Logo>
+          </uap3:Protocol>
+        </uap3:Extension>
+        <!-- New-mail notifications: Windows starts the app through this class
+             when a notification or one of its buttons is clicked, also after
+             the app has quit (src/notifications/windows.rs). The package has a
+             class of its own, which would otherwise take over the clicks of an
+             installed copy's notifications. -->
+        <com:Extension Category="windows.comServer">
+          <com:ComServer>
+            <com:ExeServer Executable="flectar-mail.exe" Arguments="--toast-activated" DisplayName="Flectar Mail">
+              <com:Class Id="6D5AB7B0-F5FC-4A63-B767-DB4CE788E699" DisplayName="Flectar Mail notifications" />
+            </com:ExeServer>
+          </com:ComServer>
+        </com:Extension>
+        <desktop:Extension Category="windows.toastNotificationActivation">
+          <desktop:ToastNotificationActivation ToastActivatorCLSID="6D5AB7B0-F5FC-4A63-B767-DB4CE788E699" />
+        </desktop:Extension>
+      </Extensions>
+    </Application>
+  </Applications>
+
+  <Capabilities>
+    <rescap:Capability Name="runFullTrust" />
+  </Capabilities>
+</Package>

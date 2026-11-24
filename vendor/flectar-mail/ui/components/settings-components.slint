@@ -1,0 +1,536 @@
+import { ComboBox, HorizontalBox, VerticalBox } from "std-widgets.slint";
+import { LineEdit, Switch } from "controls.slint";
+import { FocusVisibleScope } from "focus-visible-scope.slint";
+import { TypeScale } from "../typography.slint";
+import { SidebarStyle } from "sidebar-row.slint";
+import { KbdShortcut, KeyboardKeys } from "kbd.slint";
+
+// Settings navigation is intentionally separate from MailSidebar: the latter
+// owns mailbox models, compose actions, and tree expansion state.
+export component SettingsNavItem inherits Rectangle {
+    in property <string> text;
+    in property <image> icon;
+    in property <bool> selected: false;
+    in property <color> accent;
+    in property <color> accent-soft;
+    in property <color> body-text;
+    in property <color> muted-text;
+    in property <color> icon-color: root.selected ? root.accent : root.muted-text;
+    callback clicked;
+
+    height: 36px;
+    border-radius: 7px;
+    background: root.selected ? root.accent-soft : nav-hit.has-hover ? root.accent-soft : transparent;
+
+    Image {
+        x: 10px;
+        y: (parent.height - self.height) / 2;
+        width: SidebarStyle.icon-size;
+        height: SidebarStyle.icon-size;
+        source: root.icon;
+        colorize: root.icon-color;
+        image-fit: contain;
+        accessible-role: none;
+    }
+    Text {
+        x: 37px;
+        width: parent.width - 47px;
+        height: parent.height;
+        text: root.text;
+        color: root.body-text;
+        font-size: SidebarStyle.label-size;
+        font-weight: root.selected ? SidebarStyle.selected-weight : SidebarStyle.normal-weight;
+        vertical-alignment: center;
+        overflow: elide;
+    }
+    nav-hit := TouchArea {
+        accessible-role: button;
+        accessible-label: root.text;
+        accessible-checked: root.selected;
+        accessible-action-default => { root.clicked(); }
+        clicked => { root.clicked(); }
+        mouse-cursor: pointer;
+    }
+}
+
+export component SettingsCard inherits Rectangle {
+    in property <string> title;
+    in property <string> description;
+    in property <color> surface;
+    in property <color> card-border-color;
+    in property <color> heading;
+    in property <color> secondary-text;
+    // Where content placed below the header starts. Larger platform fonts
+    // make the header taller than its 58px design, so callers offset from it.
+    out property <length> content-y: description-text.y + description-text.height;
+
+    background: root.surface;
+    border-radius: 10px;
+    border-width: 1px;
+    border-color: root.card-border-color;
+
+    title-text := Text {
+        x: 20px;
+        y: 17px;
+        width: parent.width - 40px;
+        height: max(20px, self.preferred-height);
+        text: root.title;
+        color: root.heading;
+        font-size: TypeScale.subtitle;
+        font-weight: 600;
+        letter-spacing: -0.3px;
+        vertical-alignment: center;
+        overflow: elide;
+    }
+    description-text := Text {
+        x: 20px;
+        y: title-text.y + title-text.height + 4px;
+        width: parent.width - 40px;
+        height: max(17px, self.preferred-height);
+        text: root.description;
+        color: root.secondary-text;
+        font-size: TypeScale.caption;
+        vertical-alignment: center;
+        overflow: elide;
+    }
+}
+
+// Shared preference row for boolean appearance and behavior settings. Keeping
+// the label, description, touch target, and spacing here prevents individual
+// settings cards from slowly drifting apart.
+export component SettingsSwitchRow inherits Rectangle {
+    in property <bool> compact: false;
+    in property <length> compact-title-height: 17px;
+    in property <length> compact-description-height: 34px;
+    in property <length> desktop-height: 48px;
+    in property <string> title;
+    in property <string> description;
+    // Bound with `<=>`, the switch keeps showing the value when it changes elsewhere, such as
+    // when another account's settings load.
+    in-out property <bool> checked: false;
+    in property <bool> enabled: true;
+    in property <color> title-color;
+    in property <color> description-color;
+    // Lowers the switch, as onto the title's line where select rows put
+    // their selects.
+    in property <length> control-shift: 0px;
+    callback toggled(bool);
+
+    // Both texts grow past their designed heights with larger platform fonts.
+    height: root.compact
+        ? 27px + title-text.height + description-text.height
+        : root.desktop-height + title-text.height + description-text.height - 34px;
+    opacity: root.enabled ? 1 : 0.5;
+
+    HorizontalBox {
+        spacing: 16px;
+        VerticalBox {
+            horizontal-stretch: 1;
+            min-width: 0px;
+            spacing: 2px;
+            title-text := Text {
+                height: max(root.compact ? root.compact-title-height : 17px, self.preferred-height);
+                text: root.title;
+                color: root.title-color;
+                font-size: TypeScale.body;
+                font-weight: 600;
+                wrap: root.compact ? word-wrap : no-wrap;
+                overflow: root.compact ? clip : elide;
+            }
+            description-text := Text {
+                height: max(root.compact ? root.compact-description-height : 17px, self.preferred-height);
+                text: root.description;
+                color: root.description-color;
+                font-size: TypeScale.caption;
+                wrap: word-wrap;
+            }
+        }
+        VerticalLayout {
+            padding-top: root.control-shift;
+            alignment: start;
+            Switch {
+                checked <=> root.checked;
+                enabled: root.enabled;
+                control-label: root.title;
+                toggled => { root.toggled(self.checked); }
+            }
+        }
+    }
+}
+
+// A small app-level wrapper keeps select geometry consistent while retaining
+// the platform widget's keyboard navigation, popup behavior, and accessibility.
+export component SettingsSelect inherits ComboBox {
+    in property <[string]> choices;
+    in-out property <int> selected-index: 0;
+    callback selection-changed(int, string);
+
+    model: root.choices;
+    current-index <=> root.selected-index;
+    height: 36px;
+    min-width: 180px;
+
+    selected(value) => {
+        root.selection-changed(root.selected-index, value);
+    }
+}
+
+export component SettingsSelectRow inherits Rectangle {
+    in property <bool> compact: false;
+    in property <length> compact-description-height: 34px;
+    in property <string> title;
+    in property <string> description;
+    in property <[string]> choices;
+    in-out property <int> selected-index: 0;
+    in property <color> title-color;
+    in property <color> description-color;
+    callback selected(int, string);
+
+    // Desktop: the texts overhang the box padding by design. Compact: two 8px
+    // insets, two 7px gaps and the 36px selector around the stacked texts.
+    // Both layouts stay instantiated so the row can measure its texts.
+    height: root.compact
+        ? 66px + compact-title.height + compact-description.height
+        : 23px + desktop-title.height + desktop-description.height;
+    vertical-stretch: 0;
+
+    HorizontalBox {
+        visible: !root.compact;
+        spacing: 20px;
+        // A description longer than the room beside the selector wraps, as
+        // switch rows' do, rather than losing its end; translations run long.
+        VerticalBox {
+            horizontal-stretch: 1;
+            min-width: 0px;
+            spacing: 2px;
+            desktop-title := Text {
+                height: max(18px, self.preferred-height);
+                text: root.title;
+                color: root.title-color;
+                font-size: TypeScale.body;
+                font-weight: 600;
+                overflow: elide;
+            }
+            desktop-description := Text {
+                height: max(17px, self.preferred-height);
+                text: root.description;
+                color: root.description-color;
+                font-size: TypeScale.caption;
+                wrap: word-wrap;
+            }
+        }
+        SettingsSelect {
+            width: 210px;
+            choices: root.choices;
+            selected-index <=> root.selected-index;
+            selection-changed(index, value) => { root.selected(index, value); }
+        }
+    }
+
+    VerticalBox {
+        visible: root.compact;
+        padding: 8px;
+        spacing: 7px;
+        compact-title := Text {
+            height: max(20px, self.preferred-height);
+            text: root.title;
+            color: root.title-color;
+            font-size: TypeScale.body;
+            font-weight: 600;
+            wrap: word-wrap;
+        }
+        compact-description := Text {
+            height: max(root.compact-description-height, self.preferred-height);
+            text: root.description;
+            color: root.description-color;
+            font-size: TypeScale.caption;
+            wrap: word-wrap;
+        }
+        SettingsSelect {
+            horizontal-stretch: 1;
+            choices: root.choices;
+            selected-index <=> root.selected-index;
+            selection-changed(index, value) => { root.selected(index, value); }
+        }
+    }
+}
+
+export component SettingsLinkRow inherits Rectangle {
+    in property <string> text;
+    in property <string> description;
+    in property <image> icon;
+    in property <bool> colorize-icon: true;
+    in property <color> accent;
+    in property <color> body-text;
+    in property <color> muted-text;
+    in property <color> hover-background;
+    out property <bool> focus-visible: keyboard.focus-visible;
+    callback clicked;
+
+    height: 18px + link-title.height + link-description.height;
+    border-radius: 7px;
+    forward-focus: keyboard;
+    border-width: keyboard.focus-visible ? 2px : 0px;
+    border-color: root.accent;
+    background: link-hit.has-hover ? root.hover-background : transparent;
+    accessible-role: button;
+    accessible-label: root.text;
+    accessible-description: root.description;
+    accessible-action-default => { root.clicked(); }
+
+    Image {
+        x: 10px;
+        y: (parent.height - self.height) / 2;
+        width: 18px;
+        height: 18px;
+        source: root.icon;
+        colorize: root.colorize-icon ? root.accent : transparent;
+        image-fit: contain;
+        accessible-role: none;
+    }
+    VerticalBox {
+        x: 40px;
+        y: 7px;
+        width: parent.width - 80px;
+        height: parent.height - 14px;
+        spacing: 1px;
+        link-title := Text { height: max(18px, self.preferred-height); text: root.text; color: root.body-text; font-size: TypeScale.body; font-weight: 600; overflow: elide; }
+        link-description := Text { height: max(16px, self.preferred-height); text: root.description; color: root.muted-text; font-size: TypeScale.caption; overflow: elide; }
+    }
+    Image {
+        x: parent.width - 27px;
+        y: (parent.height - self.height) / 2;
+        width: 16px;
+        height: 16px;
+        source: @image-url("../icons/lucide/outline/external-link.svg");
+        colorize: root.accent;
+        image-fit: contain;
+        accessible-role: none;
+    }
+    keyboard := FocusVisibleScope {
+        accessible-role: none;
+        key-pressed(event) => {
+            if event.text == Key.Return || event.text == Key.Space { root.clicked(); return accept; }
+            reject
+        }
+    }
+    link-hit := TouchArea {
+        clicked => { keyboard.focus(); keyboard.pointer-activated(); root.clicked(); }
+        mouse-cursor: pointer;
+    }
+}
+
+// A card of shortcut rows under a small heading.
+export component ShortcutSection inherits Rectangle {
+    in property <string> title;
+    in property <color> surface;
+    in property <color> card-border-color;
+    in property <color> heading;
+
+    background: root.surface;
+    border-radius: 8px;
+    border-width: 1px;
+    border-color: root.card-border-color;
+    VerticalBox {
+        padding-top: 12px;
+        padding-right: 18px;
+        padding-bottom: 12px;
+        padding-left: 18px;
+        spacing: 0px;
+        Text {
+            height: max(20px, self.preferred-height);
+            text: root.title;
+            color: root.heading;
+            font-size: TypeScale.caption;
+            font-weight: 700;
+            vertical-alignment: center;
+        }
+        @children
+    }
+}
+
+// One shortcut with its keys; a second binding is shown as an alternative.
+export component ShortcutRow inherits Rectangle {
+    in property <string> title;
+    in property <[keys]> keys;
+    in property <string> separator: @tr("or");
+    in property <color> title-color;
+    in property <color> separator-color;
+
+    height: max(40px, keys-row.preferred-height + 12px);
+    accessible-role: text;
+    accessible-label: @tr("{}, {}", root.title, root.keys.length > 1
+        ? KeyboardKeys.text(root.keys[0]) + " " + root.separator + " " + KeyboardKeys.text(root.keys[1])
+        : KeyboardKeys.text(root.keys[0]));
+
+    HorizontalLayout {
+        spacing: 16px;
+        Text {
+            horizontal-stretch: 1;
+            text: root.title;
+            color: root.title-color;
+            font-size: TypeScale.body;
+            vertical-alignment: center;
+            overflow: elide;
+            accessible-role: none;
+        }
+        keys-row := HorizontalLayout {
+            spacing: 6px;
+            alignment: end;
+            cross-axis-alignment: center;
+            for binding[index] in root.keys : HorizontalLayout {
+                spacing: 6px;
+                cross-axis-alignment: center;
+                if index > 0 : Text {
+                    text: root.separator;
+                    color: root.separator-color;
+                    font-size: TypeScale.caption;
+                    vertical-alignment: center;
+                    accessible-role: none;
+                }
+                KbdShortcut { keys: binding; }
+            }
+        }
+    }
+}
+
+// A setting typed as one line of text, laid out like SettingsSelectRow so the
+// two line up in a card. What is typed is committed with Enter or when the
+// field loses focus, and only when it changed.
+export component SettingsTextRow inherits Rectangle {
+    in property <bool> compact: false;
+    in property <length> compact-description-height: 34px;
+    in property <string> title;
+    in property <string> description;
+    // The saved text. The field follows it while it isn't being edited.
+    in property <string> value;
+    in property <string> placeholder;
+    in property <bool> enabled: true;
+    in property <color> title-color;
+    in property <color> description-color;
+    callback committed(string);
+
+    function commit(text: string) {
+        if text != root.value {
+            root.committed(text);
+        }
+    }
+
+    changed value => {
+        if !desktop-field.has-focus && !compact-field.has-focus {
+            desktop-field.text = root.value;
+            compact-field.text = root.value;
+        }
+    }
+
+    height: root.compact
+        ? 66px + compact-title.height + compact-description.height
+        : 23px + desktop-title.height + desktop-description.height;
+    vertical-stretch: 0;
+
+    HorizontalBox {
+        visible: !root.compact;
+        spacing: 20px;
+        VerticalBox {
+            horizontal-stretch: 1;
+            min-width: 0px;
+            spacing: 2px;
+            desktop-title := Text {
+                height: max(18px, self.preferred-height);
+                text: root.title;
+                color: root.title-color;
+                font-size: TypeScale.body;
+                font-weight: 600;
+                overflow: elide;
+            }
+            desktop-description := Text {
+                height: max(17px, self.preferred-height);
+                text: root.description;
+                color: root.description-color;
+                font-size: TypeScale.caption;
+                wrap: word-wrap;
+            }
+        }
+        desktop-field := LineEdit {
+            width: 210px;
+            enabled: root.enabled;
+            text: root.value;
+            placeholder-text: root.placeholder;
+            input-label: root.title;
+            accepted(text) => { root.commit(text); }
+            changed has-focus => {
+                if !self.has-focus {
+                    root.commit(self.text);
+                }
+            }
+        }
+    }
+
+    VerticalBox {
+        visible: root.compact;
+        padding: 8px;
+        spacing: 7px;
+        compact-title := Text {
+            height: max(20px, self.preferred-height);
+            text: root.title;
+            color: root.title-color;
+            font-size: TypeScale.body;
+            font-weight: 600;
+            wrap: word-wrap;
+        }
+        compact-description := Text {
+            height: max(root.compact-description-height, self.preferred-height);
+            text: root.description;
+            color: root.description-color;
+            font-size: TypeScale.caption;
+            wrap: word-wrap;
+        }
+        compact-field := LineEdit {
+            horizontal-stretch: 1;
+            enabled: root.enabled;
+            text: root.value;
+            placeholder-text: root.placeholder;
+            input-label: root.title;
+            accepted(text) => { root.commit(text); }
+            changed has-focus => {
+                if !self.has-focus {
+                    root.commit(self.text);
+                }
+            }
+        }
+    }
+}
+
+export component FormField inherits VerticalBox {
+    in property <bool> enabled: true;
+    in property <string> label;
+    // Bind with `<=>`: typing replaces a one-way binding, after which the
+    // field would keep showing its old text when the form is reset or filled.
+    in-out property <string> value;
+    in property <string> placeholder;
+    in property <InputType> input-type: InputType.text;
+    in property <color> label-color;
+    callback edited(string);
+    forward-focus: field;
+
+    padding: 0px;
+    spacing: 5px;
+    // Long translated labels wrap on narrow screens instead of overflowing.
+    Text {
+        height: max(16px, self.preferred-height);
+        text: root.label;
+        color: root.label-color;
+        font-size: TypeScale.caption;
+        font-weight: 600;
+        vertical-alignment: center;
+        wrap: word-wrap;
+    }
+    field := LineEdit {
+        enabled: root.enabled;
+        height: 36px;
+        text <=> root.value;
+        placeholder-text: root.placeholder;
+        input-type: root.input-type;
+        edited(value) => { root.edited(value); }
+    }
+}

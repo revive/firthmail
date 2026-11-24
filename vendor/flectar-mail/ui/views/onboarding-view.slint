@@ -1,0 +1,544 @@
+import { FormField } from "../components/settings-components.slint";
+import { AppIcon } from "../app-icon.slint";
+import { MailAdvancedFields, MailPorts, MailSecurityFields } from "../components/mail-security-fields.slint";
+import { OAuthBrowserHelp } from "../components/oauth-browser-help.slint";
+import { HorizontalBox, ScrollView, VerticalBox } from "std-widgets.slint";
+import { Button } from "../components/button.slint";
+import { CopyableDiagnostic } from "../components/copyable-diagnostic.slint";
+import { AccountDiscovery, AccountDiscoveryNotice } from "../account-discovery.slint";
+import { LineEdit, TextLink } from "../components/controls.slint";
+import { ProviderButton } from "../components/provider-button.slint";
+import { OAuthSetupDialog } from "../dialogs/oauth-setup-dialog.slint";
+import { AppTheme } from "../design-system.slint";
+import { TypeScale } from "../typography.slint";
+import { SyncUi } from "../device-sync.slint";
+
+export component OnboardingView inherits Rectangle {
+    in property <bool> google-available: false;
+    in property <bool> microsoft-available: false;
+    in property <bool> google-bundled: false;
+    in property <bool> microsoft-bundled: false;
+    in property <string> google-client-id;
+    in property <string> google-client-secret;
+    in property <string> ms-client-id;
+    in-out property <bool> oauth-setup-open: false;
+    callback save-oauth-apps(string, string, string);
+    in property <bool> oauth-settings-saving: false;
+    in-out property <string> oauth-settings-error: "";
+    in property <bool> startup-ready: false;
+    in property <bool> account-setup-in-progress: false;
+    in property <bool> oauth-in-progress: false;
+    in property <string> oauth-authorization-url;
+    in property <bool> oauth-browser-error;
+    callback retry-oauth-browser();
+    callback copy-oauth-link();
+    callback submit-oauth-redirect(string);
+    callback import-mail-certificate();
+    in-out property <string> incoming-security: "tls";
+    in-out property <string> smtp-security: "tls";
+    in-out property <string> trusted-certificate-pem;
+    // The account form's advanced settings (#252).
+    in-out property <bool> account-sends-mail: true;
+    in-out property <string> incoming-login: "automatic";
+    in-out property <string> smtp-login: "automatic";
+    in-out property <string> smtp-username;
+    in-out property <string> smtp-password;
+    private property <bool> advanced-open: false;
+    in-out property <string> account-username;
+    in property <string> status: "";
+    in property <color> page-bg;
+    in property <color> surface;
+    in property <color> hover-surface;
+    in property <color> title-color;
+    in property <color> body-text;
+    in property <color> muted-text;
+    in property <color> ui-border;
+    in-out property <string> account-email: "";
+    in-out property <string> account-password: "";
+    in-out property <string> account-protocol: "imap";
+    in-out property <string> jmap-url: "";
+    in-out property <string> incoming-host: "";
+    in-out property <string> incoming-port: "993";
+    in-out property <string> smtp-host: "";
+    in-out property <string> smtp-port: "465";
+    in-out property <bool> account-form-open: false;
+    private property <bool> show-account-status: false;
+    callback add-password-account(string, string, string, string, string, string, string, string, string);
+    callback suggest-account-settings(string);
+    callback start-oauth(string);
+    callback cancel-oauth();
+    callback import-accounts();
+    // Join Flectar Mail Sync with a code from another device or the recovery
+    // code: "code" or "recovery".
+    callback join-sync(string);
+    in property <string> privacy-policy-url;
+    callback open-link(string);
+
+    private property <bool> account-form-valid: root.account-email != ""
+        && root.account-password != ""
+        && AccountDiscovery.ready
+        && (root.account-protocol == "jmap" || (
+            root.incoming-host != ""
+            && root.incoming-port != ""
+            && (!root.account-sends-mail || (root.smtp-host != "" && root.smtp-port != ""))));
+
+    function open-new-mail-account() {
+        root.account-email = "";
+        AccountDiscovery.state = "";
+        AccountDiscovery.confirmed = false;
+        root.account-username = "";
+        root.account-password = "";
+        root.account-protocol = "imap";
+        root.jmap-url = "";
+        root.incoming-security = "tls";
+        root.smtp-security = "tls";
+        root.trusted-certificate-pem = "";
+        root.incoming-host = "";
+        root.incoming-port = "993";
+        root.smtp-host = "";
+        root.smtp-port = "465";
+        root.account-sends-mail = true;
+        root.incoming-login = "automatic";
+        root.smtp-login = "automatic";
+        root.smtp-username = "";
+        root.smtp-password = "";
+        root.advanced-open = false;
+        root.show-account-status = false;
+        root.account-form-open = true;
+    }
+
+    function choose-protocol(protocol: string) {
+        if MailPorts.is-standard-incoming(root.incoming-port) {
+            root.incoming-port = MailPorts.incoming(protocol, root.incoming-security);
+        }
+        root.account-protocol = protocol;
+        // Settings found for the address may list this protocol's server.
+        root.suggest-account-settings(root.account-email);
+    }
+
+    background: root.page-bg;
+
+    setup-scroll := ScrollView {
+        width: parent.width;
+        height: parent.height;
+        content-width: self.visible-width;
+        content-height: max(self.visible-height, setup-content.y + setup-content.height + 24px);
+
+        setup-content := VerticalBox {
+            x: max(20px, (setup-scroll.visible-width - 400px) / 2);
+            y: max(24px, (setup-scroll.visible-height - self.preferred-height) / 2);
+            width: min(400px, setup-scroll.visible-width - 40px);
+            height: self.preferred-height;
+            padding: 0px;
+            padding-bottom: 24px;
+            spacing: 0px;
+
+            HorizontalBox {
+                height: root.account-form-open ? 40px : 62px;
+                Rectangle { horizontal-stretch: 1; }
+                Image {
+                    width: root.account-form-open ? 40px : 62px;
+                    height: root.account-form-open ? 40px : 62px;
+                    source: AppIcon.logo(AppIcon.variant);
+                    image-fit: contain;
+                    accessible-label: @tr("Flectar Mail logo");
+                }
+                Rectangle { horizontal-stretch: 1; }
+            }
+            Rectangle { height: root.account-form-open ? 12px : 22px; }
+            Text {
+                text: @tr("Flectar Mail");
+                color: root.title-color;
+                font-size: TypeScale.display-large;
+                font-weight: 600;
+                horizontal-alignment: center;
+                letter-spacing: -0.6px;
+            }
+
+            if !root.startup-ready : VerticalBox {
+                spacing: 8px;
+                Rectangle { height: 6px; }
+                Text {
+                    text: @tr("Opening your mailbox…");
+                    color: root.muted-text;
+                    font-size: TypeScale.body;
+                    horizontal-alignment: center;
+                }
+            }
+
+            if root.startup-ready && !root.account-form-open : VerticalBox {
+                padding: 0px;
+                spacing: 10px;
+                Rectangle { height: 6px; }
+                Text {
+                    text: @tr("Connect an account to get started.");
+                    color: root.muted-text;
+                    font-size: TypeScale.body;
+                    horizontal-alignment: center;
+                }
+                Rectangle { height: 16px; }
+                ProviderButton {
+                    text: @tr("Continue with Gmail");
+                    icon: @image-url("../icons/brand/gmail.svg");
+                    enabled: !root.account-setup-in-progress && !root.oauth-in-progress && !root.oauth-settings-saving && root.google-available;
+                    tooltip-text: root.google-available ? "" : @tr("Add app keys in Sign-in settings to enable this provider.");
+                    foreground: root.body-text;
+                    muted: root.muted-text;
+                    surface: root.surface;
+                    hover-surface: root.hover-surface;
+                    button-border: root.ui-border;
+                    clicked => { root.start-oauth("gmail"); }
+                }
+                ProviderButton {
+                    text: @tr("Continue with Outlook");
+                    icon: @image-url("../icons/brand/outlook.svg");
+                    enabled: !root.account-setup-in-progress && !root.oauth-in-progress && !root.oauth-settings-saving && root.microsoft-available;
+                    tooltip-text: root.microsoft-available ? "" : @tr("Add app keys in Sign-in settings to enable this provider.");
+                    foreground: root.body-text;
+                    muted: root.muted-text;
+                    surface: root.surface;
+                    hover-surface: root.hover-surface;
+                    button-border: root.ui-border;
+                    clicked => { root.start-oauth("microsoft"); }
+                }
+                ProviderButton {
+                    text: @tr("Connect another provider");
+                    icon: @image-url("../icons/lucide/outline/mail.svg");
+                    colorize-icon: true;
+                    // Optical correction for the asymmetric mail-outline glyph.
+                    icon-offset-x: 1px;
+                    enabled: !root.account-setup-in-progress && !root.oauth-in-progress && !root.oauth-settings-saving;
+                    foreground: root.body-text;
+                    muted: root.muted-text;
+                    surface: root.surface;
+                    hover-surface: root.hover-surface;
+                    button-border: root.ui-border;
+                    clicked => { root.open-new-mail-account(); }
+                }
+                if !root.google-available : Text {
+                    text: @tr("For Gmail with an app password, use Connect another provider.");
+                    color: root.muted-text;
+                    font-size: TypeScale.caption;
+                    horizontal-alignment: center;
+                    wrap: word-wrap; height: self.preferred-height;
+                }
+                if !root.google-available || !root.microsoft-available : Text {
+                    text: !root.google-available && !root.microsoft-available
+                        ? @tr("Add your own app keys to enable Gmail and Outlook.")
+                        : !root.google-available ? @tr("Add your own app keys to enable Gmail.")
+                        : @tr("Add your own app key to enable Outlook.");
+                    color: root.muted-text;
+                    font-size: TypeScale.caption;
+                    horizontal-alignment: center;
+                    wrap: word-wrap; height: self.preferred-height;
+                }
+                oauth-settings := Button {
+                    height: 40px;
+                    text: @tr("Sign-in settings");
+                    icon: @image-url("../icons/lucide/outline/gear.svg");
+                    has-icon: true;
+                    enabled: !root.account-setup-in-progress && !root.oauth-in-progress && !root.oauth-settings-saving;
+                    clicked => { root.oauth-setup-open = true; }
+                }
+                // A new device can get its accounts from Flectar Mail Sync
+                // instead of setting them up again.
+                Rectangle { height: 8px; }
+                Text {
+                    text: @tr("Already syncing on another device? Add this one to it.");
+                    color: root.muted-text;
+                    font-size: TypeScale.caption;
+                    horizontal-alignment: center;
+                    wrap: word-wrap;
+                }
+                // Stacked like the buttons above: translations of these labels
+                // run long.
+                Button {
+                    height: 40px;
+                    text: @tr("Enter code");
+                    icon: @image-url("../icons/lucide/outline/link.svg");
+                    has-icon: true;
+                    enabled: !root.account-setup-in-progress && !root.oauth-in-progress && !root.oauth-settings-saving && !SyncUi.busy;
+                    clicked => { root.join-sync("code"); }
+                }
+                Button {
+                    height: 40px;
+                    text: @tr("Recovery code");
+                    icon: @image-url("../icons/lucide/outline/key.svg");
+                    has-icon: true;
+                    enabled: !root.account-setup-in-progress && !root.oauth-in-progress && !root.oauth-settings-saving && !SyncUi.busy;
+                    clicked => { root.join-sync("recovery"); }
+                }
+                Rectangle { height: 8px; }
+                Text {
+                    text: @tr("Moving from Thunderbird, K-9 Mail, or another device?");
+                    color: root.muted-text;
+                    font-size: TypeScale.caption;
+                    horizontal-alignment: center;
+                    wrap: word-wrap;
+                }
+                Button {
+                    height: 40px;
+                    text: @tr("Import accounts and mail");
+                    icon: @image-url("../icons/lucide/outline/download.svg");
+                    has-icon: true;
+                    enabled: !root.account-setup-in-progress && !root.oauth-in-progress && !root.oauth-settings-saving;
+                    clicked => { root.import-accounts(); }
+                }
+                if root.oauth-in-progress && root.oauth-authorization-url != "" : OAuthBrowserHelp {
+                    launch-failed: root.oauth-browser-error;
+                    retry => { root.retry-oauth-browser(); }
+                    copy-link => { root.copy-oauth-link(); }
+                    submit-redirect(address) => { root.submit-oauth-redirect(address); }
+                }
+                if root.oauth-in-progress : Button {
+                    height: 40px;
+                    text: @tr("Cancel sign-in");
+                    clicked => { root.cancel-oauth(); }
+                }
+            }
+
+            if root.startup-ready && root.account-form-open : VerticalBox {
+                padding: 0px;
+                spacing: 10px;
+                Rectangle { height: 6px; }
+                Text {
+                    text: @tr("Connect a mail account");
+                    color: root.title-color;
+                    font-size: TypeScale.heading;
+                    font-weight: 700;
+                    horizontal-alignment: center;
+                    wrap: word-wrap;
+                }
+                Text {
+                    text: root.account-protocol == "jmap" ? @tr("Connect using JMAP for mail sync and sending.")
+                        : root.account-protocol == "pop3" ? @tr("Connect using POP3 and SMTP. Mail is downloaded to this device and kept here.")
+                        : @tr("Connect using IMAP and SMTP.");
+                    wrap: word-wrap; height: self.preferred-height;
+                    color: root.muted-text;
+                    font-size: TypeScale.secondary;
+                    horizontal-alignment: center;
+                }
+                Rectangle { height: 8px; }
+                FormField {
+                    enabled: !root.account-setup-in-progress;
+                    height: 60px;
+                    label: @tr("Email address");
+                    label-color: root.muted-text;
+                    value <=> root.account-email;
+                    placeholder: @tr("Email address");
+                    edited(value) => { root.suggest-account-settings(value); }
+                }
+                FormField {
+                    enabled: !root.account-setup-in-progress;
+                    height: 60px;
+                    label: @tr("Username (defaults to email)");
+                    label-color: root.muted-text;
+                    value <=> root.account-username;
+                    placeholder: @tr("Username (defaults to email)");
+                }
+                AccountDiscoveryNotice { enabled: !root.account-setup-in-progress; text-color: root.muted-text; }
+                FormField {
+                    enabled: !root.account-setup-in-progress;
+                    height: 60px;
+                    label: root.account-protocol == "jmap" ? @tr("Password, app password, or API token") : @tr("Password or app password");
+                    label-color: root.muted-text;
+                    value <=> root.account-password;
+                    input-type: password;
+                    placeholder: root.account-protocol == "jmap" ? @tr("Password, app password, or API token") : @tr("Password or app password");
+                }
+                HorizontalBox {
+                    height: 42px;
+                    padding: 0px;
+                    spacing: 8px;
+                    Button {
+                        horizontal-stretch: 1;
+                        height: 42px;
+                        text: @tr("IMAP");
+                        enabled: !root.account-setup-in-progress;
+                        primary: root.account-protocol == "imap";
+                        clicked => { root.choose-protocol("imap"); }
+                    }
+                    Button {
+                        horizontal-stretch: 1;
+                        height: 42px;
+                        text: @tr("POP3");
+                        enabled: !root.account-setup-in-progress;
+                        primary: root.account-protocol == "pop3";
+                        clicked => { root.choose-protocol("pop3"); }
+                    }
+                    Button {
+                        horizontal-stretch: 1;
+                        height: 42px;
+                        text: @tr("JMAP");
+                        enabled: !root.account-setup-in-progress;
+                        primary: root.account-protocol == "jmap";
+                        clicked => { root.choose-protocol("jmap"); }
+                    }
+                }
+                if root.account-protocol == "jmap" : LineEdit {
+                    height: 42px;
+                    text <=> root.jmap-url;
+                    placeholder-text: @tr("Server address (optional)");
+                }
+                if root.account-protocol == "jmap" : Text {
+                    text: @tr("Leave blank to discover /.well-known/jmap from your email domain.");
+                    color: root.muted-text;
+                    font-size: TypeScale.caption;
+                    wrap: word-wrap; height: self.preferred-height;
+                }
+                if root.account-protocol != "jmap" : HorizontalBox {
+                    height: 60px;
+                    padding: 0px;
+                    spacing: 8px;
+                    FormField {
+                        enabled: !root.account-setup-in-progress;
+                        horizontal-stretch: 1;
+                        label: root.account-protocol == "pop3" ? @tr("POP3 server") : @tr("IMAP server");
+                        label-color: root.muted-text;
+                        value <=> root.incoming-host;
+                        placeholder: root.account-protocol == "pop3" ? @tr("POP3 server") : @tr("IMAP server");
+                    }
+                    FormField {
+                        enabled: !root.account-setup-in-progress;
+                        width: max(82px, self.preferred-width);
+                        label: @tr("Port");
+                        label-color: root.muted-text;
+                        value <=> root.incoming-port;
+                        input-type: number;
+                        placeholder: MailPorts.incoming(root.account-protocol, root.incoming-security);
+                    }
+                }
+                if root.account-protocol != "jmap" && root.account-sends-mail : HorizontalBox {
+                    height: 60px;
+                    padding: 0px;
+                    spacing: 8px;
+                    FormField {
+                        enabled: !root.account-setup-in-progress;
+                        horizontal-stretch: 1;
+                        label: @tr("SMTP server");
+                        label-color: root.muted-text;
+                        value <=> root.smtp-host;
+                        placeholder: @tr("SMTP server");
+                    }
+                    FormField {
+                        enabled: !root.account-setup-in-progress;
+                        width: max(82px, self.preferred-width);
+                        label: @tr("Port");
+                        label-color: root.muted-text;
+                        value <=> root.smtp-port;
+                        input-type: number;
+                        placeholder: MailPorts.smtp(root.smtp-security);
+                    }
+                }
+                if root.account-protocol == "imap" : Text {
+                    text: @tr("Proton Bridge: use the local servers, ports and password shown in Bridge, and match its encryption settings.");
+                    color: root.muted-text; font-size: TypeScale.caption; wrap: word-wrap; height: self.preferred-height;
+                }
+                if root.account-protocol != "jmap" : MailSecurityFields {
+                    incoming-protocol: root.account-protocol;
+                    incoming-security <=> root.incoming-security;
+                    smtp-security <=> root.smtp-security;
+                    incoming-port <=> root.incoming-port;
+                    smtp-port <=> root.smtp-port;
+                    enabled: !root.account-setup-in-progress;
+                    sends-mail: root.account-sends-mail;
+                    certificate-pem <=> root.trusted-certificate-pem;
+                    import-certificate => { root.import-mail-certificate(); }
+                }
+                if root.account-protocol != "jmap" : MailAdvancedFields {
+                    incoming-protocol: root.account-protocol;
+                    expanded <=> root.advanced-open;
+                    sends-mail <=> root.account-sends-mail;
+                    incoming-login <=> root.incoming-login;
+                    smtp-login <=> root.smtp-login;
+                    smtp-username <=> root.smtp-username;
+                    smtp-password <=> root.smtp-password;
+                    enabled: !root.account-setup-in-progress;
+                }
+                Rectangle { height: 2px; }
+                if root.show-account-status && root.status != "" : Rectangle {
+                    height: max(36px, setup-status.preferred-height + 16px);
+                    background: root.account-setup-in-progress ? root.hover-surface : AppTheme.destructive.transparentize(0.9);
+                    border-radius: 8px;
+                    border-width: 1px;
+                    border-color: root.account-setup-in-progress ? root.ui-border : AppTheme.destructive.transparentize(0.45);
+
+                    setup-status := CopyableDiagnostic {
+                        x: 10px;
+                        y: 8px;
+                        width: parent.width - 20px;
+                        text: root.status;
+                        text-color: root.account-setup-in-progress ? root.body-text : AppTheme.destructive;
+                        font-size: TypeScale.caption;
+                    }
+                }
+                Button {
+                    height: 42px;
+                    text: root.account-setup-in-progress ? @tr("Connecting…") : @tr("Connect account");
+                    primary: true;
+                    enabled: root.account-form-valid && !root.account-setup-in-progress;
+                    clicked => {
+                        root.show-account-status = true;
+                        root.add-password-account(
+                            root.account-protocol,
+                            root.account-email,
+                            root.account-username,
+                            root.account-password,
+                            root.jmap-url,
+                            root.incoming-host,
+                            root.incoming-port,
+                            root.smtp-host,
+                            root.smtp-port
+                        );
+                    }
+                }
+                Button {
+                    height: 40px;
+                    text: @tr("Back");
+                    enabled: !root.account-setup-in-progress;
+                    clicked => { root.account-form-open = false; }
+                }
+            }
+
+            if root.startup-ready && !root.account-form-open && root.status != "" : VerticalBox {
+                padding: 0px;
+                padding-top: 12px;
+                Text {
+                text: root.status;
+                color: root.muted-text;
+                font-size: TypeScale.caption;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+                wrap: word-wrap; height: self.preferred-height;
+            }
+            }
+
+            // Settings, which links the policy too, opens only once an account
+            // exists.
+            if root.startup-ready : HorizontalLayout {
+                alignment: center;
+                padding-top: 12px;
+                TextLink {
+                    text: @tr("Privacy policy");
+                    clicked => { root.open-link(root.privacy-policy-url); }
+                }
+            }
+        }
+    }
+
+    OAuthSetupDialog {
+        open <=> root.oauth-setup-open;
+        saving: root.oauth-settings-saving;
+        save-error <=> root.oauth-settings-error;
+        google-available: root.google-available;
+        microsoft-available: root.microsoft-available;
+        google-bundled: root.google-bundled;
+        microsoft-bundled: root.microsoft-bundled;
+        google-client-id: root.google-client-id;
+        google-client-secret: root.google-client-secret;
+        ms-client-id: root.ms-client-id;
+        save(google-id, google-secret, microsoft-id) => {
+            root.save-oauth-apps(google-id, google-secret, microsoft-id);
+        }
+    }
+}

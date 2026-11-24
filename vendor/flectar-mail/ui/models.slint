@@ -1,0 +1,699 @@
+// Shared UI-facing data types live outside app.slint so feature components can
+// consume the same models without depending on the application window.
+import "../resources/fonts/noto-emoji/NotoEmoji[wght].ttf";
+
+export struct LocalizedMessage {
+    key: string,
+    argument: string,
+    second_argument: string,
+    third_argument: string,
+}
+
+// Computed only while the Storage settings page is open. `offset` and
+// `fraction` let the view paint one proportional bar without doing byte math
+// in Slint's 32-bit integer type.
+export struct StorageUsageRow {
+    kind: string,
+    size: string,
+    fraction: float,
+    offset: float,
+    color: color,
+}
+
+// Drag payloads are opaque to Slint and stay application-internal. Keeping
+// the transfer construction, validation, and mutation on one shared global
+// lets the list and every responsive sidebar use the same DnD contract.
+export global MailDragApi {
+    pure callback make-transfer(int, int) -> data-transfer;
+    pure callback can-drop-on-mailbox(data-transfer, string, int, int) -> bool;
+    callback drop-on-mailbox(data-transfer, string, int, int) -> bool;
+}
+
+// What stops an account's mail checks.
+export enum AccountProblem {
+    none,
+    // The server turned the sign-in down; signing in again fixes it.
+    sign-in,
+    // A check failed, and the app keeps trying again on its own.
+    failed,
+    // The server asked the app to wait before it checks again, such as
+    // after too many connections or requests.
+    waiting,
+}
+
+// How an account's mail checks are going, as its sidebar heading shows it.
+export struct AccountStatus {
+    // A check has been running for a moment.
+    checking: bool,
+    problem: AccountProblem,
+    // The heading shows the problem: at once after a check someone asked
+    // for, otherwise once it has lasted, so a dropped connection that comes
+    // straight back marks nothing.
+    marked: bool,
+    // The server's or the network's own account of the failure.
+    reason: string,
+    // When a check last brought the Inbox up to date, for
+    // AccountStatusText.last-checked.
+    checked_day: int,
+    checked_at: string,
+    // When an account that waits for its server checks again, for
+    // AccountStatusText.checks-again.
+    resume_day: int,
+    resume_at: string,
+}
+
+// The mailboxes Flectar Mail names itself, in the interface's language: the
+// standard ones every account has, the two halves of a split inbox, snoozed
+// and scheduled mail, and the automatic categories (marketing to pitch).
+// Folders and labels have no role and keep the names their accounts give
+// them.
+export enum MailboxRole { none, inbox, starred, sent, archive, spam, trash, drafts, important, other, snoozed, scheduled, marketing, news, social, pitch }
+
+// What the list or tab of a standard mailbox is called: the mailbox, after
+// the name of its account unless it shows every account's at once.
+export struct MailboxTitle {
+    role: MailboxRole,
+    // Empty for unified mailboxes and for mail kept on this device.
+    account: string,
+    unified: bool,
+}
+
+export struct MailboxRow {
+    account_id: int,
+    folder_id: int,
+    parent_folder_id: int,
+    depth: int,
+    has_children: bool,
+    expanded: bool,
+    // The standard mailbox this row is, or none for a folder.
+    role: MailboxRole,
+    is_selectable: bool,
+    can_create_children: bool,
+    can_rename: bool,
+    can_delete: bool,
+    label_has_emoji: bool,
+    label: string,
+    scope: string,
+    context: string,
+    detail: string,
+    avatar: string,
+    avatar_image: image,
+    has_avatar: bool,
+    is_account: bool,
+    count: string,
+    color: color,
+    has_custom_color: bool,
+    // Account rows only.
+    status: AccountStatus,
+}
+
+// Provider labels and local auto-categories share one presentation model.
+// `applied` is projected for the currently selected thread so menus and chips
+// update from the same source of truth after every action.
+export struct MailLabelRow {
+    id: int,
+    account_id: int,
+    account_name: string,
+    name: string,
+    display_name: string,
+    depth: int,
+    has_children: bool,
+    expanded: bool,
+    can_create_children: bool,
+    name_has_emoji: bool,
+    color: color,
+    applied: bool,
+    is_auto: bool,
+    is_global: bool,
+    // The automatic category this label still is, which the window names in
+    // its language; none for every other label, and for a category that has
+    // been given a name of its own.
+    role: MailboxRole,
+    // Unread mail the label's list shows, as the sidebar badge shows it.
+    count: string,
+}
+
+// One visible navigation entry per list row; stable keys also identify sections.
+export enum SidebarRowKind {
+    unified-heading, unified-section, unified-inbox, unified-mailbox,
+    categories-section, important, other, category, snoozed, scheduled,
+    global-labels-section, global-label,
+    saved-searches-section, saved-search,
+    accounts-heading, account, folder, account-labels-section, account-label,
+    new-folder, new-label,
+}
+
+export struct SidebarRow {
+    key: string,
+    kind: SidebarRowKind,
+    mailbox: MailboxRow,
+    label: MailLabelRow,
+    open: bool,
+    show_row: bool,
+    reveal_row: bool,
+}
+
+// A file shown on a message-list row.
+export struct ListAttachment {
+    id: string,
+    // The name before its extension, which stays whole when the name is cut.
+    stem: string,
+    extension: string,
+    // The file's type, as for MailAttachment.
+    kind: string,
+    previewable: bool,
+}
+
+export struct EmailRow {
+    id: int,
+    account_id: int,
+    account: string,
+    account_color: color,
+    account_profile: string,
+    show_account_marker: bool,
+    folder: string,
+    sender: string,
+    address: string,
+    initials: string,
+    favicon: image,
+    favicon_small: image,
+    has_favicon: bool,
+    subject: string,
+    preview: string,
+    time: string,
+    unread: bool,
+    starred: bool,
+    has_attachments: bool,
+    has_replied: bool,
+    // Nobody replied in time to mail the user asked to be reminded about.
+    reply_due: bool,
+    // Sent with high importance (#236), for a marker in the list.
+    high_importance: bool,
+    message_count: int,
+    // The names of the labels other than automatic categories, and the
+    // categories the labels include, which the window names in its language.
+    label_summary: string,
+    label_categories: [MailboxRole],
+    labels: [MailLabelRow],
+    // Gmail labels are tags; other accounts file labels like folders.
+    account_uses_labels: bool,
+    // The one-time code the message asks its reader to enter, if any, and
+    // the same code spelled out for screen readers.
+    verification_code: string,
+    verification_code_spelled: string,
+    // The conversation's first file, and how many files it holds.
+    attachment: ListAttachment,
+    attachment_total: int,
+    selected: bool,
+    checked: bool,
+}
+
+// Section controls and messages share a virtualized ListView. Closing rows
+// stay in the model briefly at zero height so the accordion can settle.
+export struct MailListEntry {
+    is_header: bool,
+    group_key: string,
+    group_kind: string,
+    group_count: int,
+    expanded: bool,
+    show_row: bool,
+    reveal_row: bool,
+    email_index: int,
+    email: EmailRow,
+}
+
+// Resolve keyboard movement against the entire model, including messages
+// outside the virtualized viewport. Geometry stays in the Slint component.
+export struct MailNavigationTarget {
+    id: int,
+    entry_index: int,
+    preceding_headers: int,
+    preceding_messages: int,
+    checked: bool,
+}
+
+export global MailListNavigation {
+    pure callback target([MailListEntry], int, string, int) -> MailNavigationTarget;
+}
+
+export struct MailProfileRow {
+    id: string,
+    name: string,
+    color: color,
+    account_count: int,
+}
+
+// An account in the profile editor's checklist; checked accounts belong to
+// the profile being edited.
+export struct ProfileMemberRow {
+    id: int,
+    name: string,
+    email: string,
+    initials: string,
+    avatar: image,
+    has_avatar: bool,
+    // The other profile the account is in now; empty when none.
+    other_profile: string,
+    checked: bool,
+}
+
+// Messages remain separate inside a conversation. The native side keeps the
+// bodies and renderer state; this lightweight model is safe to virtualize even
+// for long threads.
+// Who a message is from and to, and when, as the reader's details list them.
+export struct MessageDetails {
+    from: string,
+    to: [string],
+    cc: [string],
+    date: string,
+}
+
+export struct ThreadMessageRow {
+    index: int,
+    sender: string,
+    address: string,
+    initials: string,
+    favicon: image,
+    favicon_small: image,
+    has_favicon: bool,
+    preview: string,
+    time: string,
+    to: string,
+    unread: bool,
+    outgoing: bool,
+    body_pending: bool,
+    selected: bool,
+}
+
+// A calendar server an account syncs; mirrors
+// flectar_mail_core::models::CalendarConnection.
+export struct CalendarConnectionRow {
+    id: int,
+    // google | generic | microsoft
+    kind: string,
+    base_url: string,
+    host: string,
+    username: string,
+    // The calendar's name when the connection syncs exactly one.
+    calendar_name: string,
+    calendar_count: int,
+    enabled: bool,
+    // "needs_reauth", "offline" or an error message; empty while it syncs.
+    error: string,
+}
+
+export struct AccountRow {
+    id: int,
+    drag_key: string,
+    // What lists of accounts call it: `custom_name`, else `default_name`.
+    name: string,
+    // The name the user gave the account, or empty.
+    custom_name: string,
+    // What it's called without a name of its own: its owner's name from
+    // the provider, else its address.
+    default_name: string,
+    email: string,
+    provider: string,
+    mail_protocol: string,
+    status: string,
+    sync_error: string,
+    // When a check last brought the Inbox up to date, for
+    // AccountStatusText.last-checked.
+    checked_day: int,
+    checked_at: string,
+    // When an account that waits for its server checks again, for
+    // AccountStatusText.checks-again.
+    resume_day: int,
+    resume_at: string,
+    initials: string,
+    avatar: image,
+    avatar_small: image,
+    has_avatar: bool,
+    profile_id: string,
+    profile_name: string,
+    profile_color: color,
+    has_profile: bool,
+    has_account_color: bool,
+    username: string,
+    jmap_url: string,
+    incoming_security: string,
+    smtp_security: string,
+    trusted_certificate_pem: string,
+    incoming_host: string,
+    incoming_port: string,
+    smtp_host: string,
+    smtp_port: string,
+    // An IMAP or POP3 account with no SMTP server, which only receives mail.
+    receive_only: bool,
+    // How the incoming and SMTP servers are signed in to, as "automatic",
+    // "plain" or "login", and for SMTP also "none".
+    incoming_login: string,
+    smtp_login: string,
+    // The SMTP server's own username, or empty for the account's.
+    smtp_username: string,
+    mail_history: string,
+    sent_copy_policy: string,
+    keep_on_server: string,
+    // IMAP: the account lists only the folders the user subscribed to.
+    subscribed_folders_only: bool,
+    // How often the account checks for new mail: "app" as Settings has
+    // every account check, "1", "5", "15", "30" or "60" minutes, or
+    // "manual" only when asked.
+    check_interval: string,
+    // IMAP and JMAP: the server tells of new mail as it arrives.
+    push: bool,
+    // IMAP, POP3 and JMAP: how long to wait for the account's servers, in
+    // seconds, as "30", "60", "120" or "300".
+    server_timeout: string,
+    // IMAP: what downloads ahead of time, "headers", "messages" or
+    // "everything" (#253).
+    download: string,
+    // Days a POP3 server keeps downloaded mail on its own; -1 when it
+    // keeps it or hasn't said.
+    server_keeps_mail_days: int,
+    // Calendar servers the account syncs: its provider's first, then CalDAV.
+    calendar_connections: [CalendarConnectionRow],
+    // Gmail and Outlook accounts sync their provider's calendar at most once.
+    provider_calendar_connected: bool,
+    // Why connecting the provider's calendar last failed.
+    provider_calendar_error: string,
+    carddav_connected: bool,
+    carddav_enabled: bool,
+    carddav_status: string,
+    carddav_url: string,
+    carddav_username: string,
+}
+
+export struct EmailLink {
+    x: float,
+    y: float,
+    width: float,
+    height: float,
+    url: string,
+    name: string
+}
+
+// Email HTML is rasterized into bounded vertical tiles. Coordinates are
+// normalized against the reading-pane width so HiDPI scaling stays in Slint
+// and no single full-message bitmap has to move on every scroll frame.
+export struct EmailTile {
+    image: image,
+    y: float,
+    height: float,
+}
+
+// The composer uses the same bounded-tile strategy as the message renderer,
+// but these coordinates are logical pixels because cosmic-text owns the
+// editor's exact wrapping and caret geometry.
+export struct ComposeEditorTile {
+    image: image,
+    y: float,
+    height: float,
+}
+
+// A language spelling can be checked in, as the editor menu lists it.
+export struct SpellingLanguage {
+    name: string,
+    checked: bool,
+}
+
+export struct EmailTemplateRow {
+    id: int,
+    name: string,
+    shortcut: string,
+    subject: string,
+    body_text: string,
+}
+
+export struct CalendarEventRow {
+    id: int,
+    editable: bool,
+    title: string,
+    detail: string,
+    iso_date: string,
+    date_label: string,
+    color_index: int,
+    all_day: bool,
+    provider: string,
+    account: string,
+    calendar: string,
+    location: string,
+    organizer: string,
+    description: string,
+    attendees: string,
+    join_url: string,
+    rsvp_status: string,
+    recurrence: string,
+    status: string,
+    source: string,
+    // An invitation the user can answer: they are among its guests, don't
+    // organize it, and it isn't cancelled.
+    answerable: bool,
+    // A cancelled event from someone else, which the user can take out of
+    // their calendar.
+    removable: bool,
+    // For one occurrence of a repeating event, its RECURRENCE-ID (ms since
+    // the epoch, as text), else empty.
+    recurrence_id: string,
+}
+
+// A day in the month grid, the mini calendar and the phone's month strip.
+export struct CalendarDay {
+    day: string,
+    iso_date: string,
+    date_label: string,
+    outside_month: bool,
+    is_today: bool,
+    is_selected: bool,
+    // Some event runs on this day.
+    has_events: bool,
+    // more_from[k] counts the day's bars in lane k and below it, which a
+    // grid with room for k lanes leaves to "+N more".
+    more_from: [int],
+    // The day's events in agenda order, for its "+N more" list.
+    events: [CalendarEventRow],
+}
+
+// A day column of the week view, with its all-day strip.
+export struct CalendarWeekDay {
+    weekday: string,
+    day: string,
+    iso_date: string,
+    date_label: string,
+    is_today: bool,
+    more_from: [int],
+    events: [CalendarEventRow],
+}
+
+// An event's bar in a row of days: a week of the month grid, or the week
+// view's all-day strip. An event running into later weeks has one bar in
+// each, cut where the row ends.
+export struct CalendarBar {
+    event: CalendarEventRow,
+    row: int,
+    column: int,
+    span: int,
+    lane: int,
+    continues_before: bool,
+    continues_after: bool,
+    // The start time, on the bar where a timed event starts.
+    time_label: string,
+}
+
+// A timed event's box in a day column of the week view's hours. Events
+// crossing midnight have one box each day. Overlapping events split the
+// column into lanes.
+export struct CalendarTimedBlock {
+    event: CalendarEventRow,
+    column: int,
+    start_minutes: int,
+    end_minutes: int,
+    lane: int,
+    lanes: int,
+    lane_span: int,
+    continues_before: bool,
+    continues_after: bool,
+}
+
+// A flat model lets ListView virtualize individual events, including busy days.
+export struct CalendarAgendaRow {
+    key: string,
+    kind: string,
+    iso_date: string,
+    date_label: string,
+    is_today: bool,
+    count: int,
+    time_label: string,
+    end_label: string,
+    offset: float,
+    previous_event: int,
+    next_event: int,
+    event: CalendarEventRow,
+}
+
+export struct CalendarAgendaFilterRow {
+    id: int,
+    name: string,
+    account: string,
+    color_index: int,
+    checked: bool,
+}
+
+// Provider calendar collections are kept separate from events so the
+// calendar sidebar can mirror mail's account-aware navigation without
+// inventing local placeholder rows.
+export struct CalendarSourceRow {
+    id: int,
+    account_id: int,
+    group_start: bool,
+    name: string,
+    account_name: string,
+    email: string,
+    provider: string,
+    color: string,
+    color_index: int,
+    read_only: bool,
+    enabled: bool,
+    is_default: bool,
+    last_synced: string,
+}
+
+// Compose attachments intentionally expose display metadata only. Absolute
+// paths stay in Rust so the UI cannot accidentally render or persist local
+// filesystem details in a message.
+export struct ComposeAttachment {
+    name: string,
+    detail: string,
+}
+
+// A file the message sends by link: its name, and how its upload went.
+export struct ComposeLink {
+    name: string,
+    detail: string,
+    failed: bool,
+}
+
+// A deliberately small contact shape for compose autocomplete. The core
+// keeps affinity/account scoping private and only exposes what the menu needs.
+export struct ComposeContact {
+    name: string,
+    email: string,
+    initials: string,
+}
+
+// Mirrors flectar_mail_core::models::ContactSync.
+export enum ContactSyncState { local, detached, synced, pending, conflict, unavailable, failed }
+
+export struct ContactValueRow {
+    key: string,
+    value: string,
+    label: string,
+    preference: int,
+}
+
+export struct ContactRow {
+    avatar: image,
+    has-avatar: bool,
+    source: string,
+    id: int,
+    name: string,
+    email: string,
+    initials: string,
+    avatar_tone: int,
+    company: string,
+    detail: string,
+    last_contacted: string,
+    favorite: bool,
+    suggested: bool,
+    selected: bool,
+}
+
+// Account-aware contact navigation is projected separately from ContactRow so
+// list rows stay small and the sidebar can update counts independently.
+export struct ContactAccountRow {
+    id: int,
+    name: string,
+    email: string,
+    initials: string,
+    avatar: image,
+    has_avatar: bool,
+    count: string,
+    selected: bool,
+}
+
+export enum ContactSidebarRowKind { unified-heading, unified-section, all, favorites, suggestions, accounts-heading, account, contacts, hint }
+export struct ContactSidebarRow {
+    key: string,
+    kind: ContactSidebarRowKind,
+    account: ContactAccountRow,
+    open: bool,
+}
+
+// Email document controls are shared directly with the native renderer.
+// A row of the reader view. A "section" row is the summary of a collapsible
+// section of the message: `section` counts the message's sections in document
+// order, and `open` tells whether it shows its content.
+export struct ReaderItem { name: string, url: string, kind: string, y: float, section: int, open: bool }
+export struct ReaderImage { x: float, y: float, width: float, height: float, alt: string, state: string }
+export struct ReaderCaret { x: float, y: float, height: float, valid: bool }
+export global EmailReader {
+    in-out property <bool> available: false;
+    in-out property <bool> body-pending: false;
+    in-out property <ReaderCaret> selection-start;
+    in-out property <ReaderCaret> selection-end;
+    in-out property <[ReaderImage]> images;
+    in-out property <int> revision: -1;
+    in-out property <int> message-id: -1;
+    callback ensure-body(int);
+    callback retry-images();
+    in-out property <int> failed-images;
+    pure callback link-at(float, float) -> string;
+    // A name and address as one mailbox, quoted as a header would quote it.
+    pure callback mailbox-text(string, string) -> string;
+    callback command(string);
+    callback find(string, int);
+    // Opens or closes the section that a "section" row of `items` stands for.
+    callback toggle-section(int);
+    in-out property <bool> auto-fit: true;
+    in-out property <float> zoom: 1;
+    in-out property <int> zoom-revision: 0;
+    in-out property <float> width-ratio: 1;
+    in-out property <string> destination;
+    in-out property <string> context-link;
+    in-out property <string> query;
+    in-out property <string> find-status;
+    in-out property <string> notice;
+    in-out property <bool> find-open: false;
+    in-out property <bool> reader-mode: false;
+    in-out property <bool> caret-mode: false;
+    in-out property <[ReaderItem]> items;
+    in-out property <string> authored-text;
+    in-out property <bool> use-authored-text: false;
+}
+
+export struct MailAttachment {
+    id: string,
+    name: string,
+    detail: string,
+    previewable: bool,
+    // pdf, document, spreadsheet, presentation, image, video, audio,
+    // archive, code, calendar, message or file.
+    kind: string,
+    thumbnail: image,
+    has_thumbnail: bool,
+}
+export global MailAttachments {
+    callback deliver();
+    in-out property <[MailAttachment]> rows;
+    in-out property <bool> open: false;
+    in-out property <bool> busy: false;
+    in-out property <string> name;
+    in-out property <string> status;
+    in-out property <image> image;
+    in-out property <string> text;
+    in-out property <bool> is-image: false;
+    in-out property <int> page: 0;
+    in-out property <int> pages: 0;
+    in-out property <int> revision: 0;
+    callback command(string, string);
+}

@@ -1,0 +1,201 @@
+# Third-party notices
+
+Flectar Mail contains third-party open-source software. The source and binary
+forms remain subject to the licenses and copyright notices of their respective
+authors.
+
+## Slint
+
+Slint 1.19 is copyright © SixtyFPS GmbH and Slint contributors. Flectar Mail
+uses Slint under the `GPL-3.0-only` option offered by the Slint crates. The
+license text is in [`LICENSES/GPL-3.0-only.txt`](LICENSES/GPL-3.0-only.txt), and
+the upstream source is <https://github.com/slint-ui/slint>. The locally patched
+`i-slint-backend-winit` 1.19.0 crate retains its upstream license texts in
+[`crates/i-slint-backend-winit/LICENSES`](crates/i-slint-backend-winit/LICENSES).
+Its Wayland file drop patch, source checksum, and removal condition are
+documented in [`patches/slint-winit/README.md`](patches/slint-winit/README.md).
+The locally patched `i-slint-backend-android-activity` 1.19.0 crate likewise
+retains its upstream license texts in
+[`crates/i-slint-backend-android-activity/LICENSES`](crates/i-slint-backend-android-activity/LICENSES),
+and its pointer scroll backport is documented in
+[`patches/slint-android-activity/README.md`](patches/slint-android-activity/README.md).
+The locally patched `i-slint-renderer-software` 1.19.0 crate retains its
+upstream license texts in
+[`crates/i-slint-renderer-software/LICENSES`](crates/i-slint-renderer-software/LICENSES),
+and its clip fix is documented in
+[`patches/slint-renderer-software/README.md`](patches/slint-renderer-software/README.md).
+
+## Vello
+
+Flectar Mail's GPU renderer paints mail with Vello, copyright © the Vello
+Authors and used under its `MIT` option. The locally patched `vello` 0.11.0
+crate retains its license texts in
+[`crates/vello/LICENSE-MIT`](crates/vello/LICENSE-MIT) and
+[`crates/vello/LICENSE-APACHE`](crates/vello/LICENSE-APACHE). The upstream
+source is <https://github.com/linebender/vello>. Its bitmap strike fix, source
+checksum, and removal condition are documented in
+[`patches/vello/README.md`](patches/vello/README.md).
+
+## smithay-clipboard
+
+Slint's winit backend uses the locally patched `smithay-clipboard` 0.7.2 crate
+for the Wayland clipboard and, through its patch, for files dropped on a
+window. It is copyright © Smithay contributors and used under the MIT license,
+whose text it retains in
+[`crates/smithay-clipboard/LICENSE`](crates/smithay-clipboard/LICENSE). The
+upstream source is <https://github.com/smithay/smithay-clipboard>. The source
+checksum, the patch, and its removal condition are documented in
+[`patches/smithay-clipboard/README.md`](patches/smithay-clipboard/README.md).
+
+## jmap-client
+
+Flectar Mail talks to JMAP servers with the locally patched `jmap-client` 0.4.2
+crate, copyright © Stalwart Labs LLC and used under its `MIT` option. It
+retains its license texts in
+[`crates/jmap-client/LICENSE-MIT`](crates/jmap-client/LICENSE-MIT) and
+[`crates/jmap-client/LICENSE-APACHE`](crates/jmap-client/LICENSE-APACHE). The
+upstream source is <https://github.com/stalwartlabs/jmap-client>. Its proxy
+and TLS patches, source checksum, and removal condition are documented in
+[`patches/jmap-client/README.md`](patches/jmap-client/README.md).
+
+## Blitz
+
+The locally patched `blitz-dom` and `blitz-paint` crates originate from the
+DioxusLabs Blitz project and are used under their `Apache-2.0` option. The
+license text is in [`LICENSES/Apache-2.0.txt`](LICENSES/Apache-2.0.txt), and the
+upstream source is <https://github.com/DioxusLabs/blitz>. The pinned release,
+checksums, and patch order are recorded in
+[`upstream.toml`](patches/blitz/upstream.toml) and
+[`series`](patches/blitz/series).
+
+## Parley emoji presentation
+
+Slint and Blitz use Parley 0.12.0 under the Apache-2.0 option. Its
+`parley_emoji` sequence detector, from
+[Parley PR #811](https://github.com/linebender/parley/pull/811), is based on
+[Christian Hansen's c-emoji](https://github.com/chansen/c-emoji) and licensed
+under MIT. Its copyright and license are included in
+[`LICENSES/Parley-Emoji-MIT.txt`](LICENSES/Parley-Emoji-MIT.txt).
+Published packages and checksums are pinned in `Cargo.lock`.
+
+## fontique
+
+Slint, Parley and Flectar Mail share the locally patched `fontique` 0.12.0
+crate, which finds and matches fonts. It is copyright © the Parley Authors and,
+like Parley, used under the Apache-2.0 option, whose text it retains in
+[`crates/fontique/LICENSE-APACHE`](crates/fontique/LICENSE-APACHE). The upstream
+source is <https://github.com/linebender/parley>. The source checksum, the
+patch, and its removal condition are documented in
+[`patches/fontique/README.md`](patches/fontique/README.md).
+
+## Candle
+
+The optional CPU embedding runtime uses the published Candle crates under
+Apache-2.0. Published packages and checksums are pinned in `Cargo.lock`.
+
+## Reader integration dependencies
+
+The reader integration uses these Rust packages under their Apache-2.0
+license option. Their source distributions retain the authors' copyright
+notices and license texts; the Apache-2.0 license is also included in
+[`LICENSES/Apache-2.0.txt`](LICENSES/Apache-2.0.txt).
+
+| Package | Locked version | Upstream source | Purpose |
+| --- | --- | --- | --- |
+| arboard | 3.6.1 | [1Password/arboard](https://github.com/1Password/arboard) | Desktop HTML and primary-selection clipboard |
+| html5ever | 0.40.1 | [servo/html5ever](https://github.com/servo/html5ever) | HTML preflight and export tokenization |
+| unicode-segmentation | 1.13.3 | [unicode-rs/unicode-segmentation](https://github.com/unicode-rs/unicode-segmentation) | Unicode word selection |
+| percent-encoding | 2.3.2 | [servo/rust-url](https://github.com/servo/rust-url/) | Fragment and mailto decoding |
+| base64 | 0.22.1 | [marshallpierce/rust-base64](https://github.com/marshallpierce/rust-base64) | Export CSP hash encoding |
+| jpeg-decoder | 0.3.2 | [image-rs/jpeg-decoder](https://github.com/image-rs/jpeg-decoder) | Bounded native JPEG downsampling for email images |
+
+## PDF preview
+
+Desktop, Android, and iOS packages include a non-V8 PDFium runtime from
+[bblanchon/pdfium-binaries](https://github.com/bblanchon/pdfium-binaries), built
+from [PDFium](https://pdfium.googlesource.com/pdfium/). The selected release and
+per-platform SHA-256 digests are pinned in `scripts/stage-pdfium.py`. Every
+package retains the archive's `LICENSE`, complete `licenses/` directory, and
+build provenance under `pdfium-licenses` beside the private desktop library,
+Android assets at `licenses/PDFium`, and iOS bundle resources at `Licenses/PDFium`.
+PDFium's third-party components retain their respective licenses.
+
+The Flatpak builds the same PDFium release from source instead, with the
+revisions pinned in
+[`packaging/flatpak/pdfium.yml`](packaging/flatpak/pdfium.yml), and links the
+Flatpak runtime's FreeType, HarfBuzz, ICU, Little CMS, libjpeg-turbo, libpng,
+OpenJPEG and zlib. It installs PDFium's `LICENSE` and the licenses of the
+`third_party` code it compiles in under `share/licenses/flectar-mail/pdfium`.
+
+The OpenHarmony package prefers a source build from the pinned
+`OpenHarmonyPCDeveloper/pdfium` revision in
+[`platform/ohos/scripts/build-pdfium-source.sh`](platform/ohos/scripts/build-pdfium-source.sh).
+The fallback arm64 `ohos_pdfium` 7947 port has its archive URL and SHA-256
+digest pinned in
+[`platform/ohos/scripts/fetch-pdfium.sh`](platform/ohos/scripts/fetch-pdfium.sh).
+The build stages and strips the library and packages this notice plus
+[`LICENSES/PDFium-BSD-3-Clause.txt`](LICENSES/PDFium-BSD-3-Clause.txt) under
+`resources/rawfile/` in the hap. The port is documented in
+[`platform/ohos/prebuilt/README.md`](platform/ohos/prebuilt/README.md).
+
+The source-built OpenHarmony PDFium component links the OHOS SDK's
+`libc++_shared.so` C++ runtime. LLVM libc++ is Apache-2.0 with the LLVM
+exception; the license and exception are retained in
+[`LICENSES/LLVM-exception.txt`](LICENSES/LLVM-exception.txt). The pinned OHOS
+source compatibility patch is
+[`platform/ohos/patches/pdfium-ohos-compat.patch`](platform/ohos/patches/pdfium-ohos-compat.patch).
+
+The Rust interface is [pdfium-render](https://github.com/ajrcarey/pdfium-render)
+0.9.4, used under its Apache-2.0 option. Linux process restrictions use
+[Landlock](https://github.com/landlock-lsm/rust-landlock) and
+[seccompiler](https://github.com/rust-vmm/seccompiler), under their Apache-2.0
+options. Rust package versions and source checksums are recorded in `Cargo.lock`.
+
+## Lucide Icons
+
+The original SVG inputs in `ui/icons/lucide/sources` are sourced from
+[Lucide](https://lucide.dev) Static 1.46.0. The displayed outlines in
+`ui/icons/lucide/outline` preserve that geometry with an adjusted stroke weight.
+The active and sidebar variants in `ui/icons/lucide/filled` are modifications
+created for Flectar Mail from the same 24px Lucide geometry. Lucide is licensed
+under the ISC License, with Feather-derived icons covered by the MIT License.
+Both notices are retained in `ui/icons/lucide/LICENSE`. Source mappings are
+recorded in `ui/icons/lucide/sources.json` and `ui/icons/lucide/solid_recipes.py`.
+
+## Google Sans Flex
+
+The bundled Google Sans Flex font is distributed under the SIL Open Font
+License 1.1. Its license, provenance, and checksum are retained in
+[`resources/fonts/google-sans-flex`](resources/fonts/google-sans-flex).
+
+Renderer regression tests also use two fonts derived from it under SIL OFL
+1.1, with bitmap strikes added. Their license and reproduction instructions
+are retained in [`resources/test-fonts`](resources/test-fonts).
+
+## Noto Emoji
+
+The bundled Noto Emoji font is distributed under the SIL Open Font License
+1.1. Its license, provenance, and checksum are retained in
+[`resources/fonts/noto-emoji`](resources/fonts/noto-emoji).
+
+Renderer regression tests also use a subset of Noto Color Emoji under SIL OFL
+1.1. Its license and reproduction instructions are retained in
+[`resources/test-fonts`](resources/test-fonts).
+
+## Android instrumentation tests
+
+Device tests use AndroidX Test Runner 1.7.0 and AndroidX Test JUnit 1.3.0
+from [android/android-test](https://github.com/android/android-test), under
+Apache-2.0. The license text is included in
+[`LICENSES/Apache-2.0.txt`](LICENSES/Apache-2.0.txt). These dependencies are
+included only in the test APK, not the application APK.
+
+## Screenshot examples
+
+The fictional screenshot fixture uses real public sender domains so the same
+favicon service used by the application can demonstrate sender recognition.
+Third-party names and marks belong to their respective owners. Their appearance
+does not imply affiliation, sponsorship, or endorsement.
+
+Additional Rust dependencies are identified in `Cargo.lock` and retain the
+license terms supplied by their upstream packages.

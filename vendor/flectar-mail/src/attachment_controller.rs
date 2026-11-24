@@ -1,0 +1,938 @@
+//! Mail attachment metadata and an independent dialog session. Files and Mail
+//! share bounded decoders/PDF workers; opening Mail never changes Files state.
+use crate::document_preview::{Preview, image_thumbnail, preview};
+use crate::{
+    AppWindow, EmailReader, InboxState, ListAttachment, MailAttachment, MailAttachments,
+    mail::MailMessage,
+};
+use slint::{ComponentHandle, Model, ModelRc, Rgba8Pixel, SharedPixelBuffer, VecModel};
+use std::{
+    borrow::Cow,
+    cell::RefCell,
+    collections::HashSet,
+    rc::Rc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+};
+
+thread_local! {
+    /// The file name of a message forwarded without a name or a subject to
+    /// name it by, in the UI language.
+    static UNNAMED_MESSAGE: RefCell<Rc<str>> = RefCell::new(Rc::from("Forwarded message.eml"));
+}
+
+/// The UI language changed: a forwarded message without a name of its own
+/// or a subject is a file called `words` (#455).
+pub(crate) fn set_unnamed_message(words: &str) {
+    UNNAMED_MESSAGE.with(|name| *name.borrow_mut() = Rc::from(format!("{words}.eml")));
+}
+
+#[cfg(mobile)]
+static SUSPEND: std::sync::OnceLock<Box<dyn Fn() + Send + Sync>> = std::sync::OnceLock::new();
+#[cfg(mobile)]
+pub(crate) fn suspend() {
+    if let Some(suspend) = SUSPEND.get() {
+        suspend();
+    }
+}
+
+pub(crate) fn clear(app: &AppWindow) {
+    let ui = app.global::<MailAttachments>();
+    ui.invoke_command("close".into(), "".into());
+    ui.set_rows(ModelRc::default());
+}
+pub(crate) fn project(app: &AppWindow, email: &MailMessage, same: bool) {
+    let previous = same.then(|| {
+        let rows = app.global::<MailAttachments>().get_rows();
+        (0..rows.row_count())
+            .filter_map(|index| rows.row_data(index))
+            .filter(|row| row.has_thumbnail)
+            .map(|row| (row.id, row.thumbnail))
+            .collect::<std::collections::HashMap<_, _>>()
+    });
+    if !same {
+        clear(app);
+    }
+    let mut rows = attachment_rows(&email.attachments);
+    if let Some(previous) = previous {
+        for row in &mut rows {
+            if let Some(thumbnail) = previous.get(row.id.as_str()) {
+                row.thumbnail = thumbnail.clone();
+                row.has_thumbnail = true;
+            }
+        }
+    }
+    let thumbnail_ids = thumbnail_ids(&email.attachments, &rows);
+    app.global::<MailAttachments>()
+        .set_rows(ModelRc::new(VecModel::from(rows)));
+    for id in thumbnail_ids {
+        app.global::<MailAttachments>()
+            .invoke_command("thumbnail".into(), id);
+    }
+}
+
+fn visible_attachment(attachment: &flectar_mail_core::models::AttachmentMeta) -> bool {
+    !attachment.is_inline
+        || attachment
+            .filename
+            .as_ref()
+            .is_some_and(|name| !name.trim().is_empty())
+        // A message forwarded inside this one is a file as well as what the
+        // body shows, as mail apps list it (#455).
+        || is_message(attachment)
+}
+
+fn is_message(attachment: &flectar_mail_core::models::AttachmentMeta) -> bool {
+    attachment
+        .mime_type
+        .as_deref()
+        .is_some_and(flectar_mail_core::mime::is_message_type)
+}
+
+// attachment_rows preserves this filtered metadata order. Walk the two in
+// lockstep instead of formatting an ID for every row in a nested search.
+fn thumbnail_ids(
+    attachments: &[flectar_mail_core::models::AttachmentMeta],
+    rows: &[MailAttachment],
+) -> Vec<slint::SharedString> {
+    attachments
+        .iter()
+        .filter(|attachment| visible_attachment(attachment))
+        .zip(rows)
+        .filter(|(attachment, row)| thumbnail_candidate(attachment) && !row.has_thumbnail)
+        .take(4)
+        .map(|(_, row)| row.id.clone())
+        .collect()
+}
+
+fn thumbnail_candidate(attachment: &flectar_mail_core::models::AttachmentMeta) -> bool {
+    let media = attachment
+        .mime_type
+        .as_deref()
+        .unwrap_or("")
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim();
+    attachment.size.is_none_or(|size| size <= 4 * 1024 * 1024)
+        && media
+            .get(..6)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("image/"))
+        && !media.eq_ignore_ascii_case("image/svg+xml")
+}
+
+async fn read_preview_bytes(file: tokio::fs::File, max_bytes: usize) -> Result<Vec<u8>, String> {
+    use tokio::io::AsyncReadExt;
+    let mut reader = file.take(max_bytes as u64);
+    let mut bytes = Vec::new();
+    let mut chunk = [0_u8; 8 * 1024];
+    loop {
+        let count = reader
+            .read(&mut chunk)
+            .await
+            .map_err(|error| error.to_string())?;
+        if count == 0 {
+            return Ok(bytes);
+        }
+        let required = bytes.len() + count;
+        if required > bytes.capacity() {
+            let target = required
+                .max(bytes.capacity().saturating_mul(2))
+                .min(max_bytes);
+            bytes.reserve_exact(target - bytes.len());
+        }
+        bytes.extend_from_slice(&chunk[..count]);
+    }
+}
+fn attachment_rows(
+    attachments: &[flectar_mail_core::models::AttachmentMeta],
+) -> Vec<MailAttachment> {
+    attachments
+        .iter()
+        .filter(|a| visible_attachment(a))
+        .map(|a| {
+            let name = file_name(a);
+            let media = media_type(a);
+            MailAttachment {
+                id: a.id.to_string().into(),
+                name: name.as_ref().into(),
+                previewable: previewable(&name, &media),
+                kind: file_kind(&name, &media).into(),
+                detail: media.into(),
+                thumbnail: Default::default(),
+                has_thumbnail: false,
+            }
+        })
+        .collect::<Vec<_>>()
+}
+
+/// A message-list row's file chip.
+pub(crate) fn list_attachment(
+    attachment: &flectar_mail_core::models::AttachmentMeta,
+) -> ListAttachment {
+    let name = file_name(attachment);
+    let media = media_type(attachment);
+    let (stem, extension) = split_extension(&name);
+    ListAttachment {
+        id: attachment.id.to_string().into(),
+        stem: stem.into(),
+        extension: extension.into(),
+        kind: file_kind(&name, &media).into(),
+        previewable: previewable(&name, &media),
+    }
+}
+
+fn file_name(attachment: &flectar_mail_core::models::AttachmentMeta) -> Cow<'_, str> {
+    match attachment.filename.as_deref().filter(|s| !s.is_empty()) {
+        Some(name) => Cow::Borrowed(name),
+        None if is_message(attachment) => {
+            Cow::Owned(UNNAMED_MESSAGE.with(|name| name.borrow().to_string()))
+        }
+        None => Cow::Borrowed("attachment"),
+    }
+}
+
+fn media_type(attachment: &flectar_mail_core::models::AttachmentMeta) -> String {
+    attachment
+        .mime_type
+        .as_deref()
+        .unwrap_or("")
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase()
+}
+
+fn previewable(name: &str, media: &str) -> bool {
+    media == "application/pdf"
+        || media.starts_with("image/")
+        || media.starts_with("text/")
+        || matches!(media, "application/json" | "application/xml")
+        || name
+            .as_bytes()
+            .get(name.len().saturating_sub(4)..)
+            .is_some_and(|suffix| suffix.eq_ignore_ascii_case(b".pdf"))
+}
+
+/// A name and its extension, such as "Report" and ".pdf". Only a short
+/// final suffix counts, so "version 1.2 final" has none.
+fn split_extension(name: &str) -> (&str, &str) {
+    match name.rfind('.') {
+        Some(dot)
+            if dot > 0
+                && (2..=6).contains(&(name.len() - dot))
+                && name[dot + 1..].chars().all(|c| c.is_ascii_alphanumeric()) =>
+        {
+            name.split_at(dot)
+        }
+        _ => (name, ""),
+    }
+}
+
+/// What a file is, by its type and otherwise its name: pdf, document,
+/// spreadsheet, presentation, image, video, audio, archive, code, calendar,
+/// message or file. It picks the file's icon.
+fn file_kind(name: &str, media: &str) -> &'static str {
+    let extension = split_extension(name)
+        .1
+        .trim_start_matches('.')
+        .to_ascii_lowercase();
+    let is = |types: &[&str], extensions: &[&str], families: &[&str]| {
+        types.contains(&media)
+            || families.iter().any(|family| media.starts_with(family))
+            || extensions.contains(&extension.as_str())
+    };
+    if is(&["application/pdf"], &["pdf"], &[]) {
+        "pdf"
+    } else if is(&["message/rfc822", "message/global"], &["eml"], &[]) {
+        "message"
+    } else if is(
+        &[],
+        &[
+            "png", "jpg", "jpeg", "gif", "webp", "heic", "heif", "bmp", "tif", "tiff", "svg",
+            "avif",
+        ],
+        &["image/"],
+    ) {
+        "image"
+    } else if is(
+        &[],
+        &[
+            "mp4", "mov", "m4v", "avi", "mkv", "webm", "wmv", "mpg", "mpeg", "3gp",
+        ],
+        &["video/"],
+    ) {
+        "video"
+    } else if is(
+        &[],
+        &[
+            "mp3", "wav", "m4a", "aac", "flac", "ogg", "oga", "opus", "wma", "aif", "aiff", "amr",
+        ],
+        &["audio/"],
+    ) {
+        "audio"
+    } else if is(
+        &["text/calendar", "application/ics"],
+        &["ics", "ical", "vcs"],
+        &[],
+    ) {
+        "calendar"
+    } else if is(
+        &[
+            "text/csv",
+            "text/tab-separated-values",
+            "application/vnd.ms-excel",
+            "application/vnd.oasis.opendocument.spreadsheet",
+            "application/vnd.apple.numbers",
+        ],
+        &[
+            "xls", "xlsx", "xlsm", "xlsb", "ods", "csv", "tsv", "numbers",
+        ],
+        &["application/vnd.openxmlformats-officedocument.spreadsheetml"],
+    ) {
+        "spreadsheet"
+    } else if is(
+        &[
+            "application/vnd.ms-powerpoint",
+            "application/vnd.oasis.opendocument.presentation",
+            "application/vnd.apple.keynote",
+        ],
+        &["ppt", "pptx", "pps", "ppsx", "odp", "key"],
+        &["application/vnd.openxmlformats-officedocument.presentationml"],
+    ) {
+        "presentation"
+    } else if is(
+        &[
+            "application/msword",
+            "application/rtf",
+            "text/rtf",
+            "text/plain",
+            "text/markdown",
+            "application/vnd.oasis.opendocument.text",
+            "application/vnd.apple.pages",
+            "application/epub+zip",
+        ],
+        &["doc", "docx", "odt", "rtf", "txt", "md", "pages", "epub"],
+        &["application/vnd.openxmlformats-officedocument.wordprocessingml"],
+    ) {
+        "document"
+    } else if is(
+        &[
+            "application/zip",
+            "application/x-zip-compressed",
+            "application/vnd.rar",
+            "application/x-rar-compressed",
+            "application/x-7z-compressed",
+            "application/x-tar",
+            "application/gzip",
+            "application/x-gzip",
+            "application/x-bzip2",
+            "application/x-xz",
+            "application/zstd",
+        ],
+        &["zip", "rar", "7z", "tar", "gz", "tgz", "bz2", "xz", "zst"],
+        &[],
+    ) {
+        "archive"
+    } else if is(
+        &[
+            "application/json",
+            "application/xml",
+            "text/xml",
+            "text/html",
+            "text/css",
+            "text/javascript",
+            "application/javascript",
+            "application/x-sh",
+        ],
+        &[
+            "json", "xml", "html", "htm", "css", "js", "ts", "py", "rs", "go", "java", "c", "cpp",
+            "h", "sh", "yml", "yaml", "toml", "sql",
+        ],
+        &[],
+    ) {
+        "code"
+    } else {
+        "file"
+    }
+}
+
+struct Session {
+    task: Option<tokio::task::AbortHandle>,
+    document: Option<Arc<Vec<u8>>>,
+    selected: Option<flectar_mail_core::models::AttachmentMeta>,
+}
+impl Session {
+    fn stop(&mut self) {
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
+        self.document = None;
+        self.selected = None;
+    }
+}
+impl Drop for Session {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+fn close(ui: &MailAttachments<'_>, generation: &AtomicU64, session: &RefCell<Session>) {
+    generation.fetch_add(1, Ordering::SeqCst);
+    session.borrow_mut().stop();
+    ui.set_open(false);
+    ui.set_busy(false);
+    ui.set_image(Default::default());
+    ui.set_text("".into());
+    ui.set_status("".into());
+    ui.set_pages(0);
+    ui.set_is_image(false);
+}
+
+pub(crate) fn register(
+    app: &AppWindow,
+    inbox: &Rc<RefCell<InboxState>>,
+    runtime: &tokio::runtime::Handle,
+    documents: Arc<dyn crate::documents::DocumentProvider>,
+) {
+    let session = Rc::new(RefCell::new(Session {
+        task: None,
+        document: None,
+        selected: None,
+    }));
+    let generation = Arc::new(AtomicU64::new(0));
+    let weak = app.as_weak();
+    #[cfg(mobile)]
+    {
+        let weak = weak.clone();
+        let _ = SUSPEND.set(Box::new(move || {
+            let _ = weak.upgrade_in_event_loop(|app| {
+                app.global::<MailAttachments>()
+                    .invoke_command("close".into(), "".into())
+            });
+        }));
+    }
+    // Profile IDs are not globally unique: compare Core identity as well as
+    // message identity before allowing an old session to remain actionable.
+    let context = Rc::new(RefCell::new(None::<(Arc<flectar_mail_core::Core>, i32)>));
+    let timer = slint::Timer::default();
+    let state = inbox.clone();
+    let observed = context.clone();
+    let window = weak.clone();
+    timer.start(
+        slint::TimerMode::Repeated,
+        std::time::Duration::from_millis(100),
+        move || {
+            let Some(app) = window.upgrade() else {
+                return;
+            };
+            let current = state.borrow().core.as_ref().map(|core| {
+                (
+                    core.file_core(),
+                    app.global::<EmailReader>().get_message_id(),
+                )
+            });
+            let changed = match (&*observed.borrow(), &current) {
+                (Some((a, id)), Some((b, next))) => !Arc::ptr_eq(a, b) || id != next,
+                (None, None) => false,
+                _ => true,
+            };
+            if changed {
+                app.global::<MailAttachments>()
+                    .invoke_command("close".into(), "".into());
+                *observed.borrow_mut() = current;
+            }
+        },
+    );
+    let (sender, mut receiver) = tokio::sync::mpsc::channel::<(
+        u64,
+        i32,
+        Arc<flectar_mail_core::Core>,
+        Result<Option<Preview>, String>,
+    )>(2);
+    let (thumbnail_sender, mut thumbnail_receiver) = tokio::sync::mpsc::channel::<(
+        i32,
+        i64,
+        Arc<flectar_mail_core::Core>,
+        Result<(Vec<u8>, u32, u32), String>,
+    )>(8);
+    let (thumbnail_job_sender, mut thumbnail_job_receiver) = tokio::sync::mpsc::channel::<(
+        i32,
+        flectar_mail_core::models::AttachmentMeta,
+        Arc<flectar_mail_core::Core>,
+    )>(8);
+    let thumbnail_window = weak.clone();
+    runtime.spawn(async move {
+        while let Some((message, attachment, core)) = thumbnail_job_receiver.recv().await {
+            let attachment_id = attachment.id;
+            let result = async {
+                let path = core
+                    .get_attachment(attachment_id)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                let file = tokio::fs::File::open(path)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                let bytes = read_preview_bytes(file, 4 * 1024 * 1024 + 1).await?;
+                image_thumbnail(bytes).await
+            }
+            .await;
+            if thumbnail_sender
+                .send((message, attachment_id, core, result))
+                .await
+                .is_err()
+            {
+                break;
+            }
+            let _ = thumbnail_window
+                .upgrade_in_event_loop(|app| app.global::<MailAttachments>().invoke_deliver());
+        }
+    });
+    let thumbnail_pending = Rc::new(RefCell::new(HashSet::<(usize, i32, i64)>::new()));
+    let state = inbox.clone();
+    let session_for_delivery = session.clone();
+    let current = generation.clone();
+    let pending_for_delivery = thumbnail_pending.clone();
+    let window = weak.clone();
+    app.global::<MailAttachments>().on_deliver(move || {
+        let Some(app) = window.upgrade() else {
+            return;
+        };
+        let session = &session_for_delivery;
+        while let Ok((revision, message, core, result)) = receiver.try_recv() {
+            if current.load(Ordering::SeqCst) != revision
+                || app.global::<EmailReader>().get_message_id() != message
+            {
+                continue;
+            }
+
+            if !state
+                .borrow()
+                .core
+                .as_ref()
+                .is_some_and(|c| Arc::ptr_eq(&core, &c.file_core()))
+            {
+                continue;
+            }
+
+            let ui = app.global::<MailAttachments>();
+            ui.set_busy(false);
+            match result {
+                Ok(Some(Preview::Pdf(data, page))) => {
+                    session.borrow_mut().document = Some(data);
+                    ui.set_page(page.index as i32);
+                    ui.set_pages(page.count as i32);
+                    ui.set_image(slint::Image::from_rgba8(
+                        SharedPixelBuffer::<Rgba8Pixel>::clone_from_slice(
+                            &page.pixels,
+                            page.width,
+                            page.height,
+                        ),
+                    ));
+                    ui.set_is_image(true);
+                }
+                Ok(Some(Preview::Image(data, w, h))) => {
+                    ui.set_image(slint::Image::from_rgba8(
+                        SharedPixelBuffer::<Rgba8Pixel>::clone_from_slice(&data, w, h),
+                    ));
+                    ui.set_is_image(true);
+                }
+                Ok(Some(Preview::Text(text))) => ui.set_text(text.into()),
+                Ok(None) => close(&ui, &current, session),
+                Err(error) => ui.set_status(error.into()),
+            }
+        }
+        while let Ok((message, attachment_id, core, result)) = thumbnail_receiver.try_recv() {
+            let core_id = Arc::as_ptr(&core) as usize;
+            pending_for_delivery
+                .borrow_mut()
+                .remove(&(core_id, message, attachment_id));
+            if app.global::<EmailReader>().get_message_id() != message
+                || !state
+                    .borrow()
+                    .core
+                    .as_ref()
+                    .is_some_and(|candidate| Arc::ptr_eq(&core, &candidate.file_core()))
+            {
+                continue;
+            }
+            let Ok((pixels, width, height)) = result else {
+                continue;
+            };
+            let rows = app.global::<MailAttachments>().get_rows();
+            let attachment_id = attachment_id.to_string();
+            for index in 0..rows.row_count() {
+                let Some(mut row) = rows.row_data(index) else {
+                    continue;
+                };
+                if row.id.as_str() != attachment_id {
+                    continue;
+                }
+                row.thumbnail = slint::Image::from_rgba8(
+                    SharedPixelBuffer::<Rgba8Pixel>::clone_from_slice(&pixels, width, height),
+                );
+                row.has_thumbnail = true;
+                rows.set_row_data(index, row);
+                break;
+            }
+        }
+    });
+    let state = inbox.clone();
+    let handle = runtime.clone();
+    let pending_thumbnails = thumbnail_pending.clone();
+    app.global::<MailAttachments>()
+        .on_command(move |action, value| {
+            let _keep_timer = &timer;
+            let Some(app) = weak.upgrade() else {
+                return;
+            };
+            let ui = app.global::<MailAttachments>();
+            if action == "close" {
+                close(&ui, &generation, &session);
+                return;
+            }
+            let Some(core) = state.borrow().core.as_ref().map(|core| core.file_core()) else {
+                return;
+            };
+            let message = app.global::<EmailReader>().get_message_id();
+            // A profile switch may happen before the lifecycle timer's next
+            // tick. Never use a retained attachment ID with a different Core.
+            if (action == "page" || action == "download-current")
+                && !context
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(|(owner, id)| Arc::ptr_eq(owner, &core) && *id == message)
+            {
+                close(&ui, &generation, &session);
+                return;
+            }
+            // A message-list chip offers the first file of a conversation
+            // that may not be open, so its file comes from the list rows.
+            let listed = matches!(action.as_str(), "preview-listed" | "download-listed");
+            let selected = if action == "page" || action == "download-current" {
+                session.borrow().selected.clone()
+            } else {
+                value.parse::<i64>().ok().and_then(|id| {
+                    let state = state.borrow();
+                    if listed {
+                        state
+                            .messages
+                            .iter()
+                            .filter_map(|m| m.first_attachment.as_ref())
+                            .find(|a| a.id == id)
+                            .cloned()
+                    } else {
+                        state
+                            .conversation_messages
+                            .iter()
+                            .chain(state.messages.iter())
+                            .find(|m| m.id == message)
+                            .and_then(|m| m.attachments.iter().find(|a| a.id == id))
+                            .cloned()
+                    }
+                })
+            };
+            let Some(selected) = selected else {
+                return;
+            };
+            let action = match action.as_str() {
+                "preview-listed" => "preview".into(),
+                "download-listed" => "download".into(),
+                _ => action,
+            };
+            if action == "thumbnail" {
+                let core_id = Arc::as_ptr(&core) as usize;
+                if !thumbnail_candidate(&selected)
+                    || !pending_thumbnails
+                        .borrow_mut()
+                        .insert((core_id, message, selected.id))
+                {
+                    return;
+                }
+                if thumbnail_job_sender
+                    .try_send((message, selected.clone(), core))
+                    .is_err()
+                {
+                    pending_thumbnails
+                        .borrow_mut()
+                        .remove(&(core_id, message, selected.id));
+                }
+                return;
+            }
+            if ui.get_busy() {
+                return;
+            }
+            let page = value.parse::<u32>().unwrap_or(0);
+            if action == "page" && page >= ui.get_pages().max(0) as u32 {
+                return;
+            }
+            if !matches!(
+                action.as_str(),
+                "preview" | "download" | "download-current" | "page"
+            ) {
+                return;
+            }
+            let revision = generation.fetch_add(1, Ordering::SeqCst) + 1;
+            let data = session.borrow().document.clone();
+            session.borrow_mut().selected = Some(selected.clone());
+            *context.borrow_mut() = Some((core.clone(), message));
+            if action != "page" {
+                ui.set_name(
+                    selected
+                        .filename
+                        .clone()
+                        .unwrap_or_else(|| "attachment".into())
+                        .into(),
+                );
+                ui.set_pages(0);
+                ui.set_image(Default::default());
+                ui.set_text("".into());
+                ui.set_is_image(false);
+                ui.set_revision(ui.get_revision().wrapping_add(1));
+                session.borrow_mut().document = None;
+            }
+            ui.set_open(true);
+            ui.set_busy(true);
+            ui.set_status("".into());
+            let weak = weak.clone();
+            let sender = sender.clone();
+            let documents = documents.clone();
+            let task = handle.spawn(async move {
+                let result: Result<Option<Preview>, String> = async {
+                    if action == "page" {
+                        let data = data.ok_or("PDF preview has been closed")?;
+                        return crate::pdf_preview::render(data.clone(), page, 200)
+                            .await
+                            .map(|page| Some(Preview::Pdf(data, page)));
+                    }
+                    let download = action == "download" || action == "download-current";
+                    if !download && selected.size.is_some_and(|size| size > 16 * 1024 * 1024) {
+                        return Err(
+                            "This attachment is too large to preview. Download it to view locally."
+                                .into(),
+                        );
+                    }
+                    let path = core
+                        .get_attachment(selected.id)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    if download {
+                        let dialog = crate::documents::download_dialog_for(&core).await;
+                        documents
+                            .export_with(
+                                path.into(),
+                                crate::documents::safe_name(
+                                    selected.filename.as_deref().unwrap_or("attachment"),
+                                ),
+                                dialog,
+                            )
+                            .await?;
+                        return Ok(None);
+                    }
+                    let file = tokio::fs::File::open(path)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    let bytes = read_preview_bytes(file, 16 * 1024 * 1024 + 1).await?;
+                    if bytes.len() > 16 * 1024 * 1024 {
+                        return Err(
+                            "This attachment is too large to preview. Download it to view locally."
+                                .into(),
+                        );
+                    }
+                    preview(
+                        bytes,
+                        selected
+                            .mime_type
+                            .as_deref()
+                            .unwrap_or("application/octet-stream"),
+                    )
+                    .await
+                    .map(Some)
+                }
+                .await;
+                if sender.send((revision, message, core, result)).await.is_ok() {
+                    let _ = weak.upgrade_in_event_loop(|app| {
+                        app.global::<MailAttachments>().invoke_deliver()
+                    });
+                }
+            });
+            session.borrow_mut().task = Some(task.abort_handle());
+        });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[tokio::test]
+    async fn preview_reads_bound_capacity_and_keep_the_over_limit_sentinel() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("attachment.bin");
+        let source = (0..200_000)
+            .map(|index| (index % 251) as u8)
+            .collect::<Vec<_>>();
+        tokio::fs::write(&path, &source).await.unwrap();
+        for limit in [0, 1, 8191, 8192, 8193, 65_537, 200_001] {
+            let bytes = read_preview_bytes(tokio::fs::File::open(&path).await.unwrap(), limit)
+                .await
+                .unwrap();
+            assert_eq!(bytes, source[..source.len().min(limit)]);
+            assert!(bytes.capacity() <= limit);
+        }
+    }
+    #[test]
+    fn thumbnail_plan_keeps_visible_order_and_four_item_limit() {
+        use flectar_mail_core::models::AttachmentMeta;
+        let files = (0..10)
+            .map(|id| AttachmentMeta {
+                id,
+                filename: (id != 0).then(|| "photo.png".into()),
+                mime_type: Some("image/png".into()),
+                size: Some(42),
+                is_inline: id == 0,
+            })
+            .collect::<Vec<_>>();
+        let mut rows = attachment_rows(&files);
+        rows[0].has_thumbnail = true;
+        let ids = thumbnail_ids(&files, &rows);
+        assert_eq!(
+            ids.iter().map(|id| id.as_str()).collect::<Vec<_>>(),
+            ["2", "3", "4", "5"]
+        );
+        assert_eq!(ids[0].as_ptr(), rows[1].id.as_ptr());
+    }
+
+    #[test]
+    fn file_kinds_follow_the_type_then_the_name() {
+        for (name, media, kind) in [
+            ("Joel-Solano-CV.pdf", "application/octet-stream", "pdf"),
+            ("scan", "application/pdf", "pdf"),
+            ("photo.HEIC", "", "image"),
+            (
+                "budget.xlsx",
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                "spreadsheet",
+            ),
+            ("totals.csv", "text/csv", "spreadsheet"),
+            ("deck.key", "", "presentation"),
+            ("letter.docx", "", "document"),
+            ("notes.txt", "text/plain", "document"),
+            ("book.epub", "application/epub+zip", "document"),
+            ("site.zip", "application/zip", "archive"),
+            ("invite.ics", "text/calendar", "calendar"),
+            ("Original message.eml", "message/rfc822", "message"),
+            ("thread.EML", "application/octet-stream", "message"),
+            ("Forwarded message.eml", "message/global", "message"),
+            ("clip.mov", "video/quicktime", "video"),
+            ("memo.m4a", "", "audio"),
+            ("config.json", "application/json", "code"),
+            ("data.bin", "application/octet-stream", "file"),
+        ] {
+            assert_eq!(file_kind(name, media), kind, "{name} ({media})");
+        }
+    }
+
+    #[test]
+    fn list_chips_keep_the_extension_of_a_cut_name() {
+        assert_eq!(
+            split_extension("Joel-Solano-CV.pdf"),
+            ("Joel-Solano-CV", ".pdf")
+        );
+        assert_eq!(split_extension("archive.tar.gz"), ("archive.tar", ".gz"));
+        assert_eq!(split_extension("photo.jpeg"), ("photo", ".jpeg"));
+        assert_eq!(split_extension(".bashrc"), (".bashrc", ""));
+        assert_eq!(split_extension("README"), ("README", ""));
+        assert_eq!(
+            split_extension("version 1.2 final"),
+            ("version 1.2 final", "")
+        );
+        let chip = list_attachment(&flectar_mail_core::models::AttachmentMeta {
+            id: 7,
+            filename: Some("portfolio.zip".into()),
+            mime_type: Some("application/zip".into()),
+            size: Some(9000),
+            is_inline: false,
+        });
+        assert_eq!(chip.id, "7");
+        assert_eq!(chip.stem, "portfolio");
+        assert_eq!(chip.extension, ".zip");
+        assert_eq!(chip.kind, "archive");
+        assert!(!chip.previewable);
+    }
+
+    #[test]
+    fn attachment_rows_preserve_large_ids_and_offer_safe_previews() {
+        use flectar_mail_core::models::AttachmentMeta;
+        let files = vec![
+            AttachmentMeta {
+                id: i64::MAX,
+                filename: Some("Report.PDF".into()),
+                mime_type: None,
+                size: Some(1024),
+                is_inline: false,
+            },
+            AttachmentMeta {
+                id: 2,
+                filename: Some("photo.png".into()),
+                mime_type: Some("image/png".into()),
+                size: Some(42),
+                is_inline: false,
+            },
+            AttachmentMeta {
+                id: 3,
+                filename: None,
+                mime_type: Some("image/png".into()),
+                size: Some(42),
+                is_inline: true,
+            },
+            AttachmentMeta {
+                id: 4,
+                filename: Some("archive.zip".into()),
+                mime_type: Some("application/zip".into()),
+                size: Some(42),
+                is_inline: false,
+            },
+        ];
+        let rows = attachment_rows(&files);
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].id.as_str(), i64::MAX.to_string());
+        assert!(rows[0].previewable && rows[1].previewable);
+        assert!(!rows[2].previewable);
+        assert_eq!(rows[0].kind, "pdf");
+        assert_eq!(rows[1].kind, "image");
+        assert_eq!(rows[2].kind, "archive");
+        assert!(!thumbnail_candidate(&files[0]));
+        assert!(thumbnail_candidate(&files[1]));
+        assert!(!rows[1].has_thumbnail);
+    }
+
+    /// A message forwarded inside another shows in the body and is a file
+    /// too, named by its subject or else as the UI language says (#455).
+    #[test]
+    fn issue_455_a_forwarded_message_is_listed_as_a_file() {
+        use flectar_mail_core::models::AttachmentMeta;
+        let message = |id, filename: Option<&str>| AttachmentMeta {
+            id,
+            filename: filename.map(str::to_owned),
+            mime_type: Some("message/rfc822".into()),
+            size: Some(300),
+            is_inline: true,
+        };
+        set_unnamed_message("Mensaje reenviado");
+        let rows = attachment_rows(&[message(1, Some("Original message.eml")), message(2, None)]);
+        set_unnamed_message("Forwarded message");
+        let rows: Vec<_> = rows
+            .iter()
+            .map(|row| (row.name.as_str(), row.kind.as_str(), row.previewable))
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                ("Original message.eml", "message", false),
+                ("Mensaje reenviado.eml", "message", false),
+            ]
+        );
+    }
+}
