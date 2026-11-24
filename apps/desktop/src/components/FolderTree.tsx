@@ -1,4 +1,5 @@
 import { useState, type CSSProperties, type ReactNode } from 'react';
+import { sortFolders } from '../folders';
 import type { EngineAccount, EngineFolder } from '../types';
 
 const ICONS: Record<string, string> = {
@@ -21,11 +22,14 @@ interface Props {
   groups: FolderGroup[];
   activeId: number | null;
   onSelect: (folder: EngineFolder) => void;
+  /** 多账户时顶部的合并收件箱；单账户不显示。 */
+  unified?: { label: string; active: boolean; onSelect: () => void } | null;
 }
 
 /** 文件夹树：账户分组 + 父子嵌套（默认展开，▸ 可折叠）。 */
-export default function FolderTree({ groups, activeId, onSelect }: Props) {
+export default function FolderTree({ groups, activeId, onSelect, unified = null }: Props) {
   const [collapsed, setCollapsed] = useState<Set<number>>(() => new Set());
+  const [collapsedAccounts, setCollapsedAccounts] = useState<Set<string>>(() => new Set());
 
   const toggle = (id: number) => {
     setCollapsed((prev) => {
@@ -39,9 +43,20 @@ export default function FolderTree({ groups, activeId, onSelect }: Props) {
     });
   };
 
+  const toggleAccount = (key: string) => {
+    setCollapsedAccounts((prev) => {
+      const next = new Set(prev);
+      if (next.has(key)) {
+        next.delete(key);
+      } else {
+        next.add(key);
+      }
+      return next;
+    });
+  };
+
   const renderList = (list: EngineFolder[], parentId: number | null, depth: number): ReactNode =>
-    list
-      .filter((f) => (f.parentId ?? null) === parentId)
+    sortFolders(list.filter((f) => (f.parentId ?? null) === parentId))
       .map((f) => {
         const children = list.filter((c) => (c.parentId ?? null) === f.id);
         const hasChildren = children.length > 0;
@@ -80,14 +95,42 @@ export default function FolderTree({ groups, activeId, onSelect }: Props) {
 
   return (
     <nav className="folder-tree" aria-label="邮件文件夹">
-      {groups.map((group, gi) => (
-        <div key={group.account?.id ?? `g${gi}`} className="folder-group">
-          <div className="group-title">
-            {group.account ? group.account.name ?? group.account.email : '本机邮件'}
-          </div>
-          {renderList(group.folders, null, 0)}
+      {unified && (
+        <div className="folder-group unified">
+          <button
+            className={`folder-item ${unified.active ? 'active' : ''}`}
+            style={{ paddingLeft: 8 }}
+            onClick={unified.onSelect}
+          >
+            <span className="folder-icon">📥</span>
+            <span className="folder-name">{unified.label}</span>
+          </button>
         </div>
-      ))}
+      )}
+      {groups.map((group, gi) => {
+        const key = String(group.account?.id ?? `g${gi}`);
+        const collapsedAccount = collapsedAccounts.has(key);
+        const label = group.account
+          ? (group.account.displayName ?? group.account.name ?? group.account.email)
+          : '本机邮件';
+        const email = group.account?.email ?? '';
+        return (
+          <div key={key} className="folder-group">
+            <button
+              className="group-title"
+              onClick={() => toggleAccount(key)}
+              title={email ? `${label} <${email}>` : label}
+            >
+              <span className={`expander ${collapsedAccount ? '' : 'open'}`} aria-hidden="true">
+                ▸
+              </span>
+              <span className="group-name">{label}</span>
+              {email && label !== email && <span className="group-email">{email}</span>}
+            </button>
+            {!collapsedAccount && renderList(group.folders, null, 0)}
+          </div>
+        );
+      })}
     </nav>
   );
 }

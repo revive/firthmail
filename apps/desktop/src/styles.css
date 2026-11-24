@@ -598,13 +598,52 @@ body {
   margin-bottom: 6px;
 }
 
+/* 账户标题：可折叠，显示账户名 + 邮箱。 */
 .group-title {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  width: 100%;
   padding: 4px 8px 2px;
+  border: none;
+  background: transparent;
+  font: inherit;
   font-size: 11px;
   color: #8a8886;
+  text-align: left;
+  cursor: pointer;
+  overflow: hidden;
+}
+
+.group-title:hover {
+  color: #4a4846;
+}
+
+.group-title .expander {
+  flex: none;
+}
+
+.group-title .group-name {
+  flex: none;
+  max-width: 70%;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.group-title .group-email {
+  flex: 1;
+  min-width: 0;
+  color: #a19f9d;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.folder-group.unified {
+  margin-bottom: 4px;
+  padding-bottom: 4px;
+  border-bottom: 1px solid #edebe9;
 }
 
 /* ---- account setup modal ---- */

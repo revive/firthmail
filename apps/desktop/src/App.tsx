@@ -461,6 +461,23 @@ export default function App() {
     return accounts.find((account) => account.id === accountId)?.email ?? null;
   }, [accounts, body?.accountId, compose?.original?.accountId]);
 
+  /**
+   * 多账户时在文件夹树顶部放一个合并收件箱：引擎按 view 列所有账户的
+   * 收件箱（不传 accountId），删除/归档/回复仍按每封邮件自己的账户走。
+   */
+  const unifiedInbox = useMemo(() => {
+    if (accounts.length < 2) return null;
+    return {
+      label: '所有收件箱',
+      active: folderId === null,
+      onSelect: () => {
+        if (search) clearSearch();
+        setFolderId(null);
+        void loadRows(null, 'inbox');
+      },
+    };
+  }, [accounts.length, folderId, search, clearSearch, loadRows]);
+
   return (
     <div className="app">
       <header className="app-header">
@@ -503,6 +520,7 @@ export default function App() {
         <FolderTree
           groups={grouped}
           activeId={folderId}
+          unified={unifiedInbox}
           onSelect={(folder) => {
             if (search) clearSearch();
             setFolderId(folder.id);
