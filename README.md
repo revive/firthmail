@@ -65,6 +65,22 @@ ost2eml <ost> out-dir --mbox
 - 附件按 `PR_ATTACH_DATA_BIN` 还原字节，内嵌消息递归渲染为 `message/rfc822`
 - 8 位字符串按邮件的代码页（GBK/Shift-JIS/…）解码
 
+## 添加 Outlook.com / hotmail.com 账户
+
+微软自 2022 年起关闭了这类邮箱的**密码登录**（IMAP/POP 基本认证），所以「添加账户」里的
+密码表单对 `@hotmail.com` / `@outlook.com` / `@live.com` / Microsoft 365 **无效**，
+必须走 OAuth。步骤：
+
+1. 打开 [Azure 门户](https://portal.azure.com) →「Microsoft Entra ID」→「应用注册」→「新注册」
+   - 支持的账户类型选 **任何组织目录中的账户和个人 Microsoft 账户**
+   - 「重定向 URI」平台选 **移动和桌面应用程序**，值填 `http://localhost`
+2. 复制「应用程序(客户端) ID」（一个 GUID，如 `1a2b3c4d-…`）
+3. FirthMail →「添加账户」→ 在 Outlook.com 一栏填入这个 ID →「用 Microsoft 账户登录」
+4. 在浏览器里登录并同意；回到应用后账户会自动出现并开始同步
+
+引擎用 PKCE + 本机回环（`http://localhost:<随机端口>/`）接收回调，不需要客户端密钥。
+若登录失败，检查 Azure 应用里是否打开了「允许公共客户端流」（部分租户需要）。
+
 ## 已读行为
 
 | 操作 | 结果 |

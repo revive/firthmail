@@ -20,7 +20,7 @@ use flectar_mail_core::mail_import::{scan_folder, Destination, MailImportProgres
 use flectar_mail_core::models::{
     Account, AccountFolderRoles, AddPasswordAccountArgs, ActionResult, FolderInfo, ListOrder,
     MessageCursor, MessageDetail, MessagePage, MessageSearchPage, MessageSummary, PerformActionArgs,
-    QueueSendArgs, QueueSendResult, SaveDraftArgs, View,
+    Provider, QueueSendArgs, QueueSendResult, SaveDraftArgs, View,
 };
 use flectar_mail_core::{Core, MessagePageRequest};
 use serde::Serialize;
@@ -275,6 +275,59 @@ pub async fn add_account(
 #[tauri::command]
 pub async fn remove_account(engine: State<'_, Engine>, account_id: i64) -> EngineResult<()> {
     engine.core.remove_account(account_id).await.map_err(err)
+}
+
+/// 在系统浏览器里打开一个地址（OAuth 授权页）。
+fn open_in_browser(url: &str) -> std::result::Result<(), String> {
+    #[cfg(target_os = "windows")]
+    let spawned = std::process::Command::new("cmd")
+        .args(["/C", "start", "", url])
+        .spawn();
+    #[cfg(target_os = "macos")]
+    let spawned = std::process::Command::new("open").arg(url).spawn();
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let spawned = std::process::Command::new("xdg-open").arg(url).spawn();
+    spawned.map(|_| ()).map_err(|error| error.to_string())
+}
+
+/// The Microsoft application (client) ID saved for OAuth sign-in.
+///
+/// Outlook.com / hotmail.com / Microsoft 365 no longer accept a password over
+/// IMAP, so those accounts sign in through Microsoft's OAuth flow. The engine
+/// takes the app registration from its settings (`ms_client_id`).
+#[tauri::command]
+pub async fn oauth_client_id(engine: State<'_, Engine>) -> EngineResult<String> {
+    let settings = engine.core.get_settings().await.map_err(err)?;
+    Ok(settings.ms_client_id)
+}
+
+/// Save the Microsoft application (client) ID; an empty value clears it.
+#[tauri::command]
+pub async fn set_oauth_client_id(engine: State<'_, Engine>, client_id: String) -> EngineResult<()> {
+    engine
+        .core
+        .set_oauth_apps(None, Some(client_id))
+        .await
+        .map_err(err)?;
+    Ok(())
+}
+
+/// Sign in to an Outlook.com / Microsoft 365 mailbox: opens the authorization
+/// page in the browser and waits for the engine's loopback redirect (it gives
+/// up after 15 minutes). Returns the account once its tokens are stored.
+#[tauri::command]
+pub async fn start_microsoft_login(engine: State<'_, Engine>) -> EngineResult<Account> {
+    engine
+        .core
+        .start_oauth(Provider::Microsoft, |url| open_in_browser(&url))
+        .await
+        .map_err(err)
+}
+
+/// Stop a sign-in that is waiting for the browser.
+#[tauri::command]
+pub fn cancel_oauth(engine: State<'_, Engine>) {
+    engine.core.cancel_oauth();
 }
 
 #[tauri::command]

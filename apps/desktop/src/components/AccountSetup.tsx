@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { api, type AddAccountInput } from '../api';
 
 interface Props {
@@ -19,11 +19,26 @@ const EMPTY: AddAccountInput = {
   connection: { incomingSecurity: 'tls', smtpSecurity: 'tls' },
 };
 
-/** 添加 IMAP/POP3 账户。密码进 Windows 凭据管理器。 */
+/**
+ * 添加账户。IMAP/POP3 走密码；Outlook.com / Microsoft 365 微软已关闭密码
+ * 登录，只能走 OAuth：填一次 Azure 应用的客户端 ID，然后在浏览器里登录。
+ */
 export default function AccountSetup({ onClose, onAdded }: Props) {
   const [form, setForm] = useState<AddAccountInput>(EMPTY);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [msClientId, setMsClientId] = useState('');
+  const [oauthBusy, setOauthBusy] = useState(false);
+  const [oauthNote, setOauthNote] = useState<string | null>(null);
+
+  useEffect(() => {
+    api
+      .oauthClientId()
+      .then(setMsClientId)
+      .catch(() => {
+        /* 读不到就留空，第一次登录前填上即可 */
+      });
+  }, []);
 
   const set = <K extends keyof AddAccountInput>(key: K, value: AddAccountInput[K]) =>
     setForm((f) => ({ ...f, [key]: value }));
@@ -39,6 +54,33 @@ export default function AccountSetup({ onClose, onAdded }: Props) {
         smtpHost: f.smtpHost || (domain ? `smtp.${domain}` : ''),
       };
     });
+
+  const saveMsClientId = async (): Promise<boolean> => {
+    try {
+      await api.setOauthClientId(msClientId.trim());
+      return true;
+    } catch (e) {
+      setOauthNote(String(e));
+      return false;
+    }
+  };
+
+  const loginMicrosoft = async () => {
+    setOauthNote(null);
+    setOauthBusy(true);
+    try {
+      if (msClientId.trim()) {
+        if (!(await saveMsClientId())) return;
+      }
+      setOauthNote('请在浏览器中完成 Microsoft 登录（最多 15 分钟）…');
+      await api.startMicrosoftLogin();
+      onAdded();
+    } catch (e) {
+      setOauthNote(String(e));
+    } finally {
+      setOauthBusy(false);
+    }
+  };
 
   const submit = async () => {
     setError(null);
@@ -59,7 +101,7 @@ export default function AccountSetup({ onClose, onAdded }: Props) {
 
   return (
     <div className="modal-backdrop" role="dialog" aria-modal="true">
-      <div className="modal">
+      <div className="modal modal-setup">
         <h1>添加邮箱账户</h1>
         <div className="form-row">
           <button className="link" onClick={fillDefaults}>按邮箱地址填默认值（imap./smtp. 域名，SSL 993/465）</button>
@@ -122,6 +164,37 @@ export default function AccountSetup({ onClose, onAdded }: Props) {
           </button>
         </div>
         <p className="form-note">密码保存在 Windows 凭据管理器；数据存于 %APPDATA%\FirthMail。</p>
+
+        <section className="oauth-section">
+          <h2>Outlook.com / hotmail.com / Microsoft 365</h2>
+          <p className="form-note">
+            微软已停止这类邮箱的密码登录（IMAP 基本认证），必须用 OAuth。先在 Azure
+            门户注册一个应用（「移动和桌面应用程序」平台，重定向 URI 填
+            <code> http://localhost</code>），把 Application (client) ID 填到下面，再点登录。
+          </p>
+          <label className="oauth-id">
+            <span>应用（客户端）ID</span>
+            <input
+              value={msClientId}
+              onChange={(e) => setMsClientId(e.target.value)}
+              placeholder="00000000-0000-0000-0000-000000000000"
+              spellCheck={false}
+            />
+          </label>
+          <div className="oauth-actions">
+            <button onClick={() => void saveMsClientId()} disabled={oauthBusy}>
+              仅保存 ID
+            </button>
+            {oauthBusy ? (
+              <button onClick={() => void api.cancelOauth()}>取消登录</button>
+            ) : (
+              <button className="primary" onClick={() => void loginMicrosoft()}>
+                用 Microsoft 账户登录
+              </button>
+            )}
+          </div>
+          {oauthNote && <div className="form-note oauth-note">{oauthNote}</div>}
+        </section>
       </div>
     </div>
   );

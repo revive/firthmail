@@ -771,6 +771,95 @@ body {
   color: #8a8886;
 }
 
+/* ---- OAuth 账户（Outlook.com / Microsoft 365） ---- */
+
+.modal-setup {
+  max-height: calc(100vh - 60px);
+  overflow-y: auto;
+}
+
+.oauth-section {
+  margin-top: 18px;
+  padding-top: 14px;
+  border-top: 1px solid #edebe9;
+}
+
+.oauth-section h2 {
+  font-size: 14px;
+  margin-bottom: 6px;
+}
+
+.oauth-section code {
+  padding: 0 4px;
+  border-radius: 3px;
+  background: #f3f2f1;
+  font-size: 11px;
+}
+
+.oauth-id {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 10px;
+  font-size: 12px;
+  color: #605e5c;
+}
+
+.oauth-id span {
+  flex: none;
+}
+
+.oauth-id input {
+  flex: 1;
+  height: 30px;
+  padding: 0 10px;
+  border: 1px solid #c8c6c4;
+  border-radius: 4px;
+  font: inherit;
+  color: #242424;
+}
+
+.oauth-id input:focus {
+  outline: 2px solid #0072c6;
+  outline-offset: -1px;
+}
+
+.oauth-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+  margin-top: 10px;
+}
+
+.oauth-actions button {
+  height: 30px;
+  padding: 0 14px;
+  border: 1px solid #c8c6c4;
+  border-radius: 4px;
+  background: #ffffff;
+  font: inherit;
+  cursor: pointer;
+}
+
+.oauth-actions button.primary {
+  border: none;
+  background: #0072c6;
+  color: #ffffff;
+}
+
+.oauth-actions button.primary:hover:not(:disabled) {
+  background: #106ebe;
+}
+
+.oauth-actions button:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+
+.oauth-note {
+  color: #005a9e;
+}
+
 /* ---- attachments ---- */
 
 .attachments {

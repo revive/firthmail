@@ -56,6 +56,12 @@ export const api = {
   listAccounts: () => invoke<EngineAccount[]>('list_accounts'),
   addAccount: (args: AddAccountInput) => invoke<EngineAccount>('add_account', { args }),
   removeAccount: (accountId: number) => invoke('remove_account', { accountId }),
+  /** The Microsoft OAuth application (client) ID saved for Outlook.com sign-in. */
+  oauthClientId: () => invoke<string>('oauth_client_id'),
+  setOauthClientId: (clientId: string) => invoke<void>('set_oauth_client_id', { clientId }),
+  /** Opens the Microsoft sign-in page and resolves once the account is added. */
+  startMicrosoftLogin: () => invoke<EngineAccount>('start_microsoft_login'),
+  cancelOauth: () => invoke<void>('cancel_oauth'),
   listFolders: (accountId: number | null) => invoke<EngineFolder[]>('list_folders', { accountId }),
   accountFolderRoles: (accountId: number) =>
     invoke<{ roles: FolderRoleChoiceOut[] }>('account_folder_roles', { accountId }),
