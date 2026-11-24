@@ -1,3 +1,5 @@
+import { useEffect, useRef, useState } from 'react';
+import { Icon } from './MailToolbar';
 import type { EngineMessageDetail } from '../types';
 import { sanitizeMailHtml } from '../sanitize';
 
@@ -7,15 +9,39 @@ interface Props {
   /** Selection id, so actions work before the body arrives. */
   selected: number | null;
   onReply: () => void;
+  onReplyAll: () => void;
   onForward: () => void;
   onDelete: () => void;
+  onArchive: () => void;
   onToggleRead: () => void;
 }
 
 const initials = (m: EngineMessageDetail) =>
   (m.from.name ?? m.from.email ?? '?').slice(0, 1).toUpperCase();
 
-export default function ReadingPane({ message, selected, onReply, onForward, onDelete, onToggleRead }: Props) {
+export default function ReadingPane({
+  message,
+  selected,
+  onReply,
+  onReplyAll,
+  onForward,
+  onDelete,
+  onArchive,
+  onToggleRead,
+}: Props) {
+  const [menuOpen, setMenuOpen] = useState(false);
+  const menuRef = useRef<HTMLDivElement>(null);
+
+  // 点空白处收起「⋯」菜单。
+  useEffect(() => {
+    if (!menuOpen) return;
+    const close = (event: PointerEvent) => {
+      if (!menuRef.current?.contains(event.target as Node)) setMenuOpen(false);
+    };
+    window.addEventListener('pointerdown', close);
+    return () => window.removeEventListener('pointerdown', close);
+  }, [menuOpen]);
+
   if (!message) {
     return (
       <section className="reading-pane empty" aria-label="阅读窗格">
@@ -26,14 +52,6 @@ export default function ReadingPane({ message, selected, onReply, onForward, onD
   const date = new Date(message.date);
   return (
     <section className="reading-pane" aria-label="阅读窗格">
-      <div className="reading-toolbar">
-        <button onClick={onReply} title="回复 (Ctrl+R)">↩ 回复</button>
-        <button onClick={onForward} title="转发 (Ctrl+F)">↪ 转发</button>
-        <button onClick={onDelete} title="删除 (Delete)">🗑 删除</button>
-        <button onClick={onToggleRead} title="切换已读 (Ctrl+Q / Ctrl+U)">
-          {message.isRead ? '📨 标为未读' : '📌 标为已读'}
-        </button>
-      </div>
       <div className="reading-header">
         <h1 className="reading-subject">{message.subject || '(无主题)'}</h1>
         <div className="reading-meta">
@@ -48,14 +66,72 @@ export default function ReadingPane({ message, selected, onReply, onForward, onD
               {message.cc.length > 0 && `；抄送：${message.cc.map((t) => t.name ?? t.email).join('、')}`}
             </div>
           </div>
-          <div className="meta-date">
-            {date.toLocaleString('zh-CN', {
-              year: 'numeric',
-              month: 'long',
-              day: 'numeric',
-              hour: '2-digit',
-              minute: '2-digit',
-            })}
+          <div className="reading-side">
+            <div className="reading-actions">
+              <button onClick={onReply} title="回复（Ctrl+R）">
+                <Icon name="reply" />
+                回复
+              </button>
+              <button onClick={onReplyAll} title="全部回复（Ctrl+Shift+R）">
+                <Icon name="replyAll" />
+                全部回复
+              </button>
+              <button onClick={onForward} title="转发（Ctrl+F）">
+                <Icon name="forward" />
+                转发
+              </button>
+              <div className="more-wrap" ref={menuRef}>
+                <button
+                  className="icon-only"
+                  aria-haspopup="menu"
+                  aria-expanded={menuOpen}
+                  aria-label="更多操作"
+                  onClick={() => setMenuOpen((open) => !open)}
+                >
+                  <Icon name="more" />
+                </button>
+                {menuOpen && (
+                  <div className="action-menu" role="menu">
+                    <button
+                      role="menuitem"
+                      onClick={() => {
+                        setMenuOpen(false);
+                        onToggleRead();
+                      }}
+                    >
+                      {message.isRead ? '标为未读' : '标为已读'}
+                    </button>
+                    <button
+                      role="menuitem"
+                      onClick={() => {
+                        setMenuOpen(false);
+                        onArchive();
+                      }}
+                    >
+                      归档
+                    </button>
+                    <button
+                      role="menuitem"
+                      onClick={() => {
+                        setMenuOpen(false);
+                        onDelete();
+                      }}
+                    >
+                      删除
+                    </button>
+                  </div>
+                )}
+              </div>
+            </div>
+            <div className="meta-date">
+              {date.toLocaleString('zh-CN', {
+                year: 'numeric',
+                month: 'long',
+                day: 'numeric',
+                hour: '2-digit',
+                minute: '2-digit',
+              })}
+            </div>
           </div>
         </div>
       </div>

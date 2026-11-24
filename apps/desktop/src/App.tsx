@@ -1,9 +1,10 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { listen } from '@tauri-apps/api/event';
 import AccountSetup from './components/AccountSetup';
-import Composer, { type ComposeMode } from './components/Composer';
+import { ComposeForm, type ComposeMode } from './components/Composer';
 import FolderTree from './components/FolderTree';
 import ImportModal from './components/ImportModal';
+import MailToolbar from './components/MailToolbar';
 import MessageList from './components/MessageList';
 import ReadingPane from './components/ReadingPane';
 import { api } from './api';
@@ -65,7 +66,18 @@ export default function App() {
   const [backendEvents, setBackendEvents] = useState<number | null>(null);
   const [setupOpen, setSetupOpen] = useState(false);
   const [importOpen, setImportOpen] = useState(false);
-  const [compose, setCompose] = useState<{ mode: ComposeMode } | null>(null);
+  /**
+   * The open composer. Replies and forwards start inline in the reading pane
+   * (the mail list stays put); 「弹出」 or a new message uses its own window.
+   * `original` is a snapshot: the mail the reply or forward is about, kept
+   * even if the user moves on in the list.
+   */
+  const [compose, setCompose] = useState<{
+    mode: ComposeMode;
+    replyAll: boolean;
+    inline: boolean;
+    original: EngineMessageDetail | null;
+  } | null>(null);
 
   const folderIdRef = useRef<number | null>(null);
   folderIdRef.current = folderId;
@@ -320,21 +332,68 @@ export default function App() {
     return () => window.clearTimeout(timer);
   }, [body, setRead]);
 
-  const reply = useCallback(() => {
-    if (!body) {
-      showToast('请先选择一封邮件');
+  const startNew = useCallback(() => {
+    if (accountsRef.current.length === 0) {
+      showToast('请先添加账户');
+      setSetupOpen(true);
       return;
     }
-    setCompose({ mode: 'reply' });
-  }, [body, showToast]);
+    setCompose({ mode: 'new', replyAll: false, inline: false, original: null });
+  }, [showToast]);
+
+  const reply = useCallback(
+    (all = false) => {
+      if (!body) {
+        showToast('请先选择一封邮件');
+        return;
+      }
+      setCompose({ mode: 'reply', replyAll: all, inline: true, original: body });
+    },
+    [body, showToast],
+  );
 
   const forward = useCallback(() => {
     if (!body) {
       showToast('请先选择一封邮件');
       return;
     }
-    setCompose({ mode: 'forward' });
+    setCompose({ mode: 'forward', replyAll: false, inline: true, original: body });
   }, [body, showToast]);
+
+  /** 归档：从当前文件夹移到账户的归档文件夹（引擎 `archive` 动作）。 */
+  const archiveSelected = useCallback(async () => {
+    const id = selectedRef.current;
+    if (id == null) return;
+    try {
+      await act('archive');
+    } catch (e) {
+      setStatus(String(e));
+      showToast(`无法归档：${String(e)}`);
+      return;
+    }
+    const current = rowsRef.current;
+    const idx = current.findIndex((m) => m.id === id);
+    const next = current[idx + 1] ?? current[idx - 1] ?? null;
+    if (next) {
+      setSelectedId(next.id);
+      openMessage(next.id);
+    } else {
+      setSelectedId(null);
+      setBody(null);
+    }
+    await loadRows(folderIdRef.current, viewRef.current);
+    await refreshFolders();
+    showToast('已归档');
+  }, [act, openMessage, loadRows, refreshFolders, showToast]);
+
+  const syncNow = useCallback(async () => {
+    setStatus('正在同步…');
+    try {
+      await api.syncNow();
+    } catch (e) {
+      setStatus(String(e));
+    }
+  }, []);
 
   // The keyboard map. Delete first: that is the one this client exists to
   // get right.
@@ -371,6 +430,9 @@ export default function App() {
       } else if (mod && e.key.toLowerCase() === 'u') {
         e.preventDefault();
         void setRead(false);
+      } else if (mod && e.shiftKey && e.key.toLowerCase() === 'r') {
+        e.preventDefault();
+        reply(true);
       } else if (mod && e.key.toLowerCase() === 'r') {
         e.preventDefault();
         reply();
@@ -393,6 +455,12 @@ export default function App() {
     return [...byAccount.values()];
   }, [accounts, folders]);
 
+  /** The open message's account address, left out of a reply-all. */
+  const ownAddress = useMemo(() => {
+    const accountId = compose?.original?.accountId ?? body?.accountId;
+    return accounts.find((account) => account.id === accountId)?.email ?? null;
+  }, [accounts, body?.accountId, compose?.original?.accountId]);
+
   return (
     <div className="app">
       <header className="app-header">
@@ -412,24 +480,24 @@ export default function App() {
             }
           }}
         />
-        <div className="header-actions">
-          <button
-            className="primary"
-            onClick={() => {
-              if (accounts.length === 0) {
-                showToast('请先添加账户');
-                setSetupOpen(true);
-                return;
-              }
-              setCompose({ mode: 'new' });
-            }}
-          >
-            ✉ 新邮件
-          </button>
-          <button className="primary" onClick={() => setImportOpen(true)}>📥 导入邮件</button>
-          <button className="primary" onClick={() => setSetupOpen(true)}>✚ 添加账户</button>
-        </div>
       </header>
+
+      <MailToolbar
+        hasSelection={selectedId != null && !compose}
+        isRead={body?.isRead ?? true}
+        onNew={startNew}
+        onDelete={() => void deleteSelected()}
+        onArchive={() => void archiveSelected()}
+        onReply={() => reply()}
+        onReplyAll={() => reply(true)}
+        onForward={forward}
+        onToggleRead={() => {
+          if (body) void setRead(toggledReadState(body.isRead));
+        }}
+        onSync={() => void syncNow()}
+        onImport={() => setImportOpen(true)}
+        onAccounts={() => setSetupOpen(true)}
+      />
 
       <div className="app-body">
         <FolderTree
@@ -454,16 +522,45 @@ export default function App() {
             onSelect={(id) => openMessage(id)}
           />
         </div>
-        <ReadingPane
-          message={body}
-          selected={selectedId}
-          onReply={reply}
-          onForward={forward}
-          onDelete={() => void deleteSelected()}
-          onToggleRead={() => {
-            if (body) void setRead(toggledReadState(body.isRead));
-          }}
-        />
+        {/* 阅读区：内嵌回复直接盖在邮件上（邮件仍留在下面，切回不丢草稿）。 */}
+        <div className="reading-slot">
+          <ReadingPane
+            message={body}
+            selected={selectedId}
+            onReply={() => reply()}
+            onReplyAll={() => reply(true)}
+            onForward={forward}
+            onDelete={() => void deleteSelected()}
+            onArchive={() => void archiveSelected()}
+            onToggleRead={() => {
+              if (body) void setRead(toggledReadState(body.isRead));
+            }}
+          />
+          {compose && (
+            <ComposeForm
+              // 换了要回的信（或新邮件）就换一份草稿，别留着上一封的内容。
+              key={`${compose.mode}-${compose.original?.id ?? 'new'}`}
+              mode={compose.mode}
+              replyAll={compose.replyAll}
+              original={compose.original}
+              accountId={compose.original?.accountId ?? accounts[0]?.id ?? null}
+              ownAddress={ownAddress}
+              onDiscard={() => setCompose(null)}
+              onSent={(text) => {
+                setCompose(null);
+                showToast(text);
+              }}
+              onPopOut={
+                compose.inline
+                  ? () =>
+                      setCompose((current) =>
+                        current ? { ...current, inline: false } : current,
+                      )
+                  : undefined
+              }
+            />
+          )}
+        </div>
       </div>
 
       <footer className="app-footer">
@@ -474,7 +571,7 @@ export default function App() {
             {backendEvents != null && `｜后端 ×${backendEvents}`}
           </em>
           <span className="kbd-hint">
-            Delete 删除 · ↑↓ 选择 · Ctrl+Q 已读 · Ctrl+U 未读 · Ctrl+R 回复 · Ctrl+F 转发 · 停留 3 秒自动已读
+            Delete 删除 · ↑↓ 选择 · Ctrl+Q 已读 · Ctrl+U 未读 · Ctrl+R 回复 · Ctrl+Shift+R 全部回复 · Ctrl+F 转发 · 停留 3 秒自动已读
           </span>
         </span>
       </footer>
@@ -497,18 +594,6 @@ export default function App() {
             setSetupOpen(false);
             setStatus('账户已添加，正在同步…');
             await bootstrap();
-          }}
-        />
-      )}
-      {compose && (
-        <Composer
-          mode={compose.mode}
-          original={compose.mode === 'new' ? null : body}
-          accountId={body?.accountId ?? accounts[0]?.id ?? null}
-          onClose={() => setCompose(null)}
-          onSent={(text) => {
-            setCompose(null);
-            showToast(text);
           }}
         />
       )}
