@@ -28,6 +28,15 @@ pub fn run() {
                 }
             });
 
+            // 老版本导入的文件夹没有角色（Outlook 的文件夹名是中文）：
+            // 启动时补齐，收件箱等视图才能合并显示导入的邮件。
+            tauri::async_runtime::spawn({
+                let core = core.clone();
+                async move {
+                    bridge::assign_import_roles(&core).await;
+                }
+            });
+
             app.manage(bridge::Engine::new(core.clone()));
             bridge::forward_events(core, handle);
             Ok(())
@@ -44,6 +53,7 @@ pub fn run() {
             bridge::account_folder_roles,
             bridge::mark_folder_read,
             bridge::list_messages,
+            bridge::list_messages_merged,
             bridge::get_body,
             bridge::perform_action,
             bridge::empty_trash,

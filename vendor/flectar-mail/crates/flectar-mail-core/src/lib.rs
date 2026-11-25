@@ -1715,6 +1715,49 @@ impl Core {
         self.db.read(|conn| repo::local::id(conn)).await
     }
 
+    /// Give the device-local account's imported folders the roles a mail app
+    /// would have given them, so Inbox, Sent and the other views include
+    /// imported mail.
+    ///
+    /// `choices` maps a role to the folder path that should hold it, as
+    /// `ost2eml` names folders (Outlook's own names are localized, so the
+    /// importer can't tell 收件箱 from an ordinary folder). A role another
+    /// folder already holds is left alone, and so is a path that isn't there.
+    /// Returns how many roles were assigned.
+    pub async fn assign_local_folder_roles(&self, choices: Vec<(String, String)>) -> Result<usize> {
+        let Some(account_id) = self.local_mail_account().await? else {
+            return Ok(0);
+        };
+        self.db
+            .write(move |conn| {
+                let tx = conn.transaction()?;
+                let mut assigned = 0;
+                for (role, path) in choices {
+                    if repo::folders::by_role(&tx, account_id, &role)?.is_some() {
+                        continue;
+                    }
+                    let folder_id: Option<i64> = tx
+                        .query_row(
+                            "SELECT id FROM folders WHERE account_id = ?1 AND path = ?2",
+                            rusqlite::params![account_id, path],
+                            |row| row.get(0),
+                        )
+                        .optional()?;
+                    let Some(folder_id) = folder_id else {
+                        continue;
+                    };
+                    tx.execute(
+                        "UPDATE folders SET role = ?2 WHERE id = ?1",
+                        rusqlite::params![folder_id, role],
+                    )?;
+                    assigned += 1;
+                }
+                tx.commit()?;
+                Ok(assigned)
+            })
+            .await
+    }
+
     /// Mail kept on this device, once an import has created it.
     pub async fn local_mail(&self) -> Result<Option<LocalMail>> {
         self.db

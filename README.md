@@ -69,6 +69,12 @@ ost2eml <ost> out-dir --mbox
 - 附件按 `PR_ATTACH_DATA_BIN` 还原字节，内嵌消息递归渲染为 `message/rfc822`
 - 8 位字符串按邮件的代码页（GBK/Shift-JIS/…）解码
 
+## 邮件列表
+
+邮件列表按 **200 封一页**向引擎取，滚到接近底部时自动取下一页（引擎的
+`nextCursor`），列表本身做**虚拟滚动**——DOM 里只有视口那几十行，3 万封和 300 封
+的开销一样。固定行高 64px，`↑↓` 选中会把它滚进视口。
+
 ## 导入本地邮件（含 Outlook 数据文件）
 
 「导入邮件」有两种用法，都默认**按 Message-ID 跳过本机已有的邮件**——同一个账户
@@ -84,6 +90,11 @@ ost2eml <ost> out-dir --mbox
 去重由引擎的 `import_mail_skipping_known` 完成：它比较整个 profile 的 Message-ID，
 不限于目标文件夹；没有 Message-ID 的邮件仍按目标文件夹比对（日期 + 发件人 + 主题 + 大小）。
 导入报告里的「已存在」就是被跳过的数量。
+
+只有一个邮箱账户时，文件夹树不会再多出一个「本机邮件」：导入的文件夹并进那个账户，
+同路径或同角色（收件箱/已发送/草稿/归档/垃圾邮件/废纸篓）的重复文件夹不再列出，
+因为它们的邮件已经并进对应视图；收件箱等视图用引擎的 `list_messages_for_accounts`
+**合并显示**两个账户的邮件，列表顶上有「已合并显示本机导入的邮件」提示。
 
 `ost2eml` 作为 sidecar 随安装包分发（`apps/desktop/src-tauri/binaries/`，
 Tauri 会把它放到应用同目录）。改过 `tools/ost2eml` 后重新生成：

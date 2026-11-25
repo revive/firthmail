@@ -58,6 +58,13 @@ export default function App() {
   const [folders, setFolders] = useState<EngineFolder[]>([]);
   const [folderId, setFolderId] = useState<number | null>(null);
   const [rows, setRows] = useState<EngineMessage[]>([]);
+  const [nextCursor, setNextCursor] = useState<{ date: number; messageId: number } | null>(null);
+  const [loadingMore, setLoadingMore] = useState(false);
+  /**
+   * 同一个邮箱被拆成两个账户时（IMAP 同步的 + 从 Outlook 导入到本机的），
+   * 按账户集合列同一个视图，让用户在收件箱里看到全部邮件。
+   */
+  const [merged, setMerged] = useState<{ accountIds: number[]; view: string } | null>(null);
   const [selectedId, setSelectedId] = useState<number | null>(null);
   const [body, setBody] = useState<EngineMessageDetail | null>(null);
   const [status, setStatus] = useState('启动中…');
@@ -117,16 +124,53 @@ export default function App() {
     window.setTimeout(() => setToast(null), 2200);
   }, []);
 
+  /** 一页 200 封：引擎的上限，也是滚动加载的粒度。 */
+  const PAGE_SIZE = 200;
+  const nextCursorRef = useRef<{ date: number; messageId: number } | null>(null);
+  nextCursorRef.current = nextCursor;
+  const loadingMoreRef = useRef(false);
+  const mergedRef = useRef<{ accountIds: number[]; view: string } | null>(null);
+  mergedRef.current = merged;
+
   const loadRows = useCallback(async (fid: number | null, view: string) => {
     // 只在文件夹切换时清空阅读窗格；同文件夹的刷新（事件、删除后）保留它。
     const folderChanged = fid !== folderIdRef.current;
-    viewRef.current = view;
+    const mergedNow = mergedRef.current;
+    viewRef.current = mergedNow?.view ?? view;
     try {
-      const page = await api.listMessages(fid, view);
+      const page = mergedNow
+        ? await api.listMessagesMerged(mergedNow.accountIds, mergedNow.view, PAGE_SIZE)
+        : await api.listMessages(fid, view, PAGE_SIZE);
       setRows(page.messages);
+      setNextCursor(page.nextCursor ?? null);
       if (folderChanged) setBody(null);
     } catch (e) {
       setStatus(String(e));
+    }
+  }, []);
+
+  /** 滚到列表底部时加载下一页，追加到现有列表后面。 */
+  const loadMore = useCallback(async () => {
+    const cursor = nextCursorRef.current;
+    if (!cursor || loadingMoreRef.current) return;
+    loadingMoreRef.current = true;
+    setLoadingMore(true);
+    const mergedNow = mergedRef.current;
+    try {
+      const page = mergedNow
+        ? await api.listMessagesMerged(mergedNow.accountIds, mergedNow.view, PAGE_SIZE, cursor)
+        : await api.listMessages(folderIdRef.current, viewRef.current, PAGE_SIZE, cursor);
+      setRows((current) => {
+        const known = new Set(current.map((message) => message.id));
+        const extra = page.messages.filter((message) => !known.has(message.id));
+        return extra.length > 0 ? [...current, ...extra] : current;
+      });
+      setNextCursor(page.nextCursor ?? null);
+    } catch (e) {
+      setStatus(String(e));
+    } finally {
+      loadingMoreRef.current = false;
+      setLoadingMore(false);
     }
   }, []);
 
@@ -138,9 +182,13 @@ export default function App() {
       return;
     }
     setSearch(q);
+    mergedRef.current = null;
+    setMerged(null);
     try {
       const list = await api.searchMessages(q);
       setRows(list);
+      // 搜索结果不分页（引擎一次给完）。
+      setNextCursor(null);
       setBody(null);
       setSelectedId(list.length > 0 ? list[0].id : null);
       setStatus(`搜索“${q}”：${list.length} 封`);
@@ -592,11 +640,33 @@ export default function App() {
   const grouped = useMemo(() => {
     const byAccount = new Map<number, { account: EngineAccount | undefined; folders: EngineFolder[] }>();
     for (const account of accounts) byAccount.set(account.id, { account, folders: [] });
+    const orphans: EngineFolder[] = [];
     for (const f of folders) {
-      if (!byAccount.has(f.accountId)) byAccount.set(f.accountId, { account: undefined, folders: [] });
-      byAccount.get(f.accountId)!.folders.push(f);
+      const group = byAccount.get(f.accountId);
+      if (group) group.folders.push(f);
+      else orphans.push(f);
     }
-    return [...byAccount.values()];
+    const groups = [...byAccount.values()];
+    if (orphans.length > 0) {
+      if (accounts.length === 1) {
+        // 只有一个真实账户（本机导入的邮件就是同一个邮箱的旧邮件）：并进这一组，
+        // 免得看起来像多了一个邮箱。同名/同角色的文件夹不再重复列出——它们的
+        // 邮件已经并进对应视图里了。
+        const group = groups[0];
+        const paths = new Set(group.folders.map((folder) => folder.path.toLowerCase()));
+        const roles = new Set(
+          group.folders.map((folder) => folder.role).filter((role): role is string => Boolean(role)),
+        );
+        for (const folder of orphans) {
+          if (paths.has(folder.path.toLowerCase())) continue;
+          if (folder.role && roles.has(folder.role)) continue;
+          group.folders.push(folder);
+        }
+      } else {
+        groups.push({ account: undefined, folders: orphans });
+      }
+    }
+    return groups;
   }, [accounts, folders]);
 
   /** The open message's account address, left out of a reply-all. */
@@ -604,6 +674,27 @@ export default function App() {
     const accountId = compose?.original?.accountId ?? body?.accountId;
     return accounts.find((account) => account.id === accountId)?.email ?? null;
   }, [accounts, body?.accountId, compose?.original?.accountId]);
+
+  /** 本机邮件账户（引擎的账户列表不包含它）：导入的邮件都在这儿。 */
+  const localAccountIds = useMemo(() => {
+    const known = new Set(accounts.map((account) => account.id));
+    return [...new Set(folders.map((folder) => folder.accountId))].filter((id) => !known.has(id));
+  }, [accounts, folders]);
+
+  /**
+   * 只有一个真实账户时，把本机导入的邮件并进同一个视图：一个收件箱里既有
+   * 服务器上的新邮件，也有从 Outlook 导进来的旧邮件（去重已在导入时做过）。
+   */
+  const mergedFor = useCallback(
+    (folder: EngineFolder) => {
+      if (accounts.length !== 1 || localAccountIds.length === 0) return null;
+      if (folder.accountId !== accounts[0].id) return null;
+      const view = viewForRole(folder.role);
+      if (!['inbox', 'sent', 'drafts', 'done', 'trash', 'spam'].includes(view)) return null;
+      return { accountIds: [accounts[0].id, ...localAccountIds], view };
+    },
+    [accounts, localAccountIds],
+  );
 
   /**
    * 多账户时在文件夹树顶部放一个合并收件箱：引擎按 view 列所有账户的
@@ -616,6 +707,8 @@ export default function App() {
       active: folderId === null,
       onSelect: () => {
         if (search) clearSearch();
+        mergedRef.current = null;
+        setMerged(null);
         setFolderId(null);
         void loadRows(null, 'inbox');
       },
@@ -678,6 +771,9 @@ export default function App() {
           onContextMenu={openFolderMenu}
           onSelect={(folder) => {
             if (search) clearSearch();
+            const nextMerged = mergedFor(folder);
+            mergedRef.current = nextMerged;
+            setMerged(nextMerged);
             setFolderId(folder.id);
             loadRows(folder.id, viewForRole(folder.role));
           }}
@@ -689,9 +785,16 @@ export default function App() {
               <button className="link" onClick={clearSearch}>× 清除（Esc）</button>
             </div>
           )}
+          {merged && (
+            <div className="merge-banner" role="status">
+              已合并显示本机导入的邮件（同一邮箱）
+            </div>
+          )}
           <MessageList
             rows={rows}
             selectedId={selectedId}
+            loadingMore={loadingMore}
+            onLoadMore={() => void loadMore()}
             onSelect={(id) => openMessage(id)}
             onContextMenu={(id, event) => {
               const row = rows.find((message) => message.id === id);

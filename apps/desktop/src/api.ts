@@ -70,6 +70,9 @@ export const api = {
     invoke<{ actionIds: number[] }>('mark_folder_read', { folderId, view }),
   listMessages: (folderId: number | null, view = 'all', limit = 100, cursor: { date: number; messageId: number } | null = null) =>
     invoke<EnginePage>('list_messages', { view, accountId: null, folderId, cursor, limit }),
+  /** One view across several accounts (a mailbox split into IMAP + local import). */
+  listMessagesMerged: (accountIds: number[], view = 'all', limit = 100, cursor: { date: number; messageId: number } | null = null) =>
+    invoke<EnginePage>('list_messages_merged', { accountIds, view, cursor, limit }),
   getBody: (messageId: number) => invoke<EngineMessageDetail>('get_body', { messageId }),
   performAction: (args: PerformActionArgs) => invoke<{ actionIds: number[] }>('perform_action', { args }),
   emptyTrash: (accountId: number | null) => invoke('empty_trash', { accountId }),

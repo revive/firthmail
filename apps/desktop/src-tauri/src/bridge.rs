@@ -392,6 +392,29 @@ pub async fn list_messages(
         .map_err(err)
 }
 
+/// `list_messages` across several accounts: the same mailbox synced over IMAP
+/// and imported from Outlook into the local account then reads as one list.
+#[tauri::command]
+pub async fn list_messages_merged(
+    engine: State<'_, Engine>,
+    account_ids: Vec<i64>,
+    view: Option<String>,
+    cursor: Option<MessageCursor>,
+    limit: Option<i64>,
+) -> EngineResult<MessagePage> {
+    let view = view.as_deref().map(parse_view).unwrap_or(View::Inbox);
+    let page = MessagePageRequest {
+        cursor,
+        limit: limit.unwrap_or(100).clamp(1, 200),
+        order: ListOrder::NewestFirst,
+    };
+    engine
+        .core
+        .list_messages_for_accounts(view, None, account_ids, None, None, page)
+        .await
+        .map_err(err)
+}
+
 #[tauri::command]
 pub async fn get_body(engine: State<'_, Engine>, message_id: i64) -> EngineResult<MessageDetail> {
     engine.core.get_body(message_id).await.map_err(err)
@@ -760,6 +783,7 @@ async fn run_outlook_import(
         );
     }
     let report = worker.await.map_err(err)?.map_err(err)?;
+    assign_import_roles(&core).await;
     let _ = app.emit(
         "import-report",
         serde_json::json!({
@@ -774,6 +798,37 @@ async fn run_outlook_import(
     // 转换出来的 EML 树只是中转，引擎已把自己的副本放进数据目录。
     let _ = std::fs::remove_dir_all(&out);
     Ok(())
+}
+
+/// Roles for the folders a saved-mail import creates.
+///
+/// Outlook's folder names are localized, so the engine's importer can't tell
+/// 收件箱 from an ordinary folder and leaves it without a role; a role is what
+/// makes a view (Inbox, Sent, ...) show the mail. Assigning them afterwards
+/// also lets a view merge the import with the mailbox it came from. It runs
+/// on every start too, which gives an import made by an older build its roles.
+pub async fn assign_import_roles(core: &Arc<Core>) {    const CHOICES: &[(&str, &str)] = &[
+        ("inbox", "收件箱"),
+        ("inbox", "Inbox"),
+        ("sent", "已发送"),
+        ("sent", "已发送邮件"),
+        ("sent", "Sent"),
+        ("drafts", "草稿"),
+        ("drafts", "Drafts"),
+        ("spam", "垃圾邮件"),
+        ("spam", "Junk"),
+        ("archive", "存档"),
+        ("archive", "Archives"),
+        ("trash", "已删除邮件"),
+        ("trash", "Deleted Items"),
+    ];
+    let choices = CHOICES
+        .iter()
+        .map(|(role, path)| ((*role).to_owned(), (*path).to_owned()))
+        .collect();
+    if let Err(error) = core.assign_local_folder_roles(choices).await {
+        eprintln!("could not give imported folders their roles: {error}");
+    }
 }
 
 async fn run_import(
@@ -822,6 +877,7 @@ async fn run_import(
         );
     }
     let report = worker.await.map_err(err)?.map_err(err)?;
+    assign_import_roles(&core).await;
     let _ = app.emit(
         "import-report",
         serde_json::json!({
