@@ -295,6 +295,62 @@ async fn messages(core: &crate::Core, account_id: i64) -> Vec<(String, String, b
         .unwrap()
 }
 
+/// A saved copy of mail the profile already holds adds only what it doesn't
+/// have: `import_mail_skipping_known` leaves out messages any account has,
+/// matched by Message-ID, so importing an Outlook export of a mailbox the
+/// profile also syncs doesn't duplicate it.
+#[tokio::test]
+async fn skipping_known_mail_leaves_out_what_the_profile_has() {
+    let (_directory, core) = core().await;
+    let folder = tempfile::tempdir().unwrap();
+    let root = folder.path().join("Export");
+    write(
+        &root.join("Inbox"),
+        mbox(&[message("known", "Already here", "")]),
+    );
+    let source = scan_folder(&root).unwrap();
+
+    let first = import(&core, &source, Destination::Local).await;
+    assert_eq!(first.imported, 1);
+
+    // Imported again into a differently named folder: the message is skipped
+    // because the profile has it, not because the folder does.
+    let folder_count = source.folders.len();
+    let second = MailImportRequest {
+        source: source.clone(),
+        folders: (0..folder_count).collect(),
+        destination: Destination::Local,
+        parent_folder: Some("Second import".into()),
+        loose_folder_name: "Imported".into(),
+        own_addresses: vec!["me@example.com".into()],
+    };
+    let (progress, _) = watch::channel(MailImportProgress::default());
+    let skipped = core
+        .import_mail_skipping_known(second, progress, Arc::new(AtomicBool::new(false)))
+        .await
+        .unwrap();
+    assert_eq!(skipped.imported, 0);
+    assert_eq!(skipped.already_present, 1);
+
+    // Without the flag the same export lands again in the new folder.
+    let third = MailImportRequest {
+        source,
+        folders: (0..folder_count).collect(),
+        destination: Destination::Local,
+        parent_folder: Some("Second import".into()),
+        loose_folder_name: "Imported".into(),
+        own_addresses: vec!["me@example.com".into()],
+    };
+    let (progress, _) = watch::channel(MailImportProgress::default());
+    let plain = core
+        .import_mail(third, progress, Arc::new(AtomicBool::new(false)))
+        .await
+        .unwrap();
+    assert_eq!(plain.imported, 1);
+    let account = core.local_mail_account().await.unwrap().unwrap();
+    assert_eq!(messages(&core, account).await.len(), 2);
+}
+
 #[tokio::test]
 async fn saved_mail_goes_into_local_mail_once() {
     let (_directory, core) = core().await;

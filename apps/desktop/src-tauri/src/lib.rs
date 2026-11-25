@@ -49,6 +49,7 @@ pub fn run() {
             bridge::sync_now,
             bridge::scan_import,
             bridge::import_local_mail,
+            bridge::import_outlook_file,
             bridge::cancel_import,
             bridge::save_draft,
             bridge::queue_send,

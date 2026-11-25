@@ -919,6 +919,64 @@ body {
   width: 560px;
 }
 
+.check-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 10px 0;
+  font-size: 12px;
+  color: #605e5c;
+  cursor: pointer;
+}
+
+.outlook-import {
+  margin-top: 18px;
+  padding-top: 14px;
+  border-top: 1px solid #edebe9;
+}
+
+.outlook-import h2 {
+  font-size: 14px;
+  margin-bottom: 6px;
+}
+
+.outlook-import .row {
+  display: flex;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.outlook-import .row input {
+  flex: 1;
+  height: 30px;
+  padding: 0 10px;
+  border: 1px solid #c8c6c4;
+  border-radius: 4px;
+  font: inherit;
+  color: #242424;
+}
+
+.outlook-import .row button {
+  height: 30px;
+  padding: 0 14px;
+  border: 1px solid #c8c6c4;
+  border-radius: 4px;
+  background: #ffffff;
+  font: inherit;
+  cursor: pointer;
+}
+
+.outlook-import .row button.primary {
+  border: none;
+  background: #0072c6;
+  color: #ffffff;
+}
+
+.outlook-import .row button:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+
 .root-path {
   display: flex;
   flex-direction: column;

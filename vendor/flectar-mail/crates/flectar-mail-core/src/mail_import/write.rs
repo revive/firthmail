@@ -209,6 +209,34 @@ impl crate::Core {
         progress: watch::Sender<MailImportProgress>,
         stop: Arc<AtomicBool>,
     ) -> Result<MailImportReport> {
+        self.import_mail_inner(request, progress, stop, false)
+            .await
+    }
+
+    /// [`Self::import_mail`], but leaving out messages this profile already
+    /// holds anywhere, matched by Message-ID.
+    ///
+    /// Importing a saved copy of a mailbox the profile also syncs then adds
+    /// only the mail the server no longer has, instead of a second copy of
+    /// everything. Messages without a Message-ID keep the destination
+    /// folder's own check.
+    pub async fn import_mail_skipping_known(
+        &self,
+        request: MailImportRequest,
+        progress: watch::Sender<MailImportProgress>,
+        stop: Arc<AtomicBool>,
+    ) -> Result<MailImportReport> {
+        self.import_mail_inner(request, progress, stop, true)
+            .await
+    }
+
+    async fn import_mail_inner(
+        &self,
+        request: MailImportRequest,
+        progress: watch::Sender<MailImportProgress>,
+        stop: Arc<AtomicBool>,
+        skip_known: bool,
+    ) -> Result<MailImportReport> {
         let MailImportRequest {
             source,
             folders: mut chosen,
@@ -307,6 +335,7 @@ impl crate::Core {
             // Mail a POP3 account gets this way is its own, like the mail it
             // downloads: it teaches contacts, invitations, and inbox tabs.
             downloaded: protocol == MailProtocol::Pop3,
+            skip_known,
             targets,
             paths,
             own,
@@ -732,12 +761,28 @@ impl Key {
             Self::None => false,
         })
     }
+
+    /// It is already in this profile, in any account or folder, by
+    /// Message-ID. Messages without one add nothing here.
+    fn known_anywhere(&self, conn: &Connection) -> Result<bool> {
+        Ok(match self {
+            Self::MessageId(message_id) => conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM messages WHERE message_id = ?1)",
+                params![message_id],
+                |row| row.get(0),
+            )?,
+            _ => false,
+        })
+    }
 }
 
 struct Writer<'a> {
     core: &'a crate::Core,
     account_id: i64,
     downloaded: bool,
+    /// Leave out messages this profile already holds anywhere (by
+    /// Message-ID), not just in the destination folder.
+    skip_known: bool,
     targets: HashMap<usize, Target>,
     paths: HashMap<usize, Vec<String>>,
     own: OwnAddresses,
@@ -809,13 +854,19 @@ impl Writer<'_> {
             .iter()
             .map(|(_, target, key)| (target.folder_id, key.clone()))
             .collect::<Vec<_>>();
+        let skip_known = self.skip_known;
         let present = self
             .core
             .db
             .read(move |conn| {
                 checks
                     .iter()
-                    .map(|(folder_id, key)| key.present(conn, account_id, *folder_id))
+                    .map(|(folder_id, key)| {
+                        if skip_known && key.known_anywhere(conn)? {
+                            return Ok(true);
+                        }
+                        key.present(conn, account_id, *folder_id)
+                    })
                     .collect::<Result<Vec<_>>>()
             })
             .await?;
@@ -870,6 +921,7 @@ impl Writer<'_> {
             .collect::<Vec<_>>();
         let own = self.own.clone();
         let downloaded = self.downloaded;
+        let skip_known = self.skip_known;
         let committed = self
             .core
             .db
@@ -884,8 +936,11 @@ impl Writer<'_> {
                     path,
                 } in stored
                 {
-                    // Another import may have stored the same mail since.
-                    if key.present(tx, account_id, target.folder_id)? {
+                    // Another import may have stored the same mail since, or
+                    // the profile may have had it all along.
+                    if key.present(tx, account_id, target.folder_id)?
+                        || (skip_known && key.known_anywhere(tx)?)
+                    {
                         duplicates.push(path);
                         continue;
                     }

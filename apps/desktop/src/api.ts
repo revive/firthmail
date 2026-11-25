@@ -75,8 +75,15 @@ export const api = {
   emptyTrash: (accountId: number | null) => invoke('empty_trash', { accountId }),
   syncNow: () => invoke('sync_now'),
   scanImport: (root: string) => invoke<ScanFolderOut[]>('scan_import', { root }),
-  importLocalMail: (root: string, folders: number[], ownAddresses: string[]) =>
-    invoke('import_local_mail', { root, folders, ownAddresses }),
+  importLocalMail: (
+    root: string,
+    folders: number[],
+    ownAddresses: string[],
+    skipExisting = true,
+  ) => invoke('import_local_mail', { root, folders, ownAddresses, skipExisting }),
+  /** Convert an Outlook .ost/.pst with the bundled ost2eml, then import it. */
+  importOutlookFile: (path: string, ownAddresses: string[] = []) =>
+    invoke('import_outlook_file', { path, ownAddresses }),
   cancelImport: () => invoke('cancel_import'),
   saveDraft: (args: SaveDraftInput) => invoke<number>('save_draft', { args }),
   queueSend: (draftId: number) =>

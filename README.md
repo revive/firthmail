@@ -69,6 +69,29 @@ ost2eml <ost> out-dir --mbox
 - 附件按 `PR_ATTACH_DATA_BIN` 还原字节，内嵌消息递归渲染为 `message/rfc822`
 - 8 位字符串按邮件的代码页（GBK/Shift-JIS/…）解码
 
+## 导入本地邮件（含 Outlook 数据文件）
+
+「导入邮件」有两种用法，都默认**按 Message-ID 跳过本机已有的邮件**——同一个账户
+已经从 IMAP 同步过的邮件不会变成第二份：
+
+- **目录**：每封一个 `.eml` 的目录、mbox 或 maildir（比如 `ost2eml` 的导出树），
+  可以勾选要导入的文件夹。
+- **Outlook 数据文件**：直接填 `.ost` / `.pst` 路径，应用自带的 `ost2eml` 先转成
+  EML 树（放缓存目录，导入完成后删除），再按上面的规则导入。「同步问题」这类
+  Outlook 自己的日志文件夹会被跳过。
+
+去重由引擎的 `import_mail_skipping_known` 完成：它比较整个 profile 的 Message-ID，
+不限于目标文件夹；没有 Message-ID 的邮件仍按目标文件夹比对（日期 + 发件人 + 主题 + 大小）。
+导入报告里的「已存在」就是被跳过的数量。
+
+`ost2eml` 作为 sidecar 随安装包分发（`apps/desktop/src-tauri/binaries/`，
+Tauri 会把它放到应用同目录）。改过 `tools/ost2eml` 后重新生成：
+
+```
+cargo build --release -p ost2eml
+copy target\release\ost2eml.exe apps\desktop\src-tauri\binaries\ost2eml-x86_64-pc-windows-msvc.exe
+```
+
 ## 添加 Outlook.com / hotmail.com 账户
 
 微软自 2022 年起关闭了这类邮箱的**密码登录**（IMAP/POP 基本认证），所以「添加账户」里的

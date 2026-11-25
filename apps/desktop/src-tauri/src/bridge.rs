@@ -514,6 +514,10 @@ pub async fn scan_import(
 /// Import saved mail into the device-local store (the engine creates the
 /// local account on the first import). Returns at once; progress and the
 /// report arrive as `import-progress` / `import-report` events.
+///
+/// `skip_existing` leaves out messages this profile already holds anywhere
+/// (matched by Message-ID), so importing an export of a mailbox the profile
+/// also syncs adds only the mail the server no longer has.
 #[tauri::command]
 pub async fn import_local_mail(
     engine: State<'_, Engine>,
@@ -521,6 +525,7 @@ pub async fn import_local_mail(
     root: String,
     folders: Vec<usize>,
     own_addresses: Vec<String>,
+    skip_existing: Option<bool>,
 ) -> EngineResult<()> {
     if engine
         .import_running
@@ -533,9 +538,19 @@ pub async fn import_local_mail(
     let stop = engine.import_stop.clone();
     stop.store(false, Ordering::Relaxed);
     let path = PathBuf::from(root);
+    let skip_existing = skip_existing.unwrap_or(false);
 
     tauri::async_runtime::spawn(async move {
-        let result = run_import(&app, core, path, folders, own_addresses, stop).await;
+        let result = run_import(
+            &app,
+            core,
+            path,
+            folders,
+            own_addresses,
+            skip_existing,
+            stop,
+        )
+        .await;
         running.store(false, Ordering::Relaxed);
         match result {
             Ok(()) => {}
@@ -547,12 +562,173 @@ pub async fn import_local_mail(
     Ok(())
 }
 
+/// Import the mail of an Outlook data file (`.ost` / `.pst`) directly: the
+/// bundled `ost2eml` converts it to an EML tree in the cache directory, which
+/// is then imported like any saved mail, skipping what the profile already
+/// has. Returns at once; `outlook-progress` reports the conversion phase,
+/// then `import-progress` / `import-report` the import.
+#[tauri::command]
+pub async fn import_outlook_file(
+    engine: State<'_, Engine>,
+    app: AppHandle,
+    path: String,
+    own_addresses: Vec<String>,
+) -> EngineResult<()> {
+    if engine.import_running.swap(true, Ordering::Relaxed) {
+        return Err("an import is already running".into());
+    }
+    let core = engine.core.clone();
+    let running = engine.import_running.clone();
+    let stop = engine.import_stop.clone();
+    stop.store(false, Ordering::Relaxed);
+    let ost = PathBuf::from(path);
+    tauri::async_runtime::spawn(async move {
+        let result = run_outlook_import(&app, core, ost, own_addresses, stop).await;
+        running.store(false, Ordering::Relaxed);
+        if let Err(error) = result {
+            let _ = app.emit("import-failed", error);
+        }
+    });
+    Ok(())
+}
+
+/// The bundled converter, which Tauri places next to the application binary.
+fn converter_path() -> Result<PathBuf, String> {
+    let exe = std::env::current_exe().map_err(err)?;
+    let directory = exe
+        .parent()
+        .ok_or_else(|| "the application has no directory".to_owned())?;
+    let converter = directory.join("ost2eml.exe");
+    if converter.is_file() {
+        Ok(converter)
+    } else {
+        Err(format!(
+            "找不到 ost2eml.exe，应放在 {}（与 FirthMail.exe 同目录）",
+            converter.display()
+        ))
+    }
+}
+
+async fn run_outlook_import(
+    app: &AppHandle,
+    core: Arc<Core>,
+    ost: PathBuf,
+    own_addresses: Vec<String>,
+    stop: Arc<AtomicBool>,
+) -> Result<(), String> {
+    if !ost.is_file() {
+        return Err(format!("{}: 文件不存在", ost.display()));
+    }
+    let converter = converter_path()?;
+    let out = dirs::cache_dir()
+        .ok_or("the operating system has no application cache directory")?
+        .join("FirthMail")
+        .join("outlook-import");
+    let _ = std::fs::remove_dir_all(&out);
+    std::fs::create_dir_all(&out).map_err(err)?;
+    let _ = app.emit(
+        "outlook-progress",
+        serde_json::json!({ "phase": "converting", "path": ost.to_string_lossy() }),
+    );
+
+    // 转换是几分钟的磁盘/CPU 活，放阻塞线程里跑，别堵住异步运行时。
+    let status = tokio::task::spawn_blocking({
+        let converter = converter.clone();
+        let ost = ost.clone();
+        let out = out.clone();
+        move || {
+            std::process::Command::new(&converter)
+                .arg(&ost)
+                .arg(&out)
+                .status()
+        }
+    })
+    .await
+    .map_err(err)?
+    .map_err(err)?;
+    if !status.success() {
+        return Err(format!("ost2eml 转换失败（退出码 {status}）"));
+    }
+    // 取消发生在转换期间：转换没法中途停下，转换完就别继续导入了。
+    if stop.load(Ordering::Relaxed) {
+        let _ = std::fs::remove_dir_all(&out);
+        return Ok(());
+    }
+    let _ = app.emit(
+        "outlook-progress",
+        serde_json::json!({ "phase": "importing" }),
+    );
+
+    let mut own = own_addresses;
+    for account in core.list_accounts().await.map_err(err)? {
+        if !own.iter().any(|address| address.eq_ignore_ascii_case(&account.email)) {
+            own.push(account.email);
+        }
+    }
+    let source = tokio::task::spawn_blocking({
+        let out = out.clone();
+        move || scan_folder(&out)
+    })
+    .await
+    .map_err(err)?
+    .map_err(err)?;
+    // 「同步问题」是 Outlook 自己的同步日志，不是邮件；别导进来。
+    let folders = source
+        .folders
+        .iter()
+        .enumerate()
+        .filter(|(_, folder)| !folder.path.join("/").contains("同步问题"))
+        .map(|(index, _)| index)
+        .collect();
+    let request = MailImportRequest {
+        source,
+        folders,
+        destination: Destination::Local,
+        parent_folder: None,
+        loose_folder_name: "Outlook 导入".into(),
+        own_addresses: own,
+    };
+    let (progress, mut receiver) = tokio::sync::watch::channel(MailImportProgress::default());
+    let worker = {
+        let core = core.clone();
+        let stop = stop.clone();
+        tokio::spawn(async move { core.import_mail_skipping_known(request, progress, stop).await })
+    };
+    while receiver.changed().await.is_ok() {
+        let p: MailImportProgress = *receiver.borrow_and_update();
+        let _ = app.emit(
+            "import-progress",
+            serde_json::json!({
+                "doneBytes": p.done_bytes,
+                "totalBytes": p.total_bytes,
+                "imported": p.imported,
+            }),
+        );
+    }
+    let report = worker.await.map_err(err)?.map_err(err)?;
+    let _ = app.emit(
+        "import-report",
+        serde_json::json!({
+            "accountId": report.account_id,
+            "folders": report.folders.len(),
+            "imported": report.imported,
+            "alreadyPresent": report.already_present,
+            "tooLarge": report.too_large,
+            "stopped": report.stopped,
+        }),
+    );
+    // 转换出来的 EML 树只是中转，引擎已把自己的副本放进数据目录。
+    let _ = std::fs::remove_dir_all(&out);
+    Ok(())
+}
+
 async fn run_import(
     app: &AppHandle,
     core: Arc<Core>,
     path: PathBuf,
     folders: Vec<usize>,
     own_addresses: Vec<String>,
+    skip_existing: bool,
     stop: Arc<AtomicBool>,
 ) -> Result<(), String> {
     let source = tokio::task::spawn_blocking(move || scan_folder(&path))
@@ -571,7 +747,14 @@ async fn run_import(
     let worker = {
         let core = core.clone();
         let stop = stop.clone();
-        tokio::spawn(async move { core.import_mail(request, progress, stop).await })
+        tokio::spawn(async move {
+            if skip_existing {
+                core.import_mail_skipping_known(request, progress, stop)
+                    .await
+            } else {
+                core.import_mail(request, progress, stop).await
+            }
+        })
     };
     while receiver.changed().await.is_ok() {
         let p: MailImportProgress = *receiver.borrow_and_update();
