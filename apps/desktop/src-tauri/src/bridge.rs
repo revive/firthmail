@@ -292,14 +292,21 @@ pub async fn remove_account(engine: State<'_, Engine>, account_id: i64) -> Engin
 
 /// 在系统浏览器里打开一个地址（OAuth 授权页）。
 ///
-/// Windows 上用 `cmd /C start`：URL 里的 `&` 是 cmd 的命令分隔符，必须给它
-/// 加引号，否则授权地址会在第一个 `&` 处被截断——微软只会看到
-/// `?response_type=code`，于是回一句 AADSTS900144「缺少 client_id」。
+/// 不走 `cmd /C start`：授权地址里的 `&` 会被 cmd 当成命令分隔符，地址会从
+/// 第一个 `&` 处被截断（微软只看到 `?response_type=code`，回 AADSTS900144
+/// 「缺少 client_id」）；自己给它加引号又会被 Rust 的转义变成 `\"…\"`，
+/// 浏览器拿到带反斜杠的地址。`explorer.exe` 拿到的是完整参数，交给
+/// ShellExecute 打开默认浏览器，没有 shell 解析这一层。
 fn open_in_browser(url: &str) -> std::result::Result<(), String> {
     #[cfg(target_os = "windows")]
-    let spawned = std::process::Command::new("cmd")
-        .args(["/C", "start", "", &format!("\"{url}\"")])
-        .spawn();
+    let spawned = std::process::Command::new("explorer.exe")
+        .arg(url)
+        .spawn()
+        .or_else(|_| {
+            std::process::Command::new("rundll32.exe")
+                .args(["url.dll,FileProtocolHandler", url])
+                .spawn()
+        });
     #[cfg(target_os = "macos")]
     let spawned = std::process::Command::new("open").arg(url).spawn();
     #[cfg(all(unix, not(target_os = "macos")))]
