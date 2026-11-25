@@ -113,15 +113,35 @@ copy target\release\ost2eml.exe apps\desktop\src-tauri\binaries\ost2eml-x86_64-p
 密码表单对 `@hotmail.com` / `@outlook.com` / `@live.com` / Microsoft 365 **无效**，
 必须走 OAuth。步骤：
 
-1. 打开 [Azure 门户](https://portal.azure.com) →「Microsoft Entra ID」→「应用注册」→「新注册」
-   - 支持的账户类型选 **任何组织目录中的账户和个人 Microsoft 账户**
-   - 「重定向 URI」平台选 **移动和桌面应用程序**，值填 `http://localhost`
-2. 复制「应用程序(客户端) ID」（一个 GUID，如 `1a2b3c4d-…`）
-3. FirthMail →「添加账户」→ 在 Outlook.com 一栏填入这个 ID →「用 Microsoft 账户登录」
-4. 在浏览器里登录并同意；回到应用后账户会自动出现并开始同步
+### 一、注册应用（只做一次，之后所有使用者共用）
+
+1. 打开 <https://portal.azure.com>（或 <https://entra.microsoft.com>），用**任意**微软账户
+   登录；不需要 Azure 订阅，也不产生费用。
+2. 「Microsoft Entra ID」→「应用注册」→「新注册」，名称填 `FirthMail`。
+3. 支持的账户类型选 **任何组织目录中的账户和个人 Microsoft 账户**
+   （这样个人 hotmail/outlook 和公司/学校账户都能登，别人也能用你注册的这个 ID）。
+4. 「重定向 URI」平台选 **公共客户端/本机（移动和桌面）**，值填 `http://localhost`
+   （引擎实际用的是 `http://localhost:<随机端口>/`，注册这一个即可匹配任意端口）。
+5. 「注册」，复制「应用程序(客户端) ID」——形如 `1a2b3c4d-0000-…` 的 GUID。
+6. 「身份验证」页：把「**允许公共客户端流**」设为 **是**（PKCE 必需，别建客户端密钥）。
+7. 「API 权限」→「添加权限」：
+   - **Office 365 Exchange Online** → 委托的权限 → `IMAP.AccessAsUser.All`、`SMTP.Send`
+   - （OpenID 的 `openid` / `email` / `profile` / `offline_access` 由协议自带，无需添加）
+8. 注册完把 GUID 填进 FirthMail，或者构建时编进去（见下）。
+
+> 不创建「客户端密码」：桌面应用是公共客户端，密钥会被任何人从安装包里读到；我们只用 PKCE。
+
+### 二、使用
+
+1. FirthMail →「添加账户」→ 在 Outlook.com 一栏填入这个 ID →「用 Microsoft 账户登录」。
+2. 浏览器里登录并同意（未验证发布者会有一个提示，正常现象）；回到应用后账户自动出现并开始同步。
+
+别人用你的 ID：可以。多租户 + 个人账户的应用，任何用户都能在自己那边完成同意；
+企业/学校租户如果关掉了用户同意，则需要该租户管理员批准一次。
 
 引擎用 PKCE + 本机回环（`http://localhost:<随机端口>/`）接收回调，不需要客户端密钥。
-若登录失败，检查 Azure 应用里是否打开了「允许公共客户端流」（部分租户需要）。
+若登录失败，检查 Azure 应用里是否打开了「允许公共客户端流」、是否正确添加了
+Office 365 Exchange Online 的 IMAP/SMTP 委派权限。
 
 **为什么一定要这个 ID**：OAuth 的授权端点和令牌端点都要校验 `client_id` 和登记过的重定向
 URI——文章里说的「跳转到微软登录页、不暴露密码」指的是用户体验，背后仍然是一次
