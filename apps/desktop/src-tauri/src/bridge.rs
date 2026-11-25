@@ -291,10 +291,14 @@ pub async fn remove_account(engine: State<'_, Engine>, account_id: i64) -> Engin
 }
 
 /// 在系统浏览器里打开一个地址（OAuth 授权页）。
+///
+/// Windows 上用 `cmd /C start`：URL 里的 `&` 是 cmd 的命令分隔符，必须给它
+/// 加引号，否则授权地址会在第一个 `&` 处被截断——微软只会看到
+/// `?response_type=code`，于是回一句 AADSTS900144「缺少 client_id」。
 fn open_in_browser(url: &str) -> std::result::Result<(), String> {
     #[cfg(target_os = "windows")]
     let spawned = std::process::Command::new("cmd")
-        .args(["/C", "start", "", url])
+        .args(["/C", "start", "", &format!("\"{url}\"")])
         .spawn();
     #[cfg(target_os = "macos")]
     let spawned = std::process::Command::new("open").arg(url).spawn();
