@@ -167,11 +167,17 @@ export default function AccountSetup({ onClose, onAdded }: Props) {
 
         <section className="oauth-section">
           <h2>Outlook.com / hotmail.com / Microsoft 365</h2>
-          <p className="form-note">
-            微软已停止这类邮箱的密码登录（IMAP 基本认证），必须用 OAuth。先在 Azure
-            门户注册一个应用（「移动和桌面应用程序」平台，重定向 URI 填
-            <code> http://localhost</code>），把 Application (client) ID 填到下面，再点登录。
-          </p>
+          {!msClientId && (
+            <p className="form-note">
+              微软已停止这类邮箱的密码登录（IMAP 基本认证），登录走 OAuth：点下面的按钮会打开微软的
+              授权页，密码不会经过本应用。OAuth 需要一个应用身份（客户端 ID），在 Azure
+              门户「应用注册」里免费建一个（「移动和桌面应用程序」平台，重定向 URI 填
+              <code> http://localhost</code>），把 Application (client) ID 填到这里，只需填一次。
+            </p>
+          )}
+          {msClientId && (
+            <p className="form-note">已保存客户端 ID，直接点「用 Microsoft 账户登录」即可；要换应用就在下面改。</p>
+          )}
           <label className="oauth-id">
             <span>应用（客户端）ID</span>
             <input

@@ -81,9 +81,21 @@ pub async fn start() -> Result<Core, String> {
             ],
         );
     }
-    Core::start_mail_ui(Paths::new(data_dir, cache_dir))
+    let core = Core::start_mail_ui(Paths::new(data_dir, cache_dir))
         .await
-        .map_err(err)
+        .map_err(err)?;
+    // 内置了客户端 ID 的版本：第一次启动就写进设置，用户不必自己填。
+    if let Some(client_id) = BAKED_MS_CLIENT_ID
+        && !client_id.trim().is_empty()
+    {
+        let settings = core.get_settings().await.map_err(err)?;
+        if settings.ms_client_id.trim().is_empty() {
+            core.set_oauth_apps(None, Some(client_id.to_owned()))
+                .await
+                .map_err(err)?;
+        }
+    }
+    Ok(core)
 }
 
 /// `root/name`, taking over `root/legacy` on the first start after the
@@ -290,6 +302,12 @@ fn open_in_browser(url: &str) -> std::result::Result<(), String> {
     let spawned = std::process::Command::new("xdg-open").arg(url).spawn();
     spawned.map(|_| ()).map_err(|error| error.to_string())
 }
+
+/// 构建时编进安装包的 Microsoft 客户端 ID（`FIRTHMAIL_MS_CLIENT_ID`）。
+///
+/// 有了它，添加 Outlook.com / hotmail.com 账户时不用用户自己注册应用：授权页
+/// 照旧跳微软，只是应用有了身份——Thunderbird 之类内置的就是自己的 client id。
+const BAKED_MS_CLIENT_ID: Option<&str> = option_env!("FIRTHMAIL_MS_CLIENT_ID");
 
 /// The Microsoft application (client) ID saved for OAuth sign-in.
 ///

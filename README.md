@@ -123,6 +123,19 @@ copy target\release\ost2eml.exe apps\desktop\src-tauri\binaries\ost2eml-x86_64-p
 引擎用 PKCE + 本机回环（`http://localhost:<随机端口>/`）接收回调，不需要客户端密钥。
 若登录失败，检查 Azure 应用里是否打开了「允许公共客户端流」（部分租户需要）。
 
+**为什么一定要这个 ID**：OAuth 的授权端点和令牌端点都要校验 `client_id` 和登记过的重定向
+URI——文章里说的「跳转到微软登录页、不暴露密码」指的是用户体验，背后仍然是一次
+应用注册（Thunderbird 之类是把自己的 client id 编进去了）。Azure 应用注册免费、不需要
+订阅，选「任何组织目录中的账户和个人 Microsoft 账户」即可。
+
+想让它对使用者完全透明（不填 ID），构建时把一个 GUID 编进去：
+
+```
+FIRTHMAIL_MS_CLIENT_ID=<你的 Application (client) ID> pnpm tauri build --bundles nsis
+```
+
+第一次启动会写进设置（`ms_client_id`），添加 hotmail 账户时就只剩一个登录按钮。
+
 ## 已读行为
 
 | 操作 | 结果 |
