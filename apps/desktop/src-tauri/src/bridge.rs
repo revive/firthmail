@@ -292,21 +292,59 @@ pub async fn remove_account(engine: State<'_, Engine>, account_id: i64) -> Engin
 
 /// 在系统浏览器里打开一个地址（OAuth 授权页）。
 ///
-/// 不走 `cmd /C start`：授权地址里的 `&` 会被 cmd 当成命令分隔符，地址会从
-/// 第一个 `&` 处被截断（微软只看到 `?response_type=code`，回 AADSTS900144
-/// 「缺少 client_id」）；自己给它加引号又会被 Rust 的转义变成 `\"…\"`，
-/// 浏览器拿到带反斜杠的地址。`explorer.exe` 拿到的是完整参数，交给
-/// ShellExecute 打开默认浏览器，没有 shell 解析这一层。
+/// Windows 上直接调 ShellExecuteW：这是"用默认程序打开这个地址"的官方入口。
+/// 之前两次都绕道 shell —— `cmd /C start` 会把地址里的 `&` 当命令分隔符截断，
+/// 给地址加引号又被 Rust 的参数转义成 `\"…\"`；`explorer.exe` 则把 http 地址
+/// 当成路径，打开的是文件管理器。ShellExecuteW 拿到的就是一个字符串，没有
+/// 任何解析层。
+#[cfg(target_os = "windows")]
 fn open_in_browser(url: &str) -> std::result::Result<(), String> {
-    #[cfg(target_os = "windows")]
-    let spawned = std::process::Command::new("explorer.exe")
-        .arg(url)
-        .spawn()
-        .or_else(|_| {
-            std::process::Command::new("rundll32.exe")
-                .args(["url.dll,FileProtocolHandler", url])
-                .spawn()
-        });
+    use std::os::windows::ffi::OsStrExt;
+
+    #[link(name = "shell32")]
+    unsafe extern "system" {
+        fn ShellExecuteW(
+            hwnd: *mut core::ffi::c_void,
+            operation: *const u16,
+            file: *const u16,
+            parameters: *const u16,
+            directory: *const u16,
+            show: i32,
+        ) -> *mut core::ffi::c_void;
+    }
+    /// SW_SHOWNORMAL
+    const SHOW_NORMAL: i32 = 1;
+
+    fn wide(text: &str) -> Vec<u16> {
+        std::ffi::OsStr::new(text)
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect()
+    }
+
+    let operation = wide("open");
+    let target = wide(url);
+    // SAFETY: 两个字符串都以 NUL 结尾，其余参数是空指针/常量。
+    let result = unsafe {
+        ShellExecuteW(
+            std::ptr::null_mut(),
+            operation.as_ptr(),
+            target.as_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            SHOW_NORMAL,
+        )
+    };
+    // ShellExecuteW returns a value greater than 32 on success.
+    if result as isize > 32 {
+        Ok(())
+    } else {
+        Err(format!("ShellExecuteW 打不开这个地址（返回 {result:p}）"))
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn open_in_browser(url: &str) -> std::result::Result<(), String> {
     #[cfg(target_os = "macos")]
     let spawned = std::process::Command::new("open").arg(url).spawn();
     #[cfg(all(unix, not(target_os = "macos")))]
