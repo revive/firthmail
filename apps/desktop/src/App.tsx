@@ -65,6 +65,8 @@ export default function App() {
    * 按账户集合列同一个视图，让用户在收件箱里看到全部邮件。
    */
   const [merged, setMerged] = useState<{ accountIds: number[]; view: string } | null>(null);
+  /** 当前列表是「本机副本 + 服务器」按路径对应的归并结果。 */
+  const [paired, setPaired] = useState(false);
   const [selectedId, setSelectedId] = useState<number | null>(null);
   const [body, setBody] = useState<EngineMessageDetail | null>(null);
   const [status, setStatus] = useState('启动中…');
@@ -131,6 +133,59 @@ export default function App() {
   const loadingMoreRef = useRef(false);
   const mergedRef = useRef<{ accountIds: number[]; view: string } | null>(null);
   mergedRef.current = merged;
+  /**
+   * 本机副本与 IMAP 文件夹按路径对应（例：两个 "Archives/2015"）。引擎一次只列
+   * 一个文件夹，所以列表由两边各取一页、按日期归并；`pairRef` 保存两边的游标
+   * 和预取的邮件。
+   */
+  const pairRef = useRef<{
+    folders: number[];
+    cursors: ({ date: number; messageId: number } | null)[];
+    buffers: EngineMessage[][];
+    /** 这一边已经取到最后一页了。 */
+    done: boolean[];
+  } | null>(null);
+  const pairMoreRef = useRef(false);
+
+  /** 归并取一页：哪边队首更新就取哪边，两边都没了就没有下一页。 */
+  const nextPairPage = useCallback(async (count: number) => {
+    const pair = pairRef.current;
+    if (!pair) return { items: [] as EngineMessage[], more: false };
+    const items: EngineMessage[] = [];
+    const refill = async (side: number) => {
+      // 第一次进来看的是游标 null（第一页），所以用 done 而不是游标判断结束。
+      while (pair.buffers[side].length === 0 && !pair.done[side]) {
+        const page = await api.listMessages(pair.folders[side], viewRef.current, 100, pair.cursors[side]);
+        pair.buffers[side].push(...page.messages);
+        pair.cursors[side] = page.nextCursor ?? null;
+        pair.done[side] = page.nextCursor == null;
+        if (page.messages.length === 0) {
+          pair.done[side] = true;
+        }
+      }
+    };
+    while (items.length < count) {
+      await refill(0);
+      await refill(1);
+      const [a] = pair.buffers[0];
+      const [b] = pair.buffers[1];
+      if (!a && !b) break;
+      const takeA = a && (!b || a.date >= b.date);
+      items.push((takeA ? pair.buffers[0].shift() : pair.buffers[1].shift())!);
+    }
+    const more =
+      pair.buffers.some((buffer) => buffer.length > 0) || pair.done.some((done) => !done);
+    return { items, more };
+  }, []);
+
+  const appendRows = useCallback((extra: EngineMessage[]) => {
+    if (extra.length === 0) return;
+    setRows((current) => {
+      const known = new Set(current.map((message) => message.id));
+      const fresh = extra.filter((message) => !known.has(message.id));
+      return fresh.length > 0 ? [...current, ...fresh] : current;
+    });
+  }, []);
 
   const loadRows = useCallback(async (fid: number | null, view: string) => {
     // 只在文件夹切换时清空阅读窗格；同文件夹的刷新（事件、删除后）保留它。
@@ -138,41 +193,63 @@ export default function App() {
     const mergedNow = mergedRef.current;
     viewRef.current = mergedNow?.view ?? view;
     try {
-      const page = mergedNow
-        ? await api.listMessagesMerged(mergedNow.accountIds, mergedNow.view, PAGE_SIZE)
-        : await api.listMessages(fid, view, PAGE_SIZE);
-      setRows(page.messages);
-      setNextCursor(page.nextCursor ?? null);
+      if (mergedNow) {
+        const page = await api.listMessagesMerged(mergedNow.accountIds, mergedNow.view, PAGE_SIZE);
+        setRows(page.messages);
+        setNextCursor(page.nextCursor ?? null);
+      } else if (pairRef.current) {
+        pairRef.current.cursors = [null, null];
+        pairRef.current.buffers = [[], []];
+        pairRef.current.done = [false, false];
+        const page = await nextPairPage(PAGE_SIZE);
+        pairMoreRef.current = page.more;
+        setRows(page.items);
+        setNextCursor(null);
+      } else {
+        const page = await api.listMessages(fid, view, PAGE_SIZE);
+        setRows(page.messages);
+        setNextCursor(page.nextCursor ?? null);
+      }
       if (folderChanged) setBody(null);
     } catch (e) {
       setStatus(String(e));
     }
-  }, []);
+  }, [nextPairPage]);
 
   /** 滚到列表底部时加载下一页，追加到现有列表后面。 */
   const loadMore = useCallback(async () => {
-    const cursor = nextCursorRef.current;
-    if (!cursor || loadingMoreRef.current) return;
+    if (loadingMoreRef.current) return;
+    const mergedNow = mergedRef.current;
+    const pairing = pairRef.current;
+    const atEnd = pairing ? !pairMoreRef.current : !nextCursorRef.current;
+    if (atEnd) return;
     loadingMoreRef.current = true;
     setLoadingMore(true);
-    const mergedNow = mergedRef.current;
     try {
-      const page = mergedNow
-        ? await api.listMessagesMerged(mergedNow.accountIds, mergedNow.view, PAGE_SIZE, cursor)
-        : await api.listMessages(folderIdRef.current, viewRef.current, PAGE_SIZE, cursor);
-      setRows((current) => {
-        const known = new Set(current.map((message) => message.id));
-        const extra = page.messages.filter((message) => !known.has(message.id));
-        return extra.length > 0 ? [...current, ...extra] : current;
-      });
-      setNextCursor(page.nextCursor ?? null);
+      if (pairing) {
+        const page = await nextPairPage(PAGE_SIZE);
+        pairMoreRef.current = page.more;
+        appendRows(page.items);
+      } else {
+        const page = mergedNow
+          ? await api.listMessagesMerged(mergedNow.accountIds, mergedNow.view, PAGE_SIZE, nextCursorRef.current)
+          : await api.listMessages(folderIdRef.current, viewRef.current, PAGE_SIZE, nextCursorRef.current);
+        appendRows(page.messages);
+        setNextCursor(page.nextCursor ?? null);
+      }
     } catch (e) {
       setStatus(String(e));
     } finally {
       loadingMoreRef.current = false;
       setLoadingMore(false);
     }
-  }, []);
+  }, [nextPairPage, appendRows]);
+
+  /** 搜索前记下列表模式（合并/本机副本归并），清除搜索时原样恢复。 */
+  const savedListingRef = useRef<{
+    merged: { accountIds: number[]; view: string } | null;
+    pair: typeof pairRef.current;
+  } | null>(null);
 
   /** 引擎 FTS 搜索（支持 from:/to: 等语法），结果替代当前列表。 */
   const runSearch = useCallback(async (query: string) => {
@@ -182,8 +259,11 @@ export default function App() {
       return;
     }
     setSearch(q);
+    savedListingRef.current = { merged: mergedRef.current, pair: pairRef.current };
     mergedRef.current = null;
     setMerged(null);
+    pairRef.current = null;
+    setPaired(false);
     try {
       const list = await api.searchMessages(q);
       setRows(list);
@@ -200,6 +280,14 @@ export default function App() {
   const clearSearch = useCallback(() => {
     setSearch(null);
     setSearchInput('');
+    const saved = savedListingRef.current;
+    if (saved) {
+      mergedRef.current = saved.merged;
+      setMerged(saved.merged);
+      pairRef.current = saved.pair;
+      setPaired(saved.pair != null);
+      savedListingRef.current = null;
+    }
     void loadRows(folderIdRef.current, viewRef.current);
   }, [loadRows]);
 
@@ -696,6 +784,23 @@ export default function App() {
     [accounts, localAccountIds],
   );
 
+  /** 与本机副本按路径对应的那个文件夹（导入的旧邮件就在里面）。 */
+  const mirrorOf = useCallback(
+    (folder: EngineFolder) => {
+      if (accounts.length !== 1 || localAccountIds.length === 0) return null;
+      if (localAccountIds.includes(folder.accountId)) return null;
+      const path = folder.path.toLowerCase();
+      return (
+        folders.find(
+          (candidate) =>
+            localAccountIds.includes(candidate.accountId) &&
+            candidate.path.toLowerCase() === path,
+        ) ?? null
+      );
+    },
+    [accounts.length, localAccountIds, folders],
+  );
+
   /**
    * 多账户时在文件夹树顶部放一个合并收件箱：引擎按 view 列所有账户的
    * 收件箱（不传 accountId），删除/归档/回复仍按每封邮件自己的账户走。
@@ -709,6 +814,8 @@ export default function App() {
         if (search) clearSearch();
         mergedRef.current = null;
         setMerged(null);
+        pairRef.current = null;
+        setPaired(false);
         setFolderId(null);
         void loadRows(null, 'inbox');
       },
@@ -774,6 +881,11 @@ export default function App() {
             const nextMerged = mergedFor(folder);
             mergedRef.current = nextMerged;
             setMerged(nextMerged);
+            const mirror = nextMerged ? null : mirrorOf(folder);
+            pairRef.current = mirror
+              ? { folders: [folder.id, mirror.id], cursors: [null, null], buffers: [[], []], done: [false, false] }
+              : null;
+            setPaired(mirror != null);
             setFolderId(folder.id);
             loadRows(folder.id, viewForRole(folder.role));
           }}
@@ -785,9 +897,11 @@ export default function App() {
               <button className="link" onClick={clearSearch}>× 清除（Esc）</button>
             </div>
           )}
-          {merged && (
+          {(merged || paired) && (
             <div className="merge-banner" role="status">
-              已合并显示本机导入的邮件（同一邮箱）
+              {merged
+                ? '已合并显示本机导入的邮件（同一邮箱）'
+                : '已合并显示这个文件夹的本机副本'}
             </div>
           )}
           <MessageList
