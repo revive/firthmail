@@ -65,8 +65,8 @@ export const api = {
   listFolders: (accountId: number | null) => invoke<EngineFolder[]>('list_folders', { accountId }),
   accountFolderRoles: (accountId: number) =>
     invoke<{ roles: FolderRoleChoiceOut[] }>('account_folder_roles', { accountId }),
-  listMessages: (folderId: number | null, view = 'all', limit = 100) =>
-    invoke<EnginePage>('list_messages', { view, accountId: null, folderId, cursor: null, limit }),
+  listMessages: (folderId: number | null, view = 'all', limit = 100, cursor: { date: number; messageId: number } | null = null) =>
+    invoke<EnginePage>('list_messages', { view, accountId: null, folderId, cursor, limit }),
   getBody: (messageId: number) => invoke<EngineMessageDetail>('get_body', { messageId }),
   performAction: (args: PerformActionArgs) => invoke<{ actionIds: number[] }>('perform_action', { args }),
   emptyTrash: (accountId: number | null) => invoke('empty_trash', { accountId }),

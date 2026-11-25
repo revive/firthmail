@@ -13,6 +13,8 @@
 - **键盘优先**：邮件列表按 `Delete` 直接移入废纸篓（引擎 `ActionKind::Trash`），
   `↑↓/Home/End` 导航、`Ctrl+Q` 标为已读 / `Ctrl+U` 标为未读、
   `Ctrl+R` 回复 / `Ctrl+Shift+R` 全部回复 / `Ctrl+F` 转发
+- **清空**：选中废纸篓或垃圾邮件时，工具栏「清空」可整夹永久删除（二次确认）；
+  废纸篓走引擎 `empty_trash`（服务端枚举整夹），垃圾邮件逐封 `delete_permanently`
 - **自动已读**：阅读窗格里显示满 3 秒自动标为已读（快速翻过不算）——
   时长是 `apps/desktop/src/App.tsx` 的 `AUTO_READ_DELAY_MS`
 - **只做邮件**：IMAP / POP3 / SMTP + TLS；不做日历、日程

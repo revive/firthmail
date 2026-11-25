@@ -131,6 +131,15 @@ body {
   color: #4a4846;
 }
 
+.toolbar-btn.danger:not(:disabled) {
+  color: #a4262c;
+}
+
+.toolbar-btn.danger:hover:not(:disabled) {
+  background: #fde7e9;
+  border-color: #f1c0c4;
+}
+
 .toolbar-sep {
   width: 1px;
   height: 22px;
@@ -754,6 +763,25 @@ body {
   border: none;
   background: #0072c6;
   color: #fff;
+}
+
+.modal-actions button.primary.danger {
+  background: #a4262c;
+}
+
+.modal-actions button.primary.danger:hover:not(:disabled) {
+  background: #8a1f24;
+}
+
+/* ---- confirm dialog ---- */
+
+.modal-confirm {
+  width: 420px;
+}
+
+.confirm-message {
+  color: #605e5c;
+  line-height: 1.7;
 }
 
 .modal-actions button.primary:hover:not(:disabled) {

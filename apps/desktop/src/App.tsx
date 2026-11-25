@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { listen } from '@tauri-apps/api/event';
 import AccountSetup from './components/AccountSetup';
 import { ComposeForm, type ComposeMode } from './components/Composer';
+import ConfirmDialog from './components/ConfirmDialog';
 import FolderTree from './components/FolderTree';
 import ImportModal from './components/ImportModal';
 import MailToolbar from './components/MailToolbar';
@@ -66,6 +67,14 @@ export default function App() {
   const [backendEvents, setBackendEvents] = useState<number | null>(null);
   const [setupOpen, setSetupOpen] = useState(false);
   const [importOpen, setImportOpen] = useState(false);
+  /** 待确认的清空操作：废纸篓/垃圾邮件可以整个清空。 */
+  const [emptyConfirm, setEmptyConfirm] = useState<{
+    id: number;
+    name: string;
+    role: string;
+    accountId: number;
+  } | null>(null);
+  const [emptying, setEmptying] = useState(false);
   /**
    * The open composer. Replies and forwards start inline in the reading pane
    * (the mail list stays put); 「弹出」 or a new message uses its own window.
@@ -395,6 +404,65 @@ export default function App() {
     }
   }, []);
 
+  /** 当前文件夹能整个清空吗：废纸篓和垃圾邮件。 */
+  const activeFolder = useMemo(
+    () => folders.find((folder) => folder.id === folderId) ?? null,
+    [folders, folderId],
+  );
+  const canEmpty = activeFolder?.role === 'trash' || activeFolder?.role === 'spam';
+
+  /**
+   * 清空废纸篓 / 垃圾邮件。
+   *
+   * 废纸篓用引擎的 `empty_trash`：服务端自己枚举整个废件夹（包括本地还没下载的
+   * 邮件）。垃圾邮件没有对应的引擎动作，改为把本地已知的邮件逐批
+   * `delete_permanently`。两者都进引擎的持久队列，由同步在服务端确认。
+   */
+  const runEmptyFolder = useCallback(async () => {
+    const target = emptyConfirm;
+    if (!target) return;
+    setEmptying(true);
+    try {
+      if (target.role === 'trash') {
+        await api.emptyTrash(target.accountId);
+        showToast('已请求清空废纸篓，服务器确认后完成');
+      } else {
+        const ids: number[] = [];
+        let cursor: { date: number; messageId: number } | null = null;
+        for (let round = 0; round < 50; round += 1) {
+          const page = await api.listMessages(target.id, viewForRole(target.role), 200, cursor);
+          ids.push(...page.messages.map((message) => message.id));
+          if (!page.nextCursor || page.messages.length === 0) break;
+          cursor = page.nextCursor;
+        }
+        if (ids.length === 0) {
+          showToast('这个文件夹已经是空的');
+        } else {
+          await api.performAction({
+            kind: 'delete_permanently',
+            target: { messages: ids },
+            params: null,
+          });
+          showToast(`已请求永久删除 ${ids.length} 封邮件`);
+        }
+      }
+      // 清的就是当前文件夹：先把列表清掉，别让人以为没生效。
+      if (folderIdRef.current === target.id) {
+        setRows([]);
+        setSelectedId(null);
+        setBody(null);
+      }
+      await refreshFolders();
+      setStatus(`${target.name} 已请求清空`);
+    } catch (e) {
+      setStatus(String(e));
+      showToast(`清空失败：${String(e)}`);
+    } finally {
+      setEmptying(false);
+      setEmptyConfirm(null);
+    }
+  }, [emptyConfirm, showToast, refreshFolders]);
+
   // The keyboard map. Delete first: that is the one this client exists to
   // get right.
   useEffect(() => {
@@ -502,9 +570,19 @@ export default function App() {
       <MailToolbar
         hasSelection={selectedId != null && !compose}
         isRead={body?.isRead ?? true}
+        canEmpty={canEmpty}
         onNew={startNew}
         onDelete={() => void deleteSelected()}
         onArchive={() => void archiveSelected()}
+        onEmpty={() => {
+          if (!activeFolder) return;
+          setEmptyConfirm({
+            id: activeFolder.id,
+            name: activeFolder.displayName,
+            role: activeFolder.role ?? '',
+            accountId: activeFolder.accountId,
+          });
+        }}
         onReply={() => reply()}
         onReplyAll={() => reply(true)}
         onForward={forward}
@@ -595,6 +673,21 @@ export default function App() {
       </footer>
 
       {toast && <div className="toast" role="status">{toast}</div>}
+      {emptyConfirm && (
+        <ConfirmDialog
+          title={`清空「${emptyConfirm.name}」`}
+          message={
+            emptyConfirm.role === 'trash'
+              ? '这个账户废纸篓里的邮件将被永久删除，无法恢复。'
+              : '这个文件夹里的邮件将被永久删除，无法恢复。'
+          }
+          confirmLabel="清空"
+          danger
+          busy={emptying}
+          onCancel={() => setEmptyConfirm(null)}
+          onConfirm={() => void runEmptyFolder()}
+        />
+      )}
       {importOpen && (
         <ImportModal
           onClose={() => setImportOpen(false)}

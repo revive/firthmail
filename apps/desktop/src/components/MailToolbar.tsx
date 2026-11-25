@@ -56,6 +56,14 @@ const PATHS: Record<string, ReactNode> = {
       <path d="M4 2v2.5h2.5M12 14v-2.5H9.5" />
     </>
   ),
+  empty: (
+    <>
+      <path d="M3 4.5h10" />
+      <path d="M6.5 4.5V3h3v1.5" />
+      <path d="M4.5 4.5l.7 9h5.6l.7-9" />
+      <path d="M6.2 8.5 9.8 11M9.8 8.5 6.2 11" />
+    </>
+  ),
   import: (
     <>
       <path d="M8 3v7" />
@@ -101,9 +109,12 @@ interface Props {
   /** A message is selected, so mail actions apply. */
   hasSelection: boolean;
   isRead: boolean;
+  /** The open folder is Trash or Junk, so it can be emptied. */
+  canEmpty: boolean;
   onNew: () => void;
   onDelete: () => void;
   onArchive: () => void;
+  onEmpty: () => void;
   onReply: () => void;
   onReplyAll: () => void;
   onForward: () => void;
@@ -117,9 +128,11 @@ interface Props {
 export default function MailToolbar({
   hasSelection,
   isRead,
+  canEmpty,
   onNew,
   onDelete,
   onArchive,
+  onEmpty,
   onReply,
   onReplyAll,
   onForward,
@@ -142,6 +155,15 @@ export default function MailToolbar({
       <button className="toolbar-btn" onClick={onArchive} disabled={!hasSelection} title="归档">
         <Icon name="archive" />
         <span>归档</span>
+      </button>
+      <button
+        className="toolbar-btn danger"
+        onClick={onEmpty}
+        disabled={!canEmpty}
+        title="清空当前文件夹（永久删除，不可恢复）"
+      >
+        <Icon name="empty" />
+        <span>清空</span>
       </button>
       <span className="toolbar-sep" />
       <button className="toolbar-btn" onClick={onReply} disabled={!hasSelection} title="回复（Ctrl+R）">
