@@ -93,6 +93,9 @@ cargo build --release -p ost2eml
 copy target\release\ost2eml.exe apps\desktop\src-tauri\binaries\ost2eml-x86_64-pc-windows-msvc.exe
 ```
 
+**转换失败提示「文件被锁定」（os error 33）**：OST 被别的程序占着——除了 Outlook 本身，
+从 Outlook 里打开的 Excel / PowerPoint 也会持有它的锁。全部关掉再试一次。
+
 ## 添加 Outlook.com / hotmail.com 账户
 
 微软自 2022 年起关闭了这类邮箱的**密码登录**（IMAP/POP 基本认证），所以「添加账户」里的

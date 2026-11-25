@@ -627,7 +627,8 @@ pub async fn pick_outlook_file(app: AppHandle) -> EngineResult<Option<String>> {
 }
 
 /// The bundled converter, which Tauri places next to the application binary.
-fn converter_path() -> Result<PathBuf, String> {    let exe = std::env::current_exe().map_err(err)?;
+fn converter_path() -> Result<PathBuf, String> {
+    let exe = std::env::current_exe().map_err(err)?;
     let directory = exe
         .parent()
         .ok_or_else(|| "the application has no directory".to_owned())?;
@@ -665,7 +666,9 @@ async fn run_outlook_import(
     );
 
     // 转换是几分钟的磁盘/CPU 活，放阻塞线程里跑，别堵住异步运行时。
-    let status = tokio::task::spawn_blocking({
+    // 输出要抓下来：GUI 程序没有控制台，转换器自己打印的原因（比如文件被
+    // 别的程序锁住）否则就丢了，用户只能看到一个退出码。
+    let converted = tokio::task::spawn_blocking({
         let converter = converter.clone();
         let ost = ost.clone();
         let out = out.clone();
@@ -673,14 +676,32 @@ async fn run_outlook_import(
             std::process::Command::new(&converter)
                 .arg(&ost)
                 .arg(&out)
-                .status()
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .output()
         }
     })
     .await
     .map_err(err)?
     .map_err(err)?;
-    if !status.success() {
-        return Err(format!("ost2eml 转换失败（退出码 {status}）"));
+    if !converted.status.success() {
+        let mut detail = String::from_utf8_lossy(&converted.stderr).trim().to_owned();
+        if detail.is_empty() {
+            detail = String::from_utf8_lossy(&converted.stdout).trim().to_owned();
+        }
+        // Outlook 的 OST 会被 Outlook 本身和从它打开的 Office 程序占用。
+        let locked = detail.contains("os error 33")
+            || detail.contains("锁定")
+            || detail.to_ascii_lowercase().contains("locked");
+        let hint = if locked {
+            "\n提示：这个数据文件正被其他程序占用。请关闭 Outlook（以及从 Outlook 打开的 Excel / PowerPoint 等），再试一次。"
+        } else {
+            ""
+        };
+        return Err(format!(
+            "ost2eml 转换失败（{}）：{detail}{hint}",
+            converted.status
+        ));
     }
     // 取消发生在转换期间：转换没法中途停下，转换完就别继续导入了。
     if stop.load(Ordering::Relaxed) {
