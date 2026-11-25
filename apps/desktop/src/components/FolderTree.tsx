@@ -22,12 +22,13 @@ interface Props {
   groups: FolderGroup[];
   activeId: number | null;
   onSelect: (folder: EngineFolder) => void;
+  onContextMenu?: (folder: EngineFolder, event: MouseEvent) => void;
   /** 多账户时顶部的合并收件箱；单账户不显示。 */
   unified?: { label: string; active: boolean; onSelect: () => void } | null;
 }
 
 /** 文件夹树：账户分组 + 父子嵌套（默认展开，▸ 可折叠）。 */
-export default function FolderTree({ groups, activeId, onSelect, unified = null }: Props) {
+export default function FolderTree({ groups, activeId, onSelect, onContextMenu, unified = null }: Props) {
   const [collapsed, setCollapsed] = useState<Set<number>>(() => new Set());
   const [collapsedAccounts, setCollapsedAccounts] = useState<Set<string>>(() => new Set());
 
@@ -68,6 +69,11 @@ export default function FolderTree({ groups, activeId, onSelect, unified = null 
               className={`folder-item ${f.id === activeId ? 'active' : ''}`}
               style={indent}
               onClick={() => f.selectable && onSelect(f)}
+              onContextMenu={(event) => {
+                if (!f.selectable) return;
+                event.preventDefault();
+                onContextMenu?.(f, event.nativeEvent);
+              }}
               title={f.path}
             >
               {hasChildren ? (

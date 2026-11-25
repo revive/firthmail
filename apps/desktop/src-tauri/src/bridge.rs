@@ -338,6 +338,22 @@ pub async fn list_folders(
     engine.core.list_folders(account_id).await.map_err(err)
 }
 
+/// 把一个文件夹里的邮件全部标为已读（引擎 `mark_all_read`：本地立即生效，
+/// 并给服务器排一条 `mark_folder_read`，连本地没下载的也一并标记）。
+#[tauri::command]
+pub async fn mark_folder_read(
+    engine: State<'_, Engine>,
+    folder_id: i64,
+    view: Option<String>,
+) -> EngineResult<ActionResult> {
+    let view = view.as_deref().map(parse_view).unwrap_or(View::All);
+    engine
+        .core
+        .mark_all_read(view, None, None, None, None, Some(folder_id))
+        .await
+        .map_err(err)
+}
+
 /// Which folder each special role (sent, trash, ...) resolves to on an
 /// account: the server-suggested one unless the user chose another. The
 /// UI names the exact destination after a delete.

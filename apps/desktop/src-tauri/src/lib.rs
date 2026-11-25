@@ -41,6 +41,7 @@ pub fn run() {
             bridge::cancel_oauth,
             bridge::list_folders,
             bridge::account_folder_roles,
+            bridge::mark_folder_read,
             bridge::list_messages,
             bridge::get_body,
             bridge::perform_action,

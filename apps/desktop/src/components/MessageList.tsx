@@ -15,9 +15,10 @@ interface Props {
   rows: EngineMessage[];
   selectedId: number | null;
   onSelect: (id: number) => void;
+  onContextMenu?: (id: number, event: MouseEvent) => void;
 }
 
-export default function MessageList({ rows, selectedId, onSelect }: Props) {
+export default function MessageList({ rows, selectedId, onSelect, onContextMenu }: Props) {
   const listRef = useRef<HTMLDivElement>(null);
   const selectedRef = useRef<HTMLDivElement>(null);
 
@@ -40,6 +41,10 @@ export default function MessageList({ rows, selectedId, onSelect }: Props) {
           aria-selected={m.id === selectedId}
           className={`message-row ${m.id === selectedId ? 'selected' : ''} ${m.isRead ? '' : 'unread'}`}
           onClick={() => onSelect(m.id)}
+          onContextMenu={(event) => {
+            event.preventDefault();
+            onContextMenu?.(m.id, event.nativeEvent);
+          }}
         >
           <div className="row-main">
             <div className="row-from">

@@ -65,6 +65,9 @@ export const api = {
   listFolders: (accountId: number | null) => invoke<EngineFolder[]>('list_folders', { accountId }),
   accountFolderRoles: (accountId: number) =>
     invoke<{ roles: FolderRoleChoiceOut[] }>('account_folder_roles', { accountId }),
+  /** Mark every message in a folder read (locally now, on the server queued). */
+  markFolderRead: (folderId: number, view: string) =>
+    invoke<{ actionIds: number[] }>('mark_folder_read', { folderId, view }),
   listMessages: (folderId: number | null, view = 'all', limit = 100, cursor: { date: number; messageId: number } | null = null) =>
     invoke<EnginePage>('list_messages', { view, accountId: null, folderId, cursor, limit }),
   getBody: (messageId: number) => invoke<EngineMessageDetail>('get_body', { messageId }),

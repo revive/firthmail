@@ -3,6 +3,7 @@ import { listen } from '@tauri-apps/api/event';
 import AccountSetup from './components/AccountSetup';
 import { ComposeForm, type ComposeMode } from './components/Composer';
 import ConfirmDialog from './components/ConfirmDialog';
+import ContextMenu, { type ContextMenuItem } from './components/ContextMenu';
 import FolderTree from './components/FolderTree';
 import ImportModal from './components/ImportModal';
 import MailToolbar from './components/MailToolbar';
@@ -75,6 +76,12 @@ export default function App() {
     accountId: number;
   } | null>(null);
   const [emptying, setEmptying] = useState(false);
+  /** 右键菜单：文件夹或邮件，位置是视口坐标。 */
+  const [menu, setMenu] = useState<{
+    x: number;
+    y: number;
+    target: { kind: 'folder'; folder: EngineFolder } | { kind: 'message'; isRead: boolean };
+  } | null>(null);
   /**
    * The open composer. Replies and forwards start inline in the reading pane
    * (the mail list stays put); 「弹出」 or a new message uses its own window.
@@ -463,6 +470,75 @@ export default function App() {
     }
   }, [emptyConfirm, showToast, refreshFolders]);
 
+  /** 右键：文件夹菜单（清空 / 全部已读 / 同步）。 */
+  const markFolderRead = useCallback(
+    async (folder: EngineFolder) => {
+      try {
+        await api.markFolderRead(folder.id, viewForRole(folder.role));
+        if (folderIdRef.current === folder.id) {
+          await loadRows(folder.id, viewRef.current);
+        }
+        showToast(`已将「${folder.displayName}」全部标为已读`);
+      } catch (e) {
+        setStatus(String(e));
+        showToast(`操作失败：${String(e)}`);
+      }
+    },
+    [loadRows, showToast],
+  );
+
+  const openFolderMenu = useCallback((folder: EngineFolder, event: MouseEvent) => {
+    setMenu({ x: event.clientX, y: event.clientY, target: { kind: 'folder', folder } });
+  }, []);
+
+  /**
+   * 右键邮件：先把这一封选中（同步改 ref，菜单动作立刻作用在它身上），
+   * 再弹出菜单。`isRead` 一起记下来，菜单文案不会因为正文还没加载而用错。
+   */
+  const openMessageMenu = useCallback(
+    (id: number, isRead: boolean, event: MouseEvent) => {
+      selectedRef.current = id;
+      void openMessage(id);
+      setMenu({ x: event.clientX, y: event.clientY, target: { kind: 'message', isRead } });
+    },
+    [openMessage],
+  );
+
+  const menuItems = useMemo<ContextMenuItem[]>(() => {
+    if (!menu) return [];
+    if (menu.target.kind === 'folder') {
+      const folder = menu.target.folder;
+      const items: ContextMenuItem[] = [];
+      if (folder.role === 'trash' || folder.role === 'spam') {
+        items.push({
+          label: '清空文件夹',
+          danger: true,
+          onSelect: () =>
+            setEmptyConfirm({
+              id: folder.id,
+              name: folder.displayName,
+              role: folder.role ?? '',
+              accountId: folder.accountId,
+            }),
+        });
+      }
+      items.push(
+        { label: '全部标为已读', onSelect: () => void markFolderRead(folder) },
+        { label: '同步', onSelect: () => void syncNow() },
+      );
+      return items;
+    }
+    const { isRead } = menu.target;
+    return [
+      {
+        label: isRead ? '标为未读' : '标为已读',
+        onSelect: () => void setRead(!isRead),
+      },
+      { label: '归档', onSelect: () => void archiveSelected() },
+      { label: '删除', shortcut: 'Delete', danger: true, onSelect: () => void deleteSelected() },
+    ];
+  }, [menu, markFolderRead, syncNow, setRead, archiveSelected, deleteSelected]);
+
   // The keyboard map. Delete first: that is the one this client exists to
   // get right.
   useEffect(() => {
@@ -599,6 +675,7 @@ export default function App() {
           groups={grouped}
           activeId={folderId}
           unified={unifiedInbox}
+          onContextMenu={openFolderMenu}
           onSelect={(folder) => {
             if (search) clearSearch();
             setFolderId(folder.id);
@@ -616,6 +693,10 @@ export default function App() {
             rows={rows}
             selectedId={selectedId}
             onSelect={(id) => openMessage(id)}
+            onContextMenu={(id, event) => {
+              const row = rows.find((message) => message.id === id);
+              openMessageMenu(id, row?.isRead ?? false, event);
+            }}
           />
         </div>
         {/* 阅读区：内嵌回复直接盖在邮件上（邮件仍留在下面，切回不丢草稿）。 */}
@@ -631,6 +712,9 @@ export default function App() {
             onToggleRead={() => {
               if (body) void setRead(toggledReadState(body.isRead));
             }}
+            onContextMenu={
+              body ? (event) => openMessageMenu(body.id, body.isRead, event) : undefined
+            }
           />
           {compose && (
             <ComposeForm
@@ -673,6 +757,9 @@ export default function App() {
       </footer>
 
       {toast && <div className="toast" role="status">{toast}</div>}
+      {menu && menuItems.length > 0 && (
+        <ContextMenu x={menu.x} y={menu.y} items={menuItems} onClose={() => setMenu(null)} />
+      )}
       {emptyConfirm && (
         <ConfirmDialog
           title={`清空「${emptyConfirm.name}」`}

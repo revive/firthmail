@@ -14,6 +14,7 @@ interface Props {
   onDelete: () => void;
   onArchive: () => void;
   onToggleRead: () => void;
+  onContextMenu?: (event: MouseEvent) => void;
 }
 
 const initials = (m: EngineMessageDetail) =>
@@ -28,6 +29,7 @@ export default function ReadingPane({
   onDelete,
   onArchive,
   onToggleRead,
+  onContextMenu,
 }: Props) {
   const [menuOpen, setMenuOpen] = useState(false);
   const menuRef = useRef<HTMLDivElement>(null);
@@ -51,7 +53,15 @@ export default function ReadingPane({
   }
   const date = new Date(message.date);
   return (
-    <section className="reading-pane" aria-label="阅读窗格">
+    <section
+      className="reading-pane"
+      aria-label="阅读窗格"
+      onContextMenu={(event) => {
+        if (!onContextMenu) return;
+        event.preventDefault();
+        onContextMenu(event.nativeEvent);
+      }}
+    >
       <div className="reading-header">
         <h1 className="reading-subject">{message.subject || '(无主题)'}</h1>
         <div className="reading-meta">
