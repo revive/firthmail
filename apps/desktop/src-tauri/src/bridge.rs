@@ -25,6 +25,7 @@ use flectar_mail_core::models::{
 use flectar_mail_core::{Core, MessagePageRequest};
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, State};
+use tauri_plugin_dialog::DialogExt;
 
 /// The running engine, shared by every command.
 pub struct Engine {
@@ -592,9 +593,41 @@ pub async fn import_outlook_file(
     Ok(())
 }
 
+/// The system folder picker, for the import dialog's mail directory.
+#[tauri::command]
+pub async fn pick_folder(app: AppHandle) -> EngineResult<Option<String>> {
+    let picked = tokio::task::spawn_blocking(move || {
+        app.dialog()
+            .file()
+            .set_title("选择邮件目录")
+            .blocking_pick_folder()
+    })
+    .await
+    .map_err(err)?;
+    Ok(picked
+        .and_then(|path| path.into_path().ok())
+        .map(|path| path.to_string_lossy().into_owned()))
+}
+
+/// The system file picker, limited to Outlook data files.
+#[tauri::command]
+pub async fn pick_outlook_file(app: AppHandle) -> EngineResult<Option<String>> {
+    let picked = tokio::task::spawn_blocking(move || {
+        app.dialog()
+            .file()
+            .set_title("选择 Outlook 数据文件（.ost / .pst）")
+            .add_filter("Outlook 数据文件", &["ost", "pst"])
+            .blocking_pick_file()
+    })
+    .await
+    .map_err(err)?;
+    Ok(picked
+        .and_then(|path| path.into_path().ok())
+        .map(|path| path.to_string_lossy().into_owned()))
+}
+
 /// The bundled converter, which Tauri places next to the application binary.
-fn converter_path() -> Result<PathBuf, String> {
-    let exe = std::env::current_exe().map_err(err)?;
+fn converter_path() -> Result<PathBuf, String> {    let exe = std::env::current_exe().map_err(err)?;
     let directory = exe
         .parent()
         .ok_or_else(|| "the application has no directory".to_owned())?;

@@ -13,6 +13,7 @@ use tauri::Manager;
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             let handle = app.handle().clone();
             let core = tauri::async_runtime::block_on(bridge::start())?;
@@ -48,6 +49,8 @@ pub fn run() {
             bridge::empty_trash,
             bridge::sync_now,
             bridge::scan_import,
+            bridge::pick_folder,
+            bridge::pick_outlook_file,
             bridge::import_local_mail,
             bridge::import_outlook_file,
             bridge::cancel_import,

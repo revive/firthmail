@@ -75,6 +75,10 @@ export const api = {
   emptyTrash: (accountId: number | null) => invoke('empty_trash', { accountId }),
   syncNow: () => invoke('sync_now'),
   scanImport: (root: string) => invoke<ScanFolderOut[]>('scan_import', { root }),
+  /** Native folder picker; null when the user cancels. */
+  pickFolder: () => invoke<string | null>('pick_folder'),
+  /** Native file picker limited to .ost/.pst; null when the user cancels. */
+  pickOutlookFile: () => invoke<string | null>('pick_outlook_file'),
   importLocalMail: (
     root: string,
     folders: number[],

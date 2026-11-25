@@ -76,7 +76,8 @@ ost2eml <ost> out-dir --mbox
 
 - **目录**：每封一个 `.eml` 的目录、mbox 或 maildir（比如 `ost2eml` 的导出树），
   可以勾选要导入的文件夹。
-- **Outlook 数据文件**：直接填 `.ost` / `.pst` 路径，应用自带的 `ost2eml` 先转成
+- **Outlook 数据文件**：用「选择…」挑 `.ost` / `.pst`（也可以手填路径），应用自带的
+  `ost2eml` 先转成
   EML 树（放缓存目录，导入完成后删除），再按上面的规则导入。「同步问题」这类
   Outlook 自己的日志文件夹会被跳过。
 

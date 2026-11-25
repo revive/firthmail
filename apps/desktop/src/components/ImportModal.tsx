@@ -77,6 +77,10 @@ export default function ImportModal({ onClose, onImported }: Props) {
 
   const scan = async () => {
     setError(null);
+    if (!root.trim()) {
+      setError('请先选择或填写邮件目录');
+      return;
+    }
     setScanning(true);
     setFolders(null);
     try {
@@ -92,6 +96,41 @@ export default function ImportModal({ onClose, onImported }: Props) {
       setError(String(e));
     } finally {
       setScanning(false);
+    }
+  };
+
+  /** 系统目录选择器；选完顺手扫一遍。 */
+  const chooseRoot = async () => {
+    setError(null);
+    try {
+      const path = await api.pickFolder();
+      if (!path) return;
+      setRoot(path);
+      setFolders(null);
+      setScanning(true);
+      try {
+        const list = await api.scanImport(path);
+        setFolders(list);
+        const next = new Set<number>();
+        for (const f of list) {
+          if (f.selectable && !f.name.includes('同步问题')) next.add(f.index);
+        }
+        setChecked(next);
+      } finally {
+        setScanning(false);
+      }
+    } catch (e) {
+      setError(String(e));
+    }
+  };
+
+  const chooseOutlook = async () => {
+    setError(null);
+    try {
+      const path = await api.pickOutlookFile();
+      if (path) setOutlookPath(path);
+    } catch (e) {
+      setError(String(e));
     }
   };
 
@@ -134,6 +173,7 @@ export default function ImportModal({ onClose, onImported }: Props) {
           邮件目录
           <div className="row">
             <input value={root} onChange={(e) => setRoot(e.target.value)} placeholder="D:\\邮件导出\\eml" />
+            <button onClick={() => void chooseRoot()}>选择…</button>
             <button onClick={() => void scan()} disabled={scanning}>
               {scanning ? '扫描中…' : '扫描'}
             </button>
@@ -215,6 +255,9 @@ export default function ImportModal({ onClose, onImported }: Props) {
               placeholder="C:\\Users\\<你>\\AppData\\Local\\Microsoft\\Outlook\\<账户>.ost"
               spellCheck={false}
             />
+            <button onClick={() => void chooseOutlook()} disabled={importing}>
+              选择…
+            </button>
             <button className="primary" disabled={importing} onClick={() => void startOutlook()}>
               {outlookPhase === 'converting' ? '转换中…' : '转换并导入'}
             </button>
