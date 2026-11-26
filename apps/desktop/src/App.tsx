@@ -18,6 +18,7 @@ import {
   type AutoReadWait,
 } from './readMarking';
 import type { EngineAccount, EngineFolder, EngineMessage, EngineMessageDetail } from './types';
+import { RequestGate } from './selection';
 
 /** The list view for a folder, mirroring the engine app's `view_for_folder`. */
 function viewForRole(role?: string | null): string {
@@ -113,6 +114,10 @@ export default function App() {
   selectedRef.current = selectedId;
   const searchRef = useRef<string | null>(null);
   searchRef.current = search;
+  /** Bumped for every body request, so a slow one can tell it is stale. */
+  const bodyGate = useRef(new RequestGate());
+  /** Bumped for every list load, so a slow folder/search answer is dropped. */
+  const listGate = useRef(new RequestGate());
   const accountsRef = useRef<EngineAccount[]>([]);
   accountsRef.current = accounts;
   /** 阅读窗格里停留够久就自动标已读：记录等待中的邮件，手动切换后不再自动。 */
@@ -192,9 +197,11 @@ export default function App() {
     const folderChanged = fid !== folderIdRef.current;
     const mergedNow = mergedRef.current;
     viewRef.current = mergedNow?.view ?? view;
+    const token = listGate.current.start();
     try {
       if (mergedNow) {
         const page = await api.listMessagesMerged(mergedNow.accountIds, mergedNow.view, PAGE_SIZE);
+        if (!listGate.current.current(token)) return;
         setRows(page.messages);
         setNextCursor(page.nextCursor ?? null);
       } else if (pairRef.current) {
@@ -202,11 +209,13 @@ export default function App() {
         pairRef.current.buffers = [[], []];
         pairRef.current.done = [false, false];
         const page = await nextPairPage(PAGE_SIZE);
+        if (!listGate.current.current(token)) return;
         pairMoreRef.current = page.more;
         setRows(page.items);
         setNextCursor(null);
       } else {
         const page = await api.listMessages(fid, view, PAGE_SIZE);
+        if (!listGate.current.current(token)) return;
         setRows(page.messages);
         setNextCursor(page.nextCursor ?? null);
       }
@@ -225,15 +234,19 @@ export default function App() {
     if (atEnd) return;
     loadingMoreRef.current = true;
     setLoadingMore(true);
+    const token = listGate.current.start();
     try {
       if (pairing) {
         const page = await nextPairPage(PAGE_SIZE);
+        if (!listGate.current.current(token)) return;
         pairMoreRef.current = page.more;
         appendRows(page.items);
       } else {
         const page = mergedNow
           ? await api.listMessagesMerged(mergedNow.accountIds, mergedNow.view, PAGE_SIZE, nextCursorRef.current)
           : await api.listMessages(folderIdRef.current, viewRef.current, PAGE_SIZE, nextCursorRef.current);
+        // 这期间换了文件夹/搜索：这页属于旧列表，别追加进去。
+        if (!listGate.current.current(token)) return;
         appendRows(page.messages);
         setNextCursor(page.nextCursor ?? null);
       }
@@ -264,8 +277,10 @@ export default function App() {
     setMerged(null);
     pairRef.current = null;
     setPaired(false);
+    const token = listGate.current.start();
     try {
       const list = await api.searchMessages(q);
+      if (!listGate.current.current(token)) return;
       setRows(list);
       // 搜索结果不分页（引擎一次给完）。
       setNextCursor(null);
@@ -376,12 +391,34 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  /**
+   * Open a message: mark it selected and load its body.
+   *
+   * Bodies can come from the server, which takes seconds on a slow link. Two
+   * things keep the pane honest while that happens:
+   *
+   * - the body of the previously selected message is dropped immediately, so
+   *   the pane shows 「正在载入邮件…」 instead of the mail before it;
+   * - every request carries a token, and a response for a message the user
+   *   has since clicked away from is ignored (clicking fast used to let a slow
+   *   first request overwrite the newer mail's body).
+   */
   const openMessage = useCallback(async (id: number) => {
+    const switching = selectedRef.current !== id;
+    // Keep the ref in step with the state so the token check below is exact
+    // even before React re-renders.
+    selectedRef.current = id;
     setSelectedId(id);
+    const token = bodyGate.current.start();
+    if (switching) {
+      setBody(null);
+    }
     try {
-      setBody(await api.getBody(id));
+      const detail = await api.getBody(id);
+      if (!bodyGate.current.current(token)) return;
+      setBody(detail);
     } catch (e) {
-      setStatus(String(e));
+      if (bodyGate.current.current(token)) setStatus(String(e));
     }
   }, []);
 
