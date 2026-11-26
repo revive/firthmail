@@ -114,7 +114,11 @@ pub fn get(conn: &Connection, id: i64) -> Result<Option<Account>> {
 pub fn find_by_mailbox(conn: &Connection, email: &str) -> Result<Option<Account>> {
     let email = email.trim();
     let key = mailbox_key(email);
-    let mut statement = conn.prepare("SELECT id, email FROM accounts ORDER BY id")?;
+    // The account holding mail kept on this device has no address: its `email`
+    // is NULL, which must not be read as text (that fails the whole lookup,
+    // e.g. while an OAuth sign-in checks whether the mailbox is new).
+    let mut statement =
+        conn.prepare("SELECT id, email FROM accounts WHERE email IS NOT NULL ORDER BY id")?;
     let accounts = statement
         .query_map([], |row| {
             Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
@@ -489,7 +493,10 @@ pub fn set_signed_in_address(conn: &Connection, id: i64, email: &str) -> Result<
             "{email} is a different mailbox than {previous}"
         )));
     }
-    let mut statement = conn.prepare("SELECT email FROM accounts WHERE id <> ?1")?;
+    // The device-local account has no address (its `email` is NULL); reading
+    // that as text would fail every rename. It can't be another mailbox anyway.
+    let mut statement =
+        conn.prepare("SELECT email FROM accounts WHERE id <> ?1 AND email IS NOT NULL")?;
     let others = statement
         .query_map(params![id], |row| row.get::<_, String>(0))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
