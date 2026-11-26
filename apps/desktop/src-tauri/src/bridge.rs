@@ -23,7 +23,7 @@ use flectar_mail_core::models::{
     PerformActionArgs, Provider, QueueSendArgs, QueueSendResult, SaveDraftArgs, View,
 };
 use flectar_mail_core::{Core, MessagePageRequest};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_dialog::DialogExt;
 
@@ -314,6 +314,145 @@ pub async fn open_external(url: String) -> EngineResult<()> {
         return Err(format!("不支持的链接：{url}"));
     }
     open_in_browser(url.trim()).map_err(err)
+}
+
+// ---- address book ----
+
+/// 一个地址簿条目。
+///
+/// 现在只用到名字和地址；以后的字段（电话、公司、分组……）放进 `extra`，
+/// 读写两侧都原样保留，加字段不必改存储格式，也不丢旧数据。
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AddressBookEntry {
+    pub id: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub email: String,
+    #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]
+    pub extra: serde_json::Map<String, serde_json::Value>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct AddressBookFile {
+    #[serde(default = "address_book_version")]
+    version: u32,
+    #[serde(default)]
+    entries: Vec<AddressBookEntry>,
+}
+
+fn address_book_version() -> u32 {
+    1
+}
+
+/// 序列化读写：同一时刻只有一个命令在改文件。
+static ADDRESS_BOOK_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn address_book_path() -> Result<PathBuf, String> {
+    let data = dirs::data_dir().ok_or("the operating system has no application data directory")?;
+    Ok(data.join(APP_DIR).join("address-book.json"))
+}
+
+fn read_address_book() -> Result<AddressBookFile, String> {
+    let path = address_book_path()?;
+    match std::fs::read(&path) {
+        Ok(bytes) => serde_json::from_slice(&bytes).map_err(err),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(AddressBookFile {
+            version: address_book_version(),
+            entries: Vec::new(),
+        }),
+        Err(error) => Err(err(error)),
+    }
+}
+
+/// 先写临时文件再改名：写一半断电也不会留下半个地址簿。
+fn write_address_book(book: &AddressBookFile) -> Result<(), String> {
+    let path = address_book_path()?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(err)?;
+    }
+    let bytes = serde_json::to_vec_pretty(book).map_err(err)?;
+    let temp = path.with_extension("json.tmp");
+    std::fs::write(&temp, bytes).map_err(err)?;
+    std::fs::rename(&temp, &path).map_err(err)?;
+    Ok(())
+}
+
+/// 地址簿里的全部条目。
+#[tauri::command]
+pub async fn address_book_list() -> EngineResult<Vec<AddressBookEntry>> {
+    let _guard = ADDRESS_BOOK_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    Ok(read_address_book()?.entries)
+}
+
+/// 新增或更新一条（按 id；id 为空时按地址找已有条目）。返回更新后的整份列表。
+#[tauri::command]
+pub async fn address_book_save(entry: AddressBookEntry) -> EngineResult<Vec<AddressBookEntry>> {
+    let _guard = ADDRESS_BOOK_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let email = entry.email.trim().to_owned();
+    if email.is_empty() {
+        return Err("邮件地址不能为空".into());
+    }
+    let mut book = read_address_book()?;
+    let mut saved = AddressBookEntry {
+        id: entry.id.trim().to_owned(),
+        name: entry.name.trim().to_owned(),
+        email: email.clone(),
+        extra: entry.extra,
+    };
+    let existing = if !saved.id.is_empty() {
+        book.entries.iter().position(|item| item.id == saved.id)
+    } else {
+        book.entries
+            .iter()
+            .position(|item| item.email.eq_ignore_ascii_case(&email))
+    };
+    match existing {
+        Some(index) => {
+            saved.id = book.entries[index].id.clone();
+            book.entries[index] = saved;
+        }
+        None => {
+            if saved.id.is_empty() {
+                saved.id = address_book_id();
+            }
+            book.entries.push(saved);
+        }
+    }
+    book.entries
+        .sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()).then(a.email.cmp(&b.email)));
+    write_address_book(&book)?;
+    Ok(book.entries)
+}
+
+/// 删掉一条，返回剩下的列表。
+#[tauri::command]
+pub async fn address_book_remove(id: String) -> EngineResult<Vec<AddressBookEntry>> {
+    let _guard = ADDRESS_BOOK_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut book = read_address_book()?;
+    book.entries.retain(|entry| entry.id != id);
+    write_address_book(&book)?;
+    Ok(book.entries)
+}
+
+fn address_book_id() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_nanos())
+        .unwrap_or(0);
+    let count = COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("{nanos:032x}{count:04x}")
 }
 
 /// 在系统浏览器里打开一个地址（OAuth 授权页）。

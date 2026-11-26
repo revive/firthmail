@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { listen } from '@tauri-apps/api/event';
 import AccountSetup from './components/AccountSetup';
+import AddressBook from './components/AddressBook';
 import { ComposeForm, type ComposeMode } from './components/Composer';
 import ConfirmDialog from './components/ConfirmDialog';
 import ContextMenu, { type ContextMenuItem } from './components/ContextMenu';
@@ -18,6 +19,8 @@ import {
   type AutoReadWait,
 } from './readMarking';
 import type { EngineAccount, EngineFolder, EngineMessage, EngineMessageDetail } from './types';
+import type { EngineAddress } from './types';
+import type { Contact } from './addressBook';
 import { RequestGate } from './selection';
 import { BodyCache } from './bodyCache';
 
@@ -81,6 +84,9 @@ export default function App() {
   const [backendEvents, setBackendEvents] = useState<number | null>(null);
   const [setupOpen, setSetupOpen] = useState(false);
   const [importOpen, setImportOpen] = useState(false);
+  /** 本地地址簿（名字 + 地址），写邮件时用来补全。 */
+  const [contacts, setContacts] = useState<Contact[]>([]);
+  const [addressBookOpen, setAddressBookOpen] = useState(false);
   /** 待确认的清空操作：废纸篓/垃圾邮件可以整个清空。 */
   const [emptyConfirm, setEmptyConfirm] = useState<{
     id: number;
@@ -369,6 +375,11 @@ export default function App() {
 
   const bootstrap = useCallback(async () => {
     try {
+      // 地址簿和邮件无关：读不到也只是没有补全，不该拦住启动。
+      api
+        .addressBookList()
+        .then(setContacts)
+        .catch(() => {});
       const accs = await api.listAccounts();
       setAccounts(accs);
       if (accs.length === 0) {
@@ -610,6 +621,29 @@ export default function App() {
         original: null,
         initialTo: email,
       });
+    },
+    [showToast],
+  );
+
+  /** 把邮件里的地址加进地址簿（同名地址不重复添加）。 */
+  const addToBook = useCallback(
+    async (address: EngineAddress) => {
+      const email = address.email?.trim();
+      if (!email) return;
+      try {
+        const list = await api.addressBookSave({
+          id: '',
+          name: address.name ?? '',
+          email,
+          extra: {},
+        });
+        setContacts(list);
+        showToast(
+          `已加入地址簿：${address.name ? `${address.name} <${email}>` : email}`,
+        );
+      } catch (e) {
+        setStatus(String(e));
+      }
     },
     [showToast],
   );
@@ -1002,6 +1036,7 @@ export default function App() {
         }}
         onSync={() => void syncNow()}
         onImport={() => setImportOpen(true)}
+        onAddressBook={() => setAddressBookOpen(true)}
         onAccounts={() => setSetupOpen(true)}
       />
 
@@ -1070,6 +1105,7 @@ export default function App() {
             }
             onCopied={(text) => showToast(`已复制：${text}`)}
             onComposeAddress={startNewTo}
+            onAddToBook={(address) => void addToBook(address)}
           />
           {compose && (
             <ComposeForm
@@ -1081,6 +1117,7 @@ export default function App() {
               accountId={compose.original?.accountId ?? accounts[0]?.id ?? null}
               ownAddress={ownAddress}
               initialToAddress={compose.initialTo}
+              contacts={contacts}
               onDiscard={() => setCompose(null)}
               onSent={(text) => {
                 setCompose(null);
@@ -1139,6 +1176,13 @@ export default function App() {
             showToast('导入完成');
             await bootstrap();
           }}
+        />
+      )}
+      {addressBookOpen && (
+        <AddressBook
+          contacts={contacts}
+          onClose={() => setAddressBookOpen(false)}
+          onChanged={setContacts}
         />
       )}
       {setupOpen && (

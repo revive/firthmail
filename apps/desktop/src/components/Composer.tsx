@@ -1,5 +1,7 @@
 import { useState } from 'react';
 import { api } from '../api';
+import RecipientInput from './RecipientInput';
+import type { Contact } from '../addressBook';
 import type { EngineMessageDetail } from '../types';
 
 export type ComposeMode = 'reply' | 'forward' | 'new';
@@ -56,6 +58,8 @@ interface FormProps {
   ownAddress?: string | null;
   /** 新邮件的初始收件人（点邮件地址时带上）。 */
   initialToAddress?: string;
+  /** 地址簿，用来给收件人补全。 */
+  contacts?: Contact[];
   onDiscard: () => void;
   onSent: (text: string) => void;
   /** Inline replies can pop out into their own window; absent when already one. */
@@ -74,6 +78,7 @@ export function ComposeForm({
   accountId,
   ownAddress = null,
   initialToAddress,
+  contacts = [],
   onDiscard,
   onSent,
   onPopOut,
@@ -156,15 +161,21 @@ export function ComposeForm({
       <div className="composer-fields">
         <label>
           <span>收件人</span>
-          <input value={to} onChange={(e) => setTo(e.target.value)} placeholder="a@x.com, b@y.com" autoFocus />
+          <RecipientInput
+            value={to}
+            onChange={setTo}
+            contacts={contacts}
+            placeholder="a@x.com, b@y.com"
+            autoFocus
+          />
         </label>
         <label>
           <span>抄送</span>
-          <input value={cc} onChange={(e) => setCc(e.target.value)} />
+          <RecipientInput value={cc} onChange={setCc} contacts={contacts} />
         </label>
         <label>
           <span>密件抄送</span>
-          <input value={bcc} onChange={(e) => setBcc(e.target.value)} />
+          <RecipientInput value={bcc} onChange={setBcc} contacts={contacts} />
         </label>
         <label>
           <span>主题</span>

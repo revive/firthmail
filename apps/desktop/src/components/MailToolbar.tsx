@@ -77,6 +77,13 @@ const PATHS: Record<string, ReactNode> = {
       <path d="M3.5 13a4.7 4.7 0 0 1 9 0" />
     </>
   ),
+  book: (
+    <>
+      <path d="M3 2.5h7.5a1.5 1.5 0 0 1 1.5 1.5v8a1.5 1.5 0 0 1-1.5 1.5H3z" />
+      <path d="M3 2.5v11.5" />
+      <path d="M6 5.5h3.5M6 8h3.5" />
+    </>
+  ),
   more: (
     <>
       <circle cx="3.5" cy="8" r="1" />
@@ -121,6 +128,7 @@ interface Props {
   onToggleRead: () => void;
   onSync: () => void;
   onImport: () => void;
+  onAddressBook: () => void;
   onAccounts: () => void;
 }
 
@@ -139,6 +147,7 @@ export default function MailToolbar({
   onToggleRead,
   onSync,
   onImport,
+  onAddressBook,
   onAccounts,
 }: Props) {
   return (
@@ -201,6 +210,10 @@ export default function MailToolbar({
       <button className="toolbar-btn subtle" onClick={onImport} title="从磁盘导入邮件">
         <Icon name="import" />
         <span>导入</span>
+      </button>
+      <button className="toolbar-btn subtle" onClick={onAddressBook} title="地址簿">
+        <Icon name="book" />
+        <span>地址簿</span>
       </button>
       <button className="toolbar-btn subtle" onClick={onAccounts} title="账户设置">
         <Icon name="account" />

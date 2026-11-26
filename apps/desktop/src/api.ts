@@ -19,6 +19,14 @@ export interface AddAccountInput {
 }
 
 /** One folder a local-mail scan found. */
+/** 地址簿条目：目前只有名字和地址，`extra` 留给以后的字段。 */
+export interface AddressBookEntryOut {
+  id: string;
+  name: string;
+  email: string;
+  extra?: Record<string, unknown>;
+}
+
 export interface ScanFolderOut {
   index: number;
   name: string;
@@ -58,6 +66,11 @@ export const api = {
   showMainWindow: () => invoke('show_main_window'),
   /** 用系统默认程序打开 mailto/http(s) 链接（地址里的 mailto: 用）。 */
   openExternal: (url: string) => invoke('open_external', { url }),
+  /** 本地地址簿（%APPDATA%\FirthMail\address-book.json）。 */
+  addressBookList: () => invoke<AddressBookEntryOut[]>('address_book_list'),
+  addressBookSave: (entry: AddressBookEntryOut) =>
+    invoke<AddressBookEntryOut[]>('address_book_save', { entry }),
+  addressBookRemove: (id: string) => invoke<AddressBookEntryOut[]>('address_book_remove', { id }),
   addAccount: (args: AddAccountInput) => invoke<EngineAccount>('add_account', { args }),
   removeAccount: (accountId: number) => invoke('remove_account', { accountId }),
   /** The Microsoft OAuth application (client) ID saved for Outlook.com sign-in. */

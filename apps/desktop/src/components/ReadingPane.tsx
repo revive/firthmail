@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { Icon } from './MailToolbar';
 import AddressChip from './AddressChip';
-import type { EngineMessageDetail } from '../types';
+import type { EngineAddress, EngineMessageDetail } from '../types';
 import { sanitizeMailHtml } from '../sanitize';
 
 interface Props {
@@ -20,6 +20,8 @@ interface Props {
   onCopied?: (text: string) => void;
   /** 点邮件地址时在应用里写新邮件。 */
   onComposeAddress?: (email: string) => void;
+  /** 把地址加进地址簿。 */
+  onAddToBook?: (address: EngineAddress) => void;
 }
 
 const initials = (m: EngineMessageDetail) =>
@@ -37,6 +39,7 @@ export default function ReadingPane({
   onContextMenu,
   onCopied,
   onComposeAddress,
+  onAddToBook,
 }: Props) {
   const [menuOpen, setMenuOpen] = useState(false);
   const menuRef = useRef<HTMLDivElement>(null);
@@ -80,6 +83,7 @@ export default function ReadingPane({
                 showEmail
                 onCopied={onCopied}
                 onOpen={onComposeAddress}
+                onAddToBook={onAddToBook}
               />
             </div>
             <div className="meta-to">
@@ -87,7 +91,12 @@ export default function ReadingPane({
               {message.to.map((to, index) => (
                 <span key={`to-${to.email}-${index}`}>
                   {index > 0 && '、'}
-                  <AddressChip address={to} onCopied={onCopied} onOpen={onComposeAddress} />
+                  <AddressChip
+                    address={to}
+                    onCopied={onCopied}
+                    onOpen={onComposeAddress}
+                    onAddToBook={onAddToBook}
+                  />
                 </span>
               ))}
               {message.cc.length > 0 && (
@@ -96,7 +105,12 @@ export default function ReadingPane({
                   {message.cc.map((cc, index) => (
                     <span key={`cc-${cc.email}-${index}`}>
                       {index > 0 && '、'}
-                      <AddressChip address={cc} onCopied={onCopied} onOpen={onComposeAddress} />
+                      <AddressChip
+                        address={cc}
+                        onCopied={onCopied}
+                        onOpen={onComposeAddress}
+                        onAddToBook={onAddToBook}
+                      />
                     </span>
                   ))}
                 </>

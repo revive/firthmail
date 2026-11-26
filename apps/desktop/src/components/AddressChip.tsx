@@ -12,13 +12,21 @@ interface Props {
   onCopied?: (text: string) => void;
   /** 点击地址时用它（在应用里写新邮件）；没有才交给系统邮件程序。 */
   onOpen?: (email: string) => void;
+  /** 把这个地址加进地址簿；不给就不显示按钮。 */
+  onAddToBook?: (address: EngineAddress) => void;
 }
 
 /**
  * 一个邮件地址：鼠标移上去右边浮出两个按钮——复制「名字 <地址>」和只复制地址，
  * 地址本身是可以点的 mailto 链接（交给系统默认邮件程序打开，不留在应用里）。
  */
-export default function AddressChip({ address, showEmail = false, onCopied, onOpen }: Props) {
+export default function AddressChip({
+  address,
+  showEmail = false,
+  onCopied,
+  onOpen,
+  onAddToBook,
+}: Props) {
   const [flash, setFlash] = useState<'full' | 'email' | null>(null);
   const name = displayAddress(address);
   const email = address.email?.trim() ?? '';
@@ -84,6 +92,18 @@ export default function AddressChip({ address, showEmail = false, onCopied, onOp
         >
           {flash === 'email' ? '✓' : '@'}
         </button>
+        {onAddToBook && email && (
+          <button
+            type="button"
+            title="加入地址簿"
+            onClick={(event) => {
+              event.stopPropagation();
+              onAddToBook(address);
+            }}
+          >
+            ＋
+          </button>
+        )}
       </span>
     </span>
   );
