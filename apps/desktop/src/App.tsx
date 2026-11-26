@@ -19,6 +19,7 @@ import {
 } from './readMarking';
 import type { EngineAccount, EngineFolder, EngineMessage, EngineMessageDetail } from './types';
 import { RequestGate } from './selection';
+import { BodyCache } from './bodyCache';
 
 /** The list view for a folder, mirroring the engine app's `view_for_folder`. */
 function viewForRole(role?: string | null): string {
@@ -116,6 +117,8 @@ export default function App() {
   searchRef.current = search;
   /** Bumped for every body request, so a slow one can tell it is stale. */
   const bodyGate = useRef(new RequestGate());
+  /** 最近读过的正文，来回翻时秒开。 */
+  const bodyCache = useRef(new BodyCache());
   /** Bumped for every list load, so a slow folder/search answer is dropped. */
   const listGate = useRef(new RequestGate());
   const accountsRef = useRef<EngineAccount[]>([]);
@@ -410,15 +413,21 @@ export default function App() {
     selectedRef.current = id;
     setSelectedId(id);
     const token = bodyGate.current.start();
-    if (switching) {
+    // 最近读过的邮件直接从缓存显示：点回去立刻出现，不用等 IPC + 解析。
+    const cached = bodyCache.current.get(id);
+    if (cached) {
+      setBody(cached);
+      if (bodyCache.current.isFresh(id)) return;
+    } else if (switching) {
       setBody(null);
     }
     try {
       const detail = await api.getBody(id);
       if (!bodyGate.current.current(token)) return;
+      bodyCache.current.set(id, detail);
       setBody(detail);
     } catch (e) {
-      if (bodyGate.current.current(token)) setStatus(String(e));
+      if (bodyGate.current.current(token) && !cached) setStatus(String(e));
     }
   }, []);
 
@@ -502,6 +511,7 @@ export default function App() {
       }
       setRows((list) => list.map((m) => (m.id === id ? { ...m, isRead: read } : m)));
       setBody((current) => (current && current.id === id ? { ...current, isRead: read } : current));
+      bodyCache.current.patch(id, { isRead: read });
     },
     [act],
   );
