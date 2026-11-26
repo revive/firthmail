@@ -106,6 +106,8 @@ export default function App() {
     replyAll: boolean;
     inline: boolean;
     original: EngineMessageDetail | null;
+    /** 新邮件预填的收件人（点邮件地址进来时）。 */
+    initialTo?: string;
   } | null>(null);
 
   const folderIdRef = useRef<number | null>(null);
@@ -573,6 +575,25 @@ export default function App() {
     setCompose({ mode: 'new', replyAll: false, inline: false, original: null });
   }, [showToast]);
 
+  /** 点邮件里的地址：用应用自己的写邮件窗口，而不是甩给系统默认程序。 */
+  const startNewTo = useCallback(
+    (email: string) => {
+      if (accountsRef.current.length === 0) {
+        showToast('请先添加账户');
+        setSetupOpen(true);
+        return;
+      }
+      setCompose({
+        mode: 'new',
+        replyAll: false,
+        inline: false,
+        original: null,
+        initialTo: email,
+      });
+    },
+    [showToast],
+  );
+
   const reply = useCallback(
     (all = false) => {
       if (!body) {
@@ -1014,16 +1035,18 @@ export default function App() {
               body ? (event) => openMessageMenu(body.id, body.isRead, event) : undefined
             }
             onCopied={(text) => showToast(`已复制：${text}`)}
+            onComposeAddress={startNewTo}
           />
           {compose && (
             <ComposeForm
               // 换了要回的信（或新邮件）就换一份草稿，别留着上一封的内容。
-              key={`${compose.mode}-${compose.original?.id ?? 'new'}`}
+              key={`${compose.mode}-${compose.original?.id ?? 'new'}-${compose.initialTo ?? ''}`}
               mode={compose.mode}
               replyAll={compose.replyAll}
               original={compose.original}
               accountId={compose.original?.accountId ?? accounts[0]?.id ?? null}
               ownAddress={ownAddress}
+              initialToAddress={compose.initialTo}
               onDiscard={() => setCompose(null)}
               onSent={(text) => {
                 setCompose(null);

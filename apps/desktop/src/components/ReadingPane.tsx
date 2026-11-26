@@ -18,6 +18,8 @@ interface Props {
   onContextMenu?: (event: MouseEvent) => void;
   /** 复制地址后回显一句（状态栏/吐司）。 */
   onCopied?: (text: string) => void;
+  /** 点邮件地址时在应用里写新邮件。 */
+  onComposeAddress?: (email: string) => void;
 }
 
 const initials = (m: EngineMessageDetail) =>
@@ -34,6 +36,7 @@ export default function ReadingPane({
   onToggleRead,
   onContextMenu,
   onCopied,
+  onComposeAddress,
 }: Props) {
   const [menuOpen, setMenuOpen] = useState(false);
   const menuRef = useRef<HTMLDivElement>(null);
@@ -72,14 +75,19 @@ export default function ReadingPane({
           <span className="avatar" aria-hidden="true">{initials(message)}</span>
           <div className="meta-text">
             <div className="meta-from">
-              <AddressChip address={message.from} showEmail onCopied={onCopied} />
+              <AddressChip
+                address={message.from}
+                showEmail
+                onCopied={onCopied}
+                onOpen={onComposeAddress}
+              />
             </div>
             <div className="meta-to">
               收件人：
               {message.to.map((to, index) => (
                 <span key={`to-${to.email}-${index}`}>
                   {index > 0 && '、'}
-                  <AddressChip address={to} onCopied={onCopied} />
+                  <AddressChip address={to} onCopied={onCopied} onOpen={onComposeAddress} />
                 </span>
               ))}
               {message.cc.length > 0 && (
@@ -88,7 +96,7 @@ export default function ReadingPane({
                   {message.cc.map((cc, index) => (
                     <span key={`cc-${cc.email}-${index}`}>
                       {index > 0 && '、'}
-                      <AddressChip address={cc} onCopied={onCopied} />
+                      <AddressChip address={cc} onCopied={onCopied} onOpen={onComposeAddress} />
                     </span>
                   ))}
                 </>

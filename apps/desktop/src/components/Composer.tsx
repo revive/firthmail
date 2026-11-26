@@ -5,7 +5,12 @@ import type { EngineMessageDetail } from '../types';
 export type ComposeMode = 'reply' | 'forward' | 'new';
 
 /** Where a reply starts: the sender, or everyone the original reached. */
-function initialTo(mode: ComposeMode, original: EngineMessageDetail | null): string {
+function initialTo(
+  mode: ComposeMode,
+  original: EngineMessageDetail | null,
+  prefilled?: string,
+): string {
+  if (mode === 'new') return prefilled?.trim() ?? '';
   return mode === 'reply' && original ? (original.from.email ?? '') : '';
 }
 
@@ -49,6 +54,8 @@ interface FormProps {
   accountId: number | null;
   /** This account's own address, left out of a reply-all. */
   ownAddress?: string | null;
+  /** 新邮件的初始收件人（点邮件地址时带上）。 */
+  initialToAddress?: string;
   onDiscard: () => void;
   onSent: (text: string) => void;
   /** Inline replies can pop out into their own window; absent when already one. */
@@ -66,11 +73,12 @@ export function ComposeForm({
   original,
   accountId,
   ownAddress = null,
+  initialToAddress,
   onDiscard,
   onSent,
   onPopOut,
 }: FormProps) {
-  const [to, setTo] = useState(() => initialTo(mode, original));
+  const [to, setTo] = useState(() => initialTo(mode, original, initialToAddress));
   const [cc, setCc] = useState(() => initialCc(mode, replyAll, original, ownAddress));
   const [bcc, setBcc] = useState('');
   const [subject, setSubject] = useState(() => subjectOf(mode, original));
