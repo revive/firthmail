@@ -62,16 +62,48 @@ body {
   font-weight: 700;
 }
 
-.search {
+.search-box {
+  position: relative;
   flex: 1;
   max-width: 480px;
+  display: flex;
+}
+
+.search {
+  flex: 1;
   height: 30px;
-  padding: 0 12px;
+  padding: 0 32px 0 12px;
   border: 1px solid #c8c6c4;
   border-radius: 4px;
   background: #ffffff;
   font: inherit;
   color: inherit;
+}
+
+/* 搜索框里的清除按钮：有内容或正在显示搜索结果时出现。 */
+.search-clear {
+  position: absolute;
+  right: 5px;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 20px;
+  height: 20px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border: none;
+  border-radius: 50%;
+  background: transparent;
+  color: #605e5c;
+  font-size: 15px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.search-clear:hover {
+  background: #edebe9;
+  color: #242424;
 }
 
 .search:focus {

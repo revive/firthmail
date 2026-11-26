@@ -271,6 +271,26 @@ export default function App() {
     pair: typeof pairRef.current;
   } | null>(null);
 
+  /**
+   * 动作（删除、归档……）之后刷新列表。
+   *
+   * 正在搜索时列表就是搜索结果：重新跑一次搜索，而不是把人踢回文件夹列表。
+   */
+  const reloadCurrent = useCallback(async () => {
+    const query = searchRef.current;
+    if (!query) {
+      await loadRows(folderIdRef.current, viewRef.current);
+      return;
+    }
+    try {
+      const list = await api.searchMessages(query);
+      if (searchRef.current !== query) return;
+      setRows(list);
+    } catch (e) {
+      setStatus(String(e));
+    }
+  }, [loadRows]);
+
   /** 引擎 FTS 搜索（支持 from:/to: 等语法），结果替代当前列表。 */
   const runSearch = useCallback(async (query: string) => {
     const q = query.trim();
@@ -495,7 +515,7 @@ export default function App() {
       setSelectedId(null);
       setBody(null);
     }
-    await loadRows(folderIdRef.current, viewRef.current);
+    await reloadCurrent();
     await refreshFolders();
     // 有些服务器有两个废件夹（如 Trash 与 [根]/Trash）；提示里写明
     // 引擎实际选择的那个，免得去另一个文件夹里找不到。
@@ -515,7 +535,7 @@ export default function App() {
     }
     showToast(target ? `已移入废纸篓（${target}）` : '已移入废纸篓');
     refreshUnread();
-  }, [act, openMessage, showToast, loadRows, refreshFolders, refreshUnread]);
+  }, [act, openMessage, showToast, reloadCurrent, refreshFolders, refreshUnread]);
 
   /**
    * Mark the selected message read (`mark_read`) or unread (`mark_unread`)
@@ -634,10 +654,10 @@ export default function App() {
       setSelectedId(null);
       setBody(null);
     }
-    await loadRows(folderIdRef.current, viewRef.current);
+    await reloadCurrent();
     await refreshFolders();
     showToast('已归档');
-  }, [act, openMessage, loadRows, refreshFolders, showToast]);
+  }, [act, openMessage, reloadCurrent, refreshFolders, showToast]);
 
   const syncNow = useCallback(async () => {
     setStatus('正在同步…');
@@ -930,18 +950,32 @@ export default function App() {
           <span className="brand-logo" aria-hidden="true">F</span>
           FirthMail
         </div>
-        <input
-          className="search"
-          placeholder="搜索邮件（Enter 确认；支持 from:/to: 语法）"
-          aria-label="搜索邮件"
-          value={searchInput}
-          onChange={(e) => setSearchInput(e.target.value)}
-          onKeyDown={(e) => {
-            if (e.key === 'Enter') {
-              void runSearch(searchInput);
-            }
-          }}
-        />
+        <div className="search-box">
+          <input
+            className="search"
+            placeholder="搜索邮件（Enter 确认；支持 from:/to: 语法）"
+            aria-label="搜索邮件"
+            value={searchInput}
+            onChange={(e) => setSearchInput(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter') {
+                void runSearch(searchInput);
+              } else if (e.key === 'Escape' && (searchInput || search)) {
+                clearSearch();
+              }
+            }}
+          />
+          {(searchInput || search) && (
+            <button
+              className="search-clear"
+              title="清除搜索（Esc）"
+              aria-label="清除搜索"
+              onClick={() => clearSearch()}
+            >
+              ×
+            </button>
+          )}
+        </div>
       </header>
 
       <MailToolbar
