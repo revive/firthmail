@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import { Icon } from './MailToolbar';
+import AddressChip from './AddressChip';
 import type { EngineMessageDetail } from '../types';
 import { sanitizeMailHtml } from '../sanitize';
 
@@ -15,6 +16,8 @@ interface Props {
   onArchive: () => void;
   onToggleRead: () => void;
   onContextMenu?: (event: MouseEvent) => void;
+  /** 复制地址后回显一句（状态栏/吐司）。 */
+  onCopied?: (text: string) => void;
 }
 
 const initials = (m: EngineMessageDetail) =>
@@ -30,6 +33,7 @@ export default function ReadingPane({
   onArchive,
   onToggleRead,
   onContextMenu,
+  onCopied,
 }: Props) {
   const [menuOpen, setMenuOpen] = useState(false);
   const menuRef = useRef<HTMLDivElement>(null);
@@ -68,12 +72,27 @@ export default function ReadingPane({
           <span className="avatar" aria-hidden="true">{initials(message)}</span>
           <div className="meta-text">
             <div className="meta-from">
-              {message.from.name ?? message.from.email ?? '(无名发件人)'}
-              <span className="meta-address"> &lt;{message.from.email ?? ''}&gt;</span>
+              <AddressChip address={message.from} showEmail onCopied={onCopied} />
             </div>
             <div className="meta-to">
-              收件人：{message.to.map((t) => t.name ?? t.email).join('、')}
-              {message.cc.length > 0 && `；抄送：${message.cc.map((t) => t.name ?? t.email).join('、')}`}
+              收件人：
+              {message.to.map((to, index) => (
+                <span key={`to-${to.email}-${index}`}>
+                  {index > 0 && '、'}
+                  <AddressChip address={to} onCopied={onCopied} />
+                </span>
+              ))}
+              {message.cc.length > 0 && (
+                <>
+                  ；抄送：
+                  {message.cc.map((cc, index) => (
+                    <span key={`cc-${cc.email}-${index}`}>
+                      {index > 0 && '、'}
+                      <AddressChip address={cc} onCopied={onCopied} />
+                    </span>
+                  ))}
+                </>
+              )}
             </div>
           </div>
           <div className="reading-side">

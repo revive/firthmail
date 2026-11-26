@@ -300,6 +300,22 @@ pub fn show_main_window(app: AppHandle) {
     }
 }
 
+/// 用系统默认程序打开一个外部链接（邮件地址的 mailto:）。
+///
+/// 只放行 mailto/http/https：这个入口会被邮件内容里的地址触发，不能让它
+/// 变成"打开任意本地程序"的通道。
+#[tauri::command]
+pub async fn open_external(url: String) -> EngineResult<()> {
+    let lowered = url.trim().to_ascii_lowercase();
+    let allowed = ["mailto:", "http://", "https://"]
+        .iter()
+        .any(|scheme| lowered.starts_with(scheme));
+    if !allowed {
+        return Err(format!("不支持的链接：{url}"));
+    }
+    open_in_browser(url.trim()).map_err(err)
+}
+
 /// 在系统浏览器里打开一个地址（OAuth 授权页）。
 ///
 /// Windows 上直接调 ShellExecuteW：这是"用默认程序打开这个地址"的官方入口。

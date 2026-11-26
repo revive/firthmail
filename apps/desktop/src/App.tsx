@@ -1013,6 +1013,7 @@ export default function App() {
             onContextMenu={
               body ? (event) => openMessageMenu(body.id, body.isRead, event) : undefined
             }
+            onCopied={(text) => showToast(`已复制：${text}`)}
           />
           {compose && (
             <ComposeForm

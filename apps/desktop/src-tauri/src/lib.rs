@@ -53,6 +53,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             bridge::list_accounts,
             bridge::show_main_window,
+            bridge::open_external,
             bridge::add_account,
             bridge::remove_account,
             bridge::oauth_client_id,
