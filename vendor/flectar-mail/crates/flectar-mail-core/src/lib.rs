@@ -1079,6 +1079,36 @@ impl Core {
         oauth_redirects: OAuthRedirectBrokerHandle,
         enable_embeddings: bool,
     ) -> Result<Core> {
+        // 启动耗时分段（FIRTHMAIL_TIMING=1 时写进数据目录的 startup-timing.log）：
+        // 界面在引擎起来之前是空窗，哪一段慢决定启动体验。
+        let timing = std::env::var_os("FIRTHMAIL_TIMING").is_some();
+        let started_at = std::time::Instant::now();
+        let timing_log = timing.then(|| {
+            std::env::var_os("APPDATA")
+                .map(|root| std::path::PathBuf::from(root).join("FirthMail/startup-timing.log"))
+        });
+        if let Some(Some(path)) = &timing_log {
+            let _ = std::fs::write(path, b"");
+        }
+        macro_rules! mark {
+            ($name:expr) => {
+                if let Some(Some(path)) = &timing_log {
+                    use std::io::Write as _;
+                    if let Ok(mut file) = std::fs::OpenOptions::new()
+                        .append(true)
+                        .create(true)
+                        .open(path)
+                    {
+                        let _ = writeln!(
+                            file,
+                            "{:>8.1}ms  {}",
+                            started_at.elapsed().as_secs_f64() * 1000.0,
+                            $name
+                        );
+                    }
+                }
+            };
+        }
         tracing::info!(
             data_dir = %paths.data_dir.display(),
             cache_dir = %paths.cache_dir.display(),
@@ -1099,6 +1129,7 @@ impl Core {
                 mail_db_path.display()
             ))
         })?;
+        mark!("Db::open (migrations + backfill)");
         // Product databases are opened by their first operation, not by Core construction.
         let calendar_db = Db::deferred_calendar(paths.calendar_db_file());
         let files_db = Db::deferred_files(paths.files_db_file());
@@ -1138,6 +1169,7 @@ impl Core {
         // calendar stores, then remove calendar rows that predate the durable
         // operation journal and no longer have a mail account owner.
         core.recover_cross_store_state().await?;
+        mark!("recover_cross_store_state");
         if core.paths.files_db_file().exists()
             || core
                 .db
@@ -1151,19 +1183,35 @@ impl Core {
                 .await?
         {
             core.recover_files().await?;
+            mark!("recover_files");
             core.files_db.release_idle_connections().await?;
         }
-        let removed_staged_files = core.cleanup_orphaned_draft_files().await?;
-        if removed_staged_files > 0 {
-            tracing::info!(removed_staged_files, "removed orphaned draft staging files");
+        // 清理孤儿草稿附件和中断写入的邮件原件要看整个邮件目录（几万个文件），
+        // 放在启动关键路径上会让窗口空着等一两秒。这些文件本来也不影响本次启动，
+        // 挪到后台跑。
+        {
+            let core = core.clone();
+            tokio::spawn(async move {
+                let removed_staged_files = match core.cleanup_orphaned_draft_files().await {
+                    Ok(removed) => removed,
+                    Err(error) => {
+                        tracing::warn!(%error, "could not clean orphaned draft files");
+                        0
+                    }
+                };
+                if removed_staged_files > 0 {
+                    tracing::info!(removed_staged_files, "removed orphaned draft staging files");
+                }
+                match core.remove_interrupted_mail_files().await {
+                    Ok(removed) if removed > 0 => {
+                        tracing::info!(removed, "removed interrupted mail files")
+                    }
+                    Ok(_) => {}
+                    Err(error) => tracing::warn!(%error, "could not remove interrupted mail files"),
+                }
+            });
         }
-        let removed_mail_files = core.remove_interrupted_mail_files().await?;
-        if removed_mail_files > 0 {
-            tracing::info!(
-                removed_mail_files,
-                "removed files of interrupted mail writes"
-            );
-        }
+        mark!("cleanup (deferred to background)");
 
         // Make saved OAuth app registrations available before any actor
         // needs a token refresh.
@@ -1224,6 +1272,7 @@ impl Core {
                     )?)
                 })
                 .await?;
+        mark!("scheduler_has_existing_work");
 
         // Recovery and migration can leave both SQLite page caches warm after
         // scanning a large mailbox. Foreground startup needs only a small page
@@ -1404,6 +1453,7 @@ impl Core {
             tokio::spawn(async move { c.cleanup_loop().await });
         }
 
+        mark!("start_with_platform done");
         Ok(core)
     }
 

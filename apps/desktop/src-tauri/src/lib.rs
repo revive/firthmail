@@ -38,11 +38,21 @@ pub fn run() {
             });
 
             app.manage(bridge::Engine::new(core.clone()));
-            bridge::forward_events(core, handle);
+            bridge::forward_events(core, handle.clone());
+
+            // 窗口默认隐藏、由前端渲染完第一帧后显示；前端要是没起来（脚本出错、
+            // WebView 异常），四秒后无论如何都显示出来，免得应用"启动但看不见"。
+            tauri::async_runtime::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_secs(4)).await;
+                if let Some(window) = handle.get_webview_window("main") {
+                    let _ = window.show();
+                }
+            });
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             bridge::list_accounts,
+            bridge::show_main_window,
             bridge::add_account,
             bridge::remove_account,
             bridge::oauth_client_id,

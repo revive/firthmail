@@ -54,6 +54,8 @@ export interface FolderRoleChoiceOut {
 
 export const api = {
   listAccounts: () => invoke<EngineAccount[]>('list_accounts'),
+  /** 第一帧渲染完后显示主窗口（窗口在配置里默认隐藏）。 */
+  showMainWindow: () => invoke('show_main_window'),
   addAccount: (args: AddAccountInput) => invoke<EngineAccount>('add_account', { args }),
   removeAccount: (accountId: number) => invoke('remove_account', { accountId }),
   /** The Microsoft OAuth application (client) ID saved for Outlook.com sign-in. */

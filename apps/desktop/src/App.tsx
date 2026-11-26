@@ -328,6 +328,10 @@ export default function App() {
   }, [loadRows, refreshFolders]);
 
   useEffect(() => {
+    // 窗口在配置里是隐藏的：等第一帧画好再显示，避免启动时先闪一块空白黑窗。
+    window.requestAnimationFrame(() => {
+      void api.showMainWindow().catch(() => {});
+    });
     bootstrap();
     // 事件链诊断：10 秒后问一次后端转发器收到了多少（前端计数与它对比）。
     const diagTimer = window.setTimeout(() => {

@@ -24,7 +24,7 @@ use flectar_mail_core::models::{
 };
 use flectar_mail_core::{Core, MessagePageRequest};
 use serde::Serialize;
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_dialog::DialogExt;
 
 /// The running engine, shared by every command.
@@ -288,6 +288,16 @@ pub async fn add_account(
 #[tauri::command]
 pub async fn remove_account(engine: State<'_, Engine>, account_id: i64) -> EngineResult<()> {
     engine.core.remove_account(account_id).await.map_err(err)
+}
+
+/// 界面渲染完第一帧后调用：窗口在配置里是隐藏的，这样启动时不会先闪一块
+/// 空白的黑窗；等这里把它显示出来时，内容已经在了。
+#[tauri::command]
+pub fn show_main_window(app: AppHandle) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.show();
+        let _ = window.set_focus();
+    }
 }
 
 /// 在系统浏览器里打开一个地址（OAuth 授权页）。

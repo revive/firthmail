@@ -290,15 +290,12 @@ fn prepare_store(
     migrate: impl FnOnce(&mut Connection) -> Result<()>,
 ) -> Result<()> {
     // A clean final SQLite close removes WAL/journal sidecars. Their presence
-    // before opening is therefore a cheap dirty-shutdown signal. Do the O(n)
-    // scan only then, or after a schema change, never on every normal launch.
-    let recovered_dirty_state =
-        sqlite_sidecar(path, "-wal").exists() || sqlite_sidecar(path, "-journal").exists();
+    // before opening is therefore a cheap dirty-shutdown signal. The O(n)
+    // integrity scan for it runs in the background (see `Db::open`): on a
+    // 650 MB mailbox it costs over a second, and the window would sit empty
+    // while it ran.
     let mut conn = open_connection(path, kind)?;
     let version_before: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
-    if recovered_dirty_state {
-        quick_check(&conn, store)?;
-    }
     migrate(&mut conn)?;
     // SQLite 3.46+ bounds the ANALYZE work performed by optimize. The 0x10000
     // bit also considers tables that this short-lived preparation connection
@@ -309,6 +306,32 @@ fn prepare_store(
         quick_check(&conn, store)?;
     }
     Ok(())
+}
+
+/// After an unclean shutdown, verify the store once without holding up startup.
+fn check_after_dirty_shutdown(path: &Path, store: &'static str) {
+    let path = path.to_path_buf();
+    std::thread::spawn(move || {
+        let Ok(conn) = Connection::open_with_flags(
+            &path,
+            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        ) else {
+            return;
+        };
+        let _ = conn.busy_timeout(std::time::Duration::from_secs(30));
+        match conn
+            .pragma_query_value(None, "quick_check", |row| row.get::<_, String>(0))
+            .map(|result| result.eq_ignore_ascii_case("ok"))
+        {
+            Ok(true) => {}
+            Ok(false) => tracing::error!(store, "database quick_check failed after an unclean shutdown"),
+            Err(error) => tracing::warn!(
+                store,
+                %error,
+                "could not run the post-shutdown database check"
+            ),
+        }
+    });
 }
 
 impl Db {
@@ -444,11 +467,17 @@ impl Db {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
+        // Judged before the preparation connection opens: it may checkpoint and
+        // remove the sidecars.
+        let dirty = sqlite_sidecar(path, "-wal").exists() || sqlite_sidecar(path, "-journal").exists();
         // Run migrations on a throwaway connection before the threads start.
         prepare_store(path, StoreKind::Mail, "mail", |conn| {
             migrations::run(conn)?;
             repo::contacts::backfill_folded(conn)
         })?;
+        if dirty {
+            check_after_dirty_shutdown(path, "mail");
+        }
         let write_tx = spawn_conn_thread(path.to_path_buf(), "writer", StoreKind::Mail, false)?;
         let read_tx = spawn_conn_thread(path.to_path_buf(), "reader", StoreKind::Mail, true)?;
         Ok(Db {
