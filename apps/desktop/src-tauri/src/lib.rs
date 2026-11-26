@@ -60,6 +60,7 @@ pub fn run() {
             bridge::start_microsoft_login,
             bridge::cancel_oauth,
             bridge::list_folders,
+            bridge::folder_unread_counts,
             bridge::account_folder_roles,
             bridge::mark_folder_read,
             bridge::list_messages,

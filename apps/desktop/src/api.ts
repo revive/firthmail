@@ -65,6 +65,8 @@ export const api = {
   startMicrosoftLogin: () => invoke<EngineAccount>('start_microsoft_login'),
   cancelOauth: () => invoke<void>('cancel_oauth'),
   listFolders: (accountId: number | null) => invoke<EngineFolder[]>('list_folders', { accountId }),
+  /** 每个文件夹的未读数：[folderId, unread][]；没有未读的文件夹不在结果里。 */
+  folderUnreadCounts: () => invoke<[number, number][]>('folder_unread_counts'),
   accountFolderRoles: (accountId: number) =>
     invoke<{ roles: FolderRoleChoiceOut[] }>('account_folder_roles', { accountId }),
   /** Mark every message in a folder read (locally now, on the server queued). */

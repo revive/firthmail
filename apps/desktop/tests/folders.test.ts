@@ -4,7 +4,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
-import { byRoleThenName, roleRank, sortFolders } from '../src/folders.ts';
+import { byRoleThenName, roleRank, sortFolders, unreadLabel } from '../src/folders.ts';
 import type { EngineFolder } from '../src/types.ts';
 
 /** A folder, with just the fields the order looks at. */
@@ -59,4 +59,17 @@ test('the source array is left alone', () => {
   const list = [folder(1, 'z'), folder(2, 'a')];
   sortFolders(list);
   assert.deepEqual(names(list), ['z', 'a']);
+});
+
+test('a folder with no unread mail shows no number', () => {
+  assert.equal(unreadLabel(0), null);
+  assert.equal(unreadLabel(undefined), null);
+  assert.equal(unreadLabel(-3), null);
+});
+
+test('unread mail shows its count in brackets, capped for huge mailboxes', () => {
+  assert.equal(unreadLabel(1), ' (1)');
+  assert.equal(unreadLabel(42), ' (42)');
+  assert.equal(unreadLabel(999), ' (999)');
+  assert.equal(unreadLabel(1000), ' (999+)');
 });

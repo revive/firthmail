@@ -25,3 +25,17 @@ export function byRoleThenName(a: EngineFolder, b: EngineFolder): number {
 export function sortFolders(folders: EngineFolder[]): EngineFolder[] {
   return [...folders].sort(byRoleThenName);
 }
+
+/** 超过这个数就显示成 `999+`，免得一个导入的收件箱把侧栏撑开。 */
+export const UNREAD_DISPLAY_CAP = 999;
+
+/**
+ * The 「(12)」 after a folder name, or null when there is nothing to show.
+ *
+ * Zero is hidden rather than written as 「(0)」: the tree is scanned for what
+ * needs attention, and a column of zeroes is noise.
+ */
+export function unreadLabel(count: number | null | undefined): string | null {
+  if (!count || count <= 0) return null;
+  return count > UNREAD_DISPLAY_CAP ? ` (${UNREAD_DISPLAY_CAP}+)` : ` (${count})`;
+}

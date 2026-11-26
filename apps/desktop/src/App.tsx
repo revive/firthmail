@@ -60,6 +60,8 @@ export default function App() {
   const [folders, setFolders] = useState<EngineFolder[]>([]);
   const [folderId, setFolderId] = useState<number | null>(null);
   const [rows, setRows] = useState<EngineMessage[]>([]);
+  /** 每个文件夹的未读数，侧栏显示成「收件箱 (12)」。 */
+  const [unreadByFolder, setUnreadByFolder] = useState<Record<number, number>>({});
   const [nextCursor, setNextCursor] = useState<{ date: number; messageId: number } | null>(null);
   const [loadingMore, setLoadingMore] = useState(false);
   /**
@@ -320,6 +322,29 @@ export default function App() {
     }
   }, []);
 
+  /**
+   * 侧栏每个文件夹的未读数。
+   *
+   * 引擎一次聚合就能给出全部文件夹的未读，但同步时会连续来一串事件，所以
+   * 合并成一次刷新（400 ms 内只算一次）；本地标已读/删除后也调用它，数字
+   * 立刻跟着动，不必等服务器。
+   */
+  const unreadTimer = useRef<number | null>(null);
+  const refreshUnread = useCallback(() => {
+    if (unreadTimer.current != null) return;
+    unreadTimer.current = window.setTimeout(() => {
+      unreadTimer.current = null;
+      api
+        .folderUnreadCounts()
+        .then((pairs) => {
+          const next: Record<number, number> = {};
+          for (const [folderId, count] of pairs) next[folderId] = count;
+          setUnreadByFolder(next);
+        })
+        .catch(() => {});
+    }, 400);
+  }, []);
+
   const bootstrap = useCallback(async () => {
     try {
       const accs = await api.listAccounts();
@@ -330,6 +355,7 @@ export default function App() {
         return;
       }
       const fs = await refreshFolders();
+      refreshUnread();
       const pickable = fs.find((f) => f.selectable && f.role === 'inbox') ?? fs.find((f) => f.selectable);
       if (pickable) {
         setFolderId(pickable.id);
@@ -343,7 +369,7 @@ export default function App() {
     } catch (e) {
       setStatus(String(e));
     }
-  }, [loadRows, refreshFolders]);
+  }, [loadRows, refreshFolders, refreshUnread]);
 
   useEffect(() => {
     // 窗口在配置里是隐藏的：等第一帧画好再显示，避免启动时先闪一块空白黑窗。
@@ -374,6 +400,7 @@ export default function App() {
           loadRows(folderIdRef.current, viewRef.current);
         }
         refreshFolders();
+        refreshUnread();
       } else if (type === 'sync-progress') {
         const folder = payload.folder as string;
         const done = payload.done as number;
@@ -485,7 +512,8 @@ export default function App() {
       // 角色信息拿不到不影响删除本身
     }
     showToast(target ? `已移入废纸篓（${target}）` : '已移入废纸篓');
-  }, [act, openMessage, showToast, loadRows, refreshFolders]);
+    refreshUnread();
+  }, [act, openMessage, showToast, loadRows, refreshFolders, refreshUnread]);
 
   /**
    * Mark the selected message read (`mark_read`) or unread (`mark_unread`)
@@ -512,8 +540,9 @@ export default function App() {
       setRows((list) => list.map((m) => (m.id === id ? { ...m, isRead: read } : m)));
       setBody((current) => (current && current.id === id ? { ...current, isRead: read } : current));
       bodyCache.current.patch(id, { isRead: read });
+      refreshUnread();
     },
-    [act],
+    [act, refreshUnread],
   );
 
   /**
@@ -926,6 +955,7 @@ export default function App() {
           groups={grouped}
           activeId={folderId}
           unified={unifiedInbox}
+          unread={unreadByFolder}
           onContextMenu={openFolderMenu}
           onSelect={(folder) => {
             if (search) clearSearch();

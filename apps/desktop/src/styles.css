@@ -231,16 +231,13 @@ body {
   white-space: nowrap;
 }
 
+/* 文件夹名后面的未读数「(12)」：没有未读时不渲染。 */
 .folder-unread {
-  min-width: 18px;
-  height: 18px;
-  padding: 0 5px;
-  border-radius: 9px;
-  background: #0072c6;
-  color: #fff;
+  flex: none;
+  margin-left: 4px;
+  color: #605e5c;
   font-size: 11px;
-  line-height: 18px;
-  text-align: center;
+  font-variant-numeric: tabular-nums;
 }
 
 /* message list */

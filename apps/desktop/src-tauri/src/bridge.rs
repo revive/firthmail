@@ -19,8 +19,8 @@ use flectar_mail_core::events::CoreEvent;
 use flectar_mail_core::mail_import::{scan_folder, Destination, MailImportProgress, MailImportRequest};
 use flectar_mail_core::models::{
     Account, AccountFolderRoles, AddPasswordAccountArgs, ActionResult, FolderInfo, ListOrder,
-    MessageCursor, MessageDetail, MessagePage, MessageSearchPage, MessageSummary, PerformActionArgs,
-    Provider, QueueSendArgs, QueueSendResult, SaveDraftArgs, View,
+    MailGrouping, MessageCursor, MessageDetail, MessagePage, MessageSearchPage, MessageSummary,
+    PerformActionArgs, Provider, QueueSendArgs, QueueSendResult, SaveDraftArgs, View,
 };
 use flectar_mail_core::{Core, MessagePageRequest};
 use serde::Serialize;
@@ -406,6 +406,22 @@ pub async fn start_microsoft_login(engine: State<'_, Engine>) -> EngineResult<Ac
 #[tauri::command]
 pub fn cancel_oauth(engine: State<'_, Engine>) {
     engine.core.cancel_oauth();
+}
+
+/// 每个文件夹的未读数（侧栏「收件箱 (12)」）。
+///
+/// 引擎一次扫出所有账户的未读，按文件夹 id 返回；没有未读的文件夹不在列表里。
+#[tauri::command]
+pub async fn folder_unread_counts(engine: State<'_, Engine>) -> EngineResult<Vec<(i64, i64)>> {
+    let badges = engine
+        .core
+        .mailbox_badge_counts(MailGrouping::Messages)
+        .await
+        .map_err(err)?;
+    Ok(badges
+        .into_iter()
+        .flat_map(|counts| counts.folders)
+        .collect())
 }
 
 #[tauri::command]

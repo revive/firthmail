@@ -1,5 +1,5 @@
 import { useState, type CSSProperties, type ReactNode } from 'react';
-import { sortFolders } from '../folders';
+import { sortFolders, unreadLabel } from '../folders';
 import type { EngineAccount, EngineFolder } from '../types';
 
 const ICONS: Record<string, string> = {
@@ -25,10 +25,19 @@ interface Props {
   onContextMenu?: (folder: EngineFolder, event: MouseEvent) => void;
   /** 多账户时顶部的合并收件箱；单账户不显示。 */
   unified?: { label: string; active: boolean; onSelect: () => void } | null;
+  /** 每个文件夹的未读数，按文件夹 id；没有条目或为 0 就不显示。 */
+  unread?: Record<number, number>;
 }
 
 /** 文件夹树：账户分组 + 父子嵌套（默认展开，▸ 可折叠）。 */
-export default function FolderTree({ groups, activeId, onSelect, onContextMenu, unified = null }: Props) {
+export default function FolderTree({
+  groups,
+  activeId,
+  onSelect,
+  onContextMenu,
+  unified = null,
+  unread = {},
+}: Props) {
   const [collapsed, setCollapsed] = useState<Set<number>>(() => new Set());
   const [collapsedAccounts, setCollapsedAccounts] = useState<Set<string>>(() => new Set());
 
@@ -93,6 +102,9 @@ export default function FolderTree({ groups, activeId, onSelect, onContextMenu, 
               )}
               <span className="folder-icon">{ICONS[f.role ?? ''] ?? '📁'}</span>
               <span className="folder-name">{f.displayName}</span>
+              {unreadLabel(unread[f.id]) && (
+                <span className="folder-unread">{unreadLabel(unread[f.id])}</span>
+              )}
             </button>
             {hasChildren && !isCollapsed && renderList(list, f.id, depth + 1)}
           </div>
