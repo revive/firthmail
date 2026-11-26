@@ -3968,9 +3968,12 @@ async fn fetch_body_over(
     let raw = download_message_bounded(connected, &expected_blob).await?;
     let parsed = crate::mime::parse_message(&raw)?;
     let calendar_events = crate::sync::ingest::calendar_parts(&parsed);
-    let dir = ctx.paths.mail_dir(config.id);
-    tokio::fs::create_dir_all(&dir).await?;
-    let path = dir.join(format!("{message_id}.jmap.eml"));
+    let path = ctx
+        .paths
+        .mail_file(config.id, &format!("{message_id}.jmap.eml"));
+    if let Some(shard) = path.parent() {
+        tokio::fs::create_dir_all(shard).await?;
+    }
     crate::file_io::write_atomic(&path, &raw, "JMAP message cache").await?;
     let path_string = path.to_string_lossy().into_owned();
     let guarded_remote = remote_id.clone();

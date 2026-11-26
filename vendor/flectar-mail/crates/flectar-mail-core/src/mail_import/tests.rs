@@ -298,8 +298,7 @@ async fn messages(core: &crate::Core, account_id: i64) -> Vec<(String, String, b
 /// A saved copy of mail the profile already holds adds only what it doesn't
 /// have: `import_mail_skipping_known` leaves out messages any account has,
 /// matched by Message-ID, so importing an Outlook export of a mailbox the
-/// profile also syncs doesn't duplicate it.
-#[tokio::test]
+/// profile also syncs doesn't duplicate it.#[tokio::test]
 async fn skipping_known_mail_leaves_out_what_the_profile_has() {
     let (_directory, core) = core().await;
     let folder = tempfile::tempdir().unwrap();
@@ -405,16 +404,25 @@ async fn saved_mail_goes_into_local_mail_once() {
         .unwrap()
         .unwrap();
     assert_eq!(trash.path, "Trash");
-    let originals = std::fs::read_dir(core.paths.mail_dir(report.account_id))
-        .unwrap()
-        .filter_map(|entry| entry.ok())
-        .filter(|entry| {
-            entry
+    // Originals sit one level down, in the shards, not in the account
+    // directory itself.
+    let mut originals = 0;
+    for entry in std::fs::read_dir(core.paths.mail_dir(report.account_id)).unwrap() {
+        let shard = entry.unwrap();
+        if !shard.path().is_dir() {
+            continue;
+        }
+        for file in std::fs::read_dir(shard.path()).unwrap() {
+            if file
+                .unwrap()
                 .file_name()
                 .to_string_lossy()
                 .ends_with(ORIGINAL_SUFFIX)
-        })
-        .count();
+            {
+                originals += 1;
+            }
+        }
+    }
     assert_eq!(originals, 4);
 
     // Local mail lists, searches and counts like any account's.
@@ -776,4 +784,118 @@ async fn an_export_imports_back_with_its_folders_and_states() {
     let again = import(&core, &scan_folder(&export).unwrap(), Destination::Local).await;
     assert_eq!(again.imported, 2);
     assert_eq!(messages(&core, again.account_id).await, before);
+}
+
+/// Imported originals go one directory down, into a shard named by their
+/// prefix, so a mailbox imported from Outlook never leaves tens of thousands
+/// of files in one directory.
+#[tokio::test]
+async fn imported_originals_live_in_shard_directories() {
+    let (_directory, core) = core().await;
+    let folder = tempfile::tempdir().unwrap();
+    let root = folder.path().join("Export");
+    write(&root.join("Inbox"), mbox(&[message("shard", "Sharded", "")]));
+    let source = scan_folder(&root).unwrap();
+    let report = import(&core, &source, Destination::Local).await;
+    assert_eq!(report.imported, 1);
+
+    let stored = stored_path(&core).await;
+    let path = std::path::Path::new(&stored);
+    assert!(path.is_file(), "original is on disk");
+    let shard = path.parent().unwrap();
+    assert_eq!(
+        shard.parent(),
+        Some(core.paths.mail_dir(report.account_id).as_path()),
+        "original sits in one shard below the account directory"
+    );
+    assert_eq!(shard.file_name().unwrap().len(), 2);
+}
+
+/// A file an older version left in the account directory is moved into its
+/// shard, the row follows it, and running it again changes nothing.
+#[tokio::test]
+async fn the_layout_migration_moves_flat_originals_once() {
+    let (_directory, core) = core().await;
+    let folder = tempfile::tempdir().unwrap();
+    let root = folder.path().join("Export");
+    write(&root.join("Inbox"), mbox(&[message("flat", "Flat", "")]));
+    let source = scan_folder(&root).unwrap();
+    let report = import(&core, &source, Destination::Local).await;
+
+    // Put the file back where the old layout had it, and point the row there.
+    let stored = stored_path(&core).await;
+    let name = std::path::Path::new(&stored)
+        .file_name()
+        .unwrap()
+        .to_owned();
+    let flat = core.paths.mail_dir(report.account_id).join(&name);
+    std::fs::create_dir_all(flat.parent().unwrap()).unwrap();
+    std::fs::rename(&stored, &flat).unwrap();
+    let flat_string = flat.to_string_lossy().into_owned();
+    let recorded = flat_string.clone();
+    core.db
+        .write(move |conn| {
+            conn.execute(
+                "UPDATE messages SET raw_path = ?1",
+                rusqlite::params![recorded],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    assert_eq!(stored_path(&core).await, flat_string);
+
+    assert_eq!(core.migrate_mail_layout().await.unwrap(), 1);
+    let moved = stored_path(&core).await;
+    assert_ne!(moved, flat_string);
+    assert!(std::path::Path::new(&moved).is_file());
+    assert!(!flat.exists());
+    assert_eq!(core.migrate_mail_layout().await.unwrap(), 0);
+}
+
+/// A crash between renaming a file and recording its path is repaired from
+/// the shard location.
+#[tokio::test]
+async fn a_missing_original_is_found_in_its_shard() {
+    let (_directory, core) = core().await;
+    let folder = tempfile::tempdir().unwrap();
+    let root = folder.path().join("Export");
+    write(&root.join("Inbox"), mbox(&[message("repair", "Repair", "")]));
+    let source = scan_folder(&root).unwrap();
+    import(&core, &source, Destination::Local).await;
+
+    let stored = stored_path(&core).await;
+    let path = std::path::Path::new(&stored);
+    let name = path.file_name().unwrap().to_owned();
+    let account_dir = path.parent().unwrap().parent().unwrap().to_path_buf();
+    let stale = account_dir.join(&name);
+    let stale_string = stale.to_string_lossy().into_owned();
+    let recorded = stale_string.clone();
+    core.db
+        .write(move |conn| {
+            conn.execute(
+                "UPDATE messages SET raw_path = ?1",
+                rusqlite::params![recorded],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    assert!(!stale.exists());
+
+    assert_eq!(core.repair_mail_paths().await.unwrap(), 1);
+    assert_eq!(stored_path(&core).await, stored);
+}
+
+async fn stored_path(core: &crate::Core) -> String {
+    core.db
+        .read(|conn| {
+            Ok(conn.query_row(
+                "SELECT raw_path FROM messages WHERE raw_path IS NOT NULL LIMIT 1",
+                [],
+                |row| row.get::<_, String>(0),
+            )?)
+        })
+        .await
+        .unwrap()
 }

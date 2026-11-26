@@ -114,6 +114,39 @@ const NOTIFICATION_RETRY_MS: i64 = 60_000;
 /// commits. One nothing refers to was left by an interrupted write.
 const DURABLE_ORIGINAL_SUFFIXES: [&str; 2] =
     [sync::pop3::ORIGINAL_SUFFIX, mail_import::ORIGINAL_SUFFIX];
+
+/// Whether a file name is one of the durable originals above.
+fn is_original_name(name: &std::ffi::OsStr) -> bool {
+    name.to_str().is_some_and(|name| {
+        DURABLE_ORIGINAL_SUFFIXES
+            .iter()
+            .any(|suffix| name.ends_with(suffix))
+    })
+}
+
+/// Delete originals in one shard directory that no row refers to.
+async fn remove_orphan_originals(
+    dir: &std::path::Path,
+    stored: &HashSet<std::ffi::OsString>,
+) -> Result<usize> {
+    let mut removed = 0;
+    let mut files = match tokio::fs::read_dir(dir).await {
+        Ok(files) => files,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(error.into()),
+    };
+    while let Some(file) = files.next_entry().await? {
+        let name = file.file_name();
+        if is_original_name(&name)
+            && !stored.contains(&name)
+            && file.file_type().await?.is_file()
+        {
+            tokio::fs::remove_file(file.path()).await?;
+            removed += 1;
+        }
+    }
+    Ok(removed)
+}
 const MAX_CACHED_HEADER_BYTES: usize = 256 * 1024;
 const SEND_START_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 const SEND_STATUS_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
@@ -1453,6 +1486,26 @@ impl Core {
             tokio::spawn(async move { c.cleanup_loop().await });
         }
 
+        // Originals written by older versions sit directly in the account
+        // directory. Move them into shard directories once the window is up.
+        {
+            let core = core.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                match core.repair_mail_paths().await {
+                    Ok(0) => {}
+                    Ok(repaired) => tracing::info!(repaired, "repaired stored mail paths"),
+                    Err(error) => tracing::warn!(%error, "could not repair stored mail paths"),
+                }
+                match core.migrate_mail_layout().await {
+                    Ok(0) => {}
+                    Ok(moved) => tracing::info!(moved, "moved stored mail into shard directories"),
+                    Err(error) => {
+                        tracing::warn!(%error, "could not move stored mail into shard directories")
+                    }
+                }
+            });
+        }
         mark!("start_with_platform done");
         Ok(core)
     }
@@ -3568,22 +3621,149 @@ impl Core {
                 continue;
             }
             removed += crate::file_io::remove_partial_writes(account.path()).await?;
-            let mut files = tokio::fs::read_dir(account.path()).await?;
-            while let Some(file) = files.next_entry().await? {
-                let name = file.file_name();
-                if name.to_str().is_some_and(|name| {
-                    DURABLE_ORIGINAL_SUFFIXES
-                        .iter()
-                        .any(|suffix| name.ends_with(suffix))
-                }) && !stored.contains(&name)
-                    && file.file_type().await?.is_file()
-                {
-                    tokio::fs::remove_file(file.path()).await?;
+            let mut entries = tokio::fs::read_dir(account.path()).await?;
+            while let Some(entry) = entries.next_entry().await? {
+                // Stored files live one level down in shard directories; names
+                // still directly here are files an older version wrote.
+                if entry.file_type().await?.is_dir() {
+                    removed += crate::file_io::remove_partial_writes(entry.path()).await?;
+                    removed += remove_orphan_originals(&entry.path(), &stored).await?;
+                    continue;
+                }
+                let name = entry.file_name();
+                if is_original_name(&name) && !stored.contains(&name) {
+                    tokio::fs::remove_file(entry.path()).await?;
                     removed += 1;
                 }
             }
         }
         Ok(removed)
+    }
+
+    /// Move stored originals into their shard directories, one batch at a time.
+    ///
+    /// Older versions kept every original of an account directly in
+    /// `mail/<account>/`. A mailbox imported from Outlook then leaves tens of
+    /// thousands of entries in one directory, which makes the directory slow
+    /// to enumerate for backups, virus scans and Explorer. Reads don't change:
+    /// the database stores absolute paths and this updates them.
+    ///
+    /// It is safe to stop at any point: every row is updated only after its
+    /// file moved, and [`Self::repair_mail_paths`] fixes whatever a crash left
+    /// half done.
+    pub async fn migrate_mail_layout(&self) -> Result<usize> {
+        let mut moved = 0;
+        let mut after = 0_i64;
+        loop {
+            let batch = self
+                .db
+                .read(move |conn| {
+                    let mut statement = conn.prepare(
+                        "SELECT id, account_id, raw_path FROM messages
+                         WHERE id > ?1 AND raw_path IS NOT NULL
+                         ORDER BY id LIMIT 400",
+                    )?;
+                    let rows = statement
+                        .query_map([after], |row| {
+                            Ok((
+                                row.get::<_, i64>(0)?,
+                                row.get::<_, i64>(1)?,
+                                row.get::<_, String>(2)?,
+                            ))
+                        })?
+                        .collect::<rusqlite::Result<Vec<_>>>()?;
+                    Ok(rows)
+                })
+                .await?;
+            let Some(last) = batch.last() else {
+                break;
+            };
+            after = last.0;
+            for (id, account_id, raw_path) in batch {
+                let flat = std::path::Path::new(&raw_path);
+                if flat.parent() != Some(self.paths.mail_dir(account_id).as_path()) {
+                    continue;
+                }
+                let Some(target) = self.paths.shard_for_flat_file(account_id, flat) else {
+                    continue;
+                };
+                if !flat.is_file() {
+                    continue;
+                }
+                if let Some(shard) = target.parent() {
+                    tokio::fs::create_dir_all(shard).await?;
+                }
+                tokio::fs::rename(flat, &target).await?;
+                let new_path = target.to_string_lossy().into_owned();
+                let previous = raw_path.clone();
+                self.db
+                    .write(move |conn| {
+                        conn.execute(
+                            "UPDATE messages SET raw_path = ?2 WHERE id = ?1 AND raw_path = ?3",
+                            rusqlite::params![id, new_path, previous],
+                        )?;
+                        Ok(())
+                    })
+                    .await?;
+                moved += 1;
+            }
+            // Stay out of the way of sync and imports.
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        Ok(moved)
+    }
+
+    /// Point rows whose stored file is missing at its shard location.
+    ///
+    /// A migration that stopped between renaming a file and recording its new
+    /// path leaves exactly that, and so does a crash in between; the file is
+    /// still there, one directory down.
+    pub async fn repair_mail_paths(&self) -> Result<usize> {
+        let rows = self
+            .db
+            .read(|conn| {
+                let mut statement = conn.prepare(
+                    "SELECT id, account_id, raw_path FROM messages WHERE raw_path IS NOT NULL",
+                )?;
+                let rows = statement
+                    .query_map([], |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, String>(2)?,
+                        ))
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(rows)
+            })
+            .await?;
+        let mut repaired = 0;
+        for (id, account_id, raw_path) in rows {
+            let path = std::path::Path::new(&raw_path);
+            if path.is_file() {
+                continue;
+            }
+            let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            let sharded = self.paths.mail_file(account_id, name);
+            if !sharded.is_file() {
+                continue;
+            }
+            let new_path = sharded.to_string_lossy().into_owned();
+            let previous = raw_path.clone();
+            self.db
+                .write(move |conn| {
+                    conn.execute(
+                        "UPDATE messages SET raw_path = ?2 WHERE id = ?1 AND raw_path = ?3",
+                        rusqlite::params![id, new_path, previous],
+                    )?;
+                    Ok(())
+                })
+                .await?;
+            repaired += 1;
+        }
+        Ok(repaired)
     }
 
     async fn cleanup_orphaned_draft_files(&self) -> Result<usize> {

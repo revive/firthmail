@@ -1,5 +1,27 @@
 use std::path::PathBuf;
 
+/// The shard a message file belongs in: the first two characters of its name.
+///
+/// Stored messages are named with random hex, so this spreads them evenly over
+/// 256 directories. Names that don't start with two hex digits (draft
+/// snapshots, files a test writes) get a stable hash instead, so they still
+/// land in one of the shards.
+fn shard_of(name: &str) -> String {
+    let bytes = name.as_bytes();
+    if bytes.len() >= 2 {
+        let (first, second) = (bytes[0], bytes[1]);
+        if first.is_ascii_hexdigit() && second.is_ascii_hexdigit() {
+            return name[..2].to_ascii_lowercase();
+        }
+    }
+    let mut hash: u32 = 2_166_136_261;
+    for byte in bytes {
+        hash ^= u32::from(*byte);
+        hash = hash.wrapping_mul(16_777_619);
+    }
+    format!("{:02x}", hash & 0xff)
+}
+
 #[derive(Debug, Clone)]
 pub struct Paths {
     /// Durable application state. Databases, raw mail, drafts, queues, and
@@ -38,7 +60,6 @@ impl Paths {
             cache_dir,
         }
     }
-
     pub fn for_tests(root: &std::path::Path) -> Self {
         Self::new(root.to_path_buf(), root.join("cache"))
     }
@@ -95,8 +116,31 @@ impl Paths {
     }
 
     /// Directory for raw .eml files of one account.
+    ///
+    /// Files are not kept directly in here: `mail_file` puts each in a shard
+    /// one level down, so a mailbox with tens of thousands of messages never
+    /// makes a directory whose entries a backup, a virus scan or Explorer has
+    /// to walk in one go.
     pub fn mail_dir(&self, account_id: i64) -> PathBuf {
         self.mail_root().join(account_id.to_string())
+    }
+
+    /// The shard directory a stored message file belongs in: the first two
+    /// characters of its name, which is random hex, so the shards stay even.
+    pub fn mail_shard(&self, account_id: i64, name: &str) -> PathBuf {
+        self.mail_dir(account_id).join(shard_of(name))
+    }
+
+    /// Where a message file called `name` lives, inside its account's shard.
+    pub fn mail_file(&self, account_id: i64, name: &str) -> PathBuf {
+        self.mail_shard(account_id, name).join(name)
+    }
+
+    /// The shard a file that sits directly in the account directory belongs
+    /// in. Used by the one-time layout migration.
+    pub fn shard_for_flat_file(&self, account_id: i64, path: &std::path::Path) -> Option<PathBuf> {
+        let name = path.file_name()?.to_str()?;
+        Some(self.mail_file(account_id, name))
     }
 
     /// Directory for the raw messages being copied or moved to another
@@ -151,6 +195,23 @@ impl Paths {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stored_mail_files_live_in_a_shard_named_by_their_prefix() {
+        let root = std::path::Path::new("/private/app");
+        let paths = Paths::new(root.join("data"), root.join("cache"));
+        let name = "0123456789abcdef0123456789abcdef.eml";
+
+        assert_eq!(
+            paths.mail_file(7, name),
+            root.join("data/mail/7/01").join(name)
+        );
+        // Stable: the migration and the writers must agree about the shard.
+        assert_eq!(paths.mail_file(7, name), paths.mail_file(7, name));
+        // Names that don't start with hex still land in one of the 256 buckets.
+        let other = paths.mail_file(7, "draft-1.outgoing.eml");
+        assert_eq!(other.parent().unwrap().file_name().unwrap().len(), 2);
+    }
 
     #[test]
     fn platform_paths_separate_durable_and_reconstructable_state() {

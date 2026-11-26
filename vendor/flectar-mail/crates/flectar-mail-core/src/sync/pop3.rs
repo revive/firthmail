@@ -850,9 +850,8 @@ pub(crate) const ORIGINAL_SUFFIX: &str = ".pop3.eml";
 /// A file name for a message's original. Names don't derive from the UIDL,
 /// which servers may reuse once a message is gone.
 fn new_original_path(ctx: &SyncCtx, account_id: i64) -> std::path::PathBuf {
-    ctx.paths
-        .mail_dir(account_id)
-        .join(format!("{:032x}{ORIGINAL_SUFFIX}", rand::random::<u128>()))
+    let name = format!("{:032x}{ORIGINAL_SUFFIX}", rand::random::<u128>());
+    ctx.paths.mail_file(account_id, &name)
 }
 
 /// Keep a retrieved message: its original on stable storage first, then one

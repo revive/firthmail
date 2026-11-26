@@ -5520,11 +5520,14 @@ async fn persist_body(
     if !remote_location_is_current(ctx, message_id, folder_id, i64::from(uid)).await? {
         return Ok(false);
     }
-    let dir = ctx.paths.mail_dir(config.id);
-    tokio::fs::create_dir_all(&dir).await?;
     // Include the guarded remote identity so a stale in-flight read can never
     // overwrite a newer location's raw cache file for the same local row.
-    let path = dir.join(format!("{message_id}.{folder_id}.{uid}.eml"));
+    let path = ctx
+        .paths
+        .mail_file(config.id, &format!("{message_id}.{folder_id}.{uid}.eml"));
+    if let Some(shard) = path.parent() {
+        tokio::fs::create_dir_all(shard).await?;
+    }
     crate::file_io::write_atomic(&path, raw, "IMAP message cache").await?;
     let path_str = path.to_string_lossy().to_string();
 

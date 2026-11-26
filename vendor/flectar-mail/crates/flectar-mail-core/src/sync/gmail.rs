@@ -2724,13 +2724,14 @@ async fn hydrate_at(
         .unwrap_or_default();
     let raw = api.raw_message_at(base, provider_message_id, size).await?;
     let parsed = crate::sync::ingest::parse_or_text(&raw);
-    let dir = ctx.paths.mail_dir(config.id);
-    tokio::fs::create_dir_all(&dir).await?;
     let name: String = provider_message_id
         .chars()
         .filter(char::is_ascii_alphanumeric)
         .collect();
-    let path = dir.join(format!("gmail-{name}.eml"));
+    let path = ctx.paths.mail_file(config.id, &format!("gmail-{name}.eml"));
+    if let Some(shard) = path.parent() {
+        tokio::fs::create_dir_all(shard).await?;
+    }
     crate::file_io::write_atomic(&path, &raw, "Gmail message cache").await?;
     Ok(HydratedBody {
         text: parsed.text,

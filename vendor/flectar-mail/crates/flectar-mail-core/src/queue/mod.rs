@@ -1420,8 +1420,12 @@ async fn send_action(
     // Message-ID and lets Sent filing run independently after delivery without
     // retaining composer attachments or rebuilding encrypted content.
     let msg_id_bare = msg_id.trim_matches(['<', '>']).to_string();
-    let mail_dir = ctx.paths.mail_dir(config.id);
-    let raw_path = mail_dir.join(format!("{draft_id}.outgoing.eml"));
+    let raw_path = ctx
+        .paths
+        .mail_file(config.id, &format!("{draft_id}.outgoing.eml"));
+    if let Some(shard) = raw_path.parent() {
+        tokio::fs::create_dir_all(shard).await?;
+    }
     crate::file_io::write_atomic(&raw_path, &raw, "outgoing MIME snapshot").await?;
     let raw_path_string = raw_path.to_string_lossy().into_owned();
     let stable_id = msg_id_bare.clone();

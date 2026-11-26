@@ -138,9 +138,11 @@ impl crate::Core {
         {
             return Ok(false);
         }
-        let directory = self.paths.mail_dir(account_id);
-        tokio::fs::create_dir_all(&directory).await?;
-        let path = directory.join(format!("{:032x}{ORIGINAL_SUFFIX}", rand::random::<u128>()));
+        let name = format!("{:032x}{ORIGINAL_SUFFIX}", rand::random::<u128>());
+        let path = self.paths.mail_file(account_id, &name);
+        if let Some(shard) = path.parent() {
+            tokio::fs::create_dir_all(shard).await?;
+        }
         crate::file_io::write_durable(&path, &raw, "transferred message").await?;
         let stored_path = path.to_string_lossy().into_owned();
         let role = folder.role;
@@ -879,10 +881,15 @@ impl Writer<'_> {
             }
         }
 
-        let directory = self.core.paths.mail_dir(account_id);
         let written = futures::stream::iter(new.into_iter().map(|(message, target, key)| {
-            let path = directory.join(format!("{:032x}{ORIGINAL_SUFFIX}", rand::random::<u128>()));
+            let name = format!("{:032x}{ORIGINAL_SUFFIX}", rand::random::<u128>());
+            let path = self.core.paths.mail_file(account_id, &name);
             async move {
+                if let Some(shard) = path.parent()
+                    && let Err(error) = tokio::fs::create_dir_all(shard).await
+                {
+                    return Err((error.into(), path));
+                }
                 match crate::file_io::write_durable(&path, &message.raw, "imported message").await {
                     Ok(()) => Ok(Written {
                         message,
