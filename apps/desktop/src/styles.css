@@ -1017,15 +1017,46 @@ body {
 .attachment-chip {
   display: inline-flex;
   align-items: center;
-  gap: 6px;
-  padding: 4px 10px;
+  gap: 2px;
+  padding: 2px;
   border: 1px solid #c8c6c4;
   border-radius: 4px;
   background: #faf9f8;
   font-size: 12px;
 }
 
+/* 附件本身点开是"用默认程序打开"，右边的 ⬇ 才下载。 */
+.attachment-open,
+.attachment-save {
+  border: none;
+  background: transparent;
+  font: inherit;
+  font-size: 12px;
+  color: #242424;
+  cursor: pointer;
+  padding: 2px 6px;
+  border-radius: 3px;
+}
+
+.attachment-open:hover:not(:disabled),
+.attachment-save:hover:not(:disabled) {
+  background: #edebe9;
+}
+
+.attachment-save {
+  color: #005a9e;
+  font-size: 13px;
+  line-height: 1;
+}
+
+.attachment-open:disabled,
+.attachment-save:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+
 .attachment-chip em {
+  margin-left: 6px;
   color: #8a8886;
   font-style: normal;
 }

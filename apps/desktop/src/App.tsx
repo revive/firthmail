@@ -1118,6 +1118,7 @@ export default function App() {
             onCopied={(text) => showToast(`已复制：${text}`)}
             onComposeAddress={startNewTo}
             onAddToBook={(address) => void addToBook(address)}
+            onNotice={(text) => showToast(text)}
           />
           {compose && (
             <ComposeForm

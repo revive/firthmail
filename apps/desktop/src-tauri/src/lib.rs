@@ -57,6 +57,8 @@ pub fn run() {
             bridge::address_book_list,
             bridge::address_book_save,
             bridge::address_book_remove,
+            bridge::attachment_save_as,
+            bridge::attachment_open,
             bridge::add_account,
             bridge::remove_account,
             bridge::oauth_client_id,

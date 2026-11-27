@@ -71,6 +71,11 @@ export const api = {
   addressBookSave: (entry: AddressBookEntryOut) =>
     invoke<AddressBookEntryOut[]>('address_book_save', { entry }),
   addressBookRemove: (id: string) => invoke<AddressBookEntryOut[]>('address_book_remove', { id }),
+  /** 附件：选位置保存（返回保存到的路径，取消为 null）；或用默认程序打开。 */
+  attachmentSaveAs: (attachmentId: number, fileName: string) =>
+    invoke<string | null>('attachment_save_as', { attachmentId, fileName }),
+  attachmentOpen: (attachmentId: number) =>
+    invoke('attachment_open', { attachmentId }),
   addAccount: (args: AddAccountInput) => invoke<EngineAccount>('add_account', { args }),
   removeAccount: (accountId: number) => invoke('remove_account', { accountId }),
   /** The Microsoft OAuth application (client) ID saved for Outlook.com sign-in. */

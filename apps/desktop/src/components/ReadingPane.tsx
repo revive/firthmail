@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { Icon } from './MailToolbar';
 import AddressChip from './AddressChip';
+import { api } from '../api';
 import type { EngineAddress, EngineMessageDetail } from '../types';
 import { sanitizeMailHtml } from '../sanitize';
 
@@ -22,6 +23,8 @@ interface Props {
   onComposeAddress?: (email: string) => void;
   /** 把地址加进地址簿。 */
   onAddToBook?: (address: EngineAddress) => void;
+  /** 附件的保存结果/失败原因。 */
+  onNotice?: (text: string) => void;
 }
 
 const initials = (m: EngineMessageDetail) =>
@@ -40,9 +43,35 @@ export default function ReadingPane({
   onCopied,
   onComposeAddress,
   onAddToBook,
+  onNotice,
 }: Props) {
   const [menuOpen, setMenuOpen] = useState(false);
+  /** 正在取/存的附件 id（取附件可能要等服务器）。 */
+  const [busyAttachment, setBusyAttachment] = useState<number | null>(null);
   const menuRef = useRef<HTMLDivElement>(null);
+
+  const openAttachment = async (attachmentId: number) => {
+    setBusyAttachment(attachmentId);
+    try {
+      await api.attachmentOpen(attachmentId);
+    } catch (error) {
+      onNotice?.(`打开附件失败：${String(error)}`);
+    } finally {
+      setBusyAttachment(null);
+    }
+  };
+
+  const saveAttachment = async (attachmentId: number, fileName?: string | null) => {
+    setBusyAttachment(attachmentId);
+    try {
+      const saved = await api.attachmentSaveAs(attachmentId, fileName ?? '');
+      if (saved) onNotice?.(`附件已保存到 ${saved}`);
+    } catch (error) {
+      onNotice?.(`保存附件失败：${String(error)}`);
+    } finally {
+      setBusyAttachment(null);
+    }
+  };
 
   // 点空白处收起「⋯」菜单。
   useEffect(() => {
@@ -192,8 +221,23 @@ export default function ReadingPane({
             .filter((a) => !a.isInline)
             .map((a) => (
               <span key={a.id} className="attachment-chip" title={a.filename ?? ''}>
-                📎 {a.filename ?? '附件'}
-                {a.size != null && <em>{Math.max(1, Math.round(a.size / 1024))} KB</em>}
+                <button
+                  className="attachment-open"
+                  disabled={busyAttachment === a.id}
+                  title="用默认程序打开"
+                  onClick={() => void openAttachment(a.id)}
+                >
+                  📎 {a.filename ?? '附件'}
+                  {a.size != null && <em>{Math.max(1, Math.round(a.size / 1024))} KB</em>}
+                </button>
+                <button
+                  className="attachment-save"
+                  disabled={busyAttachment === a.id}
+                  title="下载（另存为）"
+                  onClick={() => void saveAttachment(a.id, a.filename)}
+                >
+                  {busyAttachment === a.id ? '…' : '⬇'}
+                </button>
               </span>
             ))}
         </div>

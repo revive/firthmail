@@ -455,6 +455,50 @@ fn address_book_id() -> String {
     format!("{nanos:032x}{count:04x}")
 }
 
+/// 下载附件：先让用户挑保存位置，再让引擎把内容写到那里。
+///
+/// 引擎自己负责"没缓存就先取"（IMAP 分段下载 / 从原件解出），这里只做
+/// 文件对话框和落盘。返回保存到的路径；用户取消时返回 None。
+#[tauri::command]
+pub async fn attachment_save_as(
+    engine: State<'_, Engine>,
+    app: AppHandle,
+    attachment_id: i64,
+    file_name: String,
+) -> EngineResult<Option<String>> {
+    let suggested = if file_name.trim().is_empty() {
+        "attachment".to_owned()
+    } else {
+        file_name.trim().to_owned()
+    };
+    let picked = tokio::task::spawn_blocking(move || {
+        app.dialog()
+            .file()
+            .set_title("保存附件")
+            .set_file_name(&suggested)
+            .blocking_save_file()
+    })
+    .await
+    .map_err(err)?;
+    let Some(path) = picked.and_then(|path| path.into_path().ok()) else {
+        return Ok(None);
+    };
+    let target = path.to_string_lossy().into_owned();
+    engine
+        .core
+        .save_attachment(attachment_id, target.clone())
+        .await
+        .map_err(err)?;
+    Ok(Some(target))
+}
+
+/// 用系统默认程序打开附件（引擎会先把内容取到本地缓存）。
+#[tauri::command]
+pub async fn attachment_open(engine: State<'_, Engine>, attachment_id: i64) -> EngineResult<()> {
+    let path = engine.core.get_attachment(attachment_id).await.map_err(err)?;
+    open_in_browser(&path).map_err(err)
+}
+
 /// 在系统浏览器里打开一个地址（OAuth 授权页）。
 ///
 /// Windows 上直接调 ShellExecuteW：这是"用默认程序打开这个地址"的官方入口。

@@ -899,3 +899,46 @@ async fn stored_path(core: &crate::Core) -> String {
         .await
         .unwrap()
 }
+
+/// 一封带附件的邮件：保存附件应该把附件字节原样写出来。
+#[tokio::test]
+async fn an_imported_attachment_saves_to_a_chosen_path() {
+    const PDF: &[u8] = b"%PDF-1.4\nattachment bytes\n";
+    let encoded = {
+        use base64::Engine as _;
+        base64::engine::general_purpose::STANDARD.encode(PDF)
+    };
+    let raw = format!(
+        "From: Ana <ana@example.org>\r\nTo: me@example.com\r\nSubject: With attachment\r\n\
+         Date: Mon, 1 Jan 2001 10:00:00 +0000\r\nMessage-ID: <att@example.org>\r\n\
+         MIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=\"b1\"\r\n\r\n\
+         --b1\r\nContent-Type: text/plain; charset=utf-8\r\n\r\nHello\r\n\
+         --b1\r\nContent-Type: application/pdf; name=\"doc.pdf\"\r\n\
+         Content-Disposition: attachment; filename=\"doc.pdf\"\r\n\
+         Content-Transfer-Encoding: base64\r\n\r\n{encoded}\r\n--b1--\r\n"
+    );
+
+    let (_directory, core) = core().await;
+    let folder = tempfile::tempdir().unwrap();
+    let root = folder.path().join("Export");
+    write(&root.join("Inbox"), mbox(&[raw]));
+    let source = scan_folder(&root).unwrap();
+    import(&core, &source, Destination::Local).await;
+
+    let attachment_id: i64 = core
+        .db
+        .read(|conn| {
+            Ok(conn.query_row("SELECT id FROM attachments LIMIT 1", [], |row| {
+                row.get::<_, i64>(0)
+            })?)
+        })
+        .await
+        .unwrap();
+
+    let destination = folder.path().join("saved-doc.pdf");
+    core.save_attachment(attachment_id, destination.to_string_lossy().into_owned())
+        .await
+        .unwrap();
+
+    assert_eq!(std::fs::read(&destination).unwrap(), PDF);
+}
