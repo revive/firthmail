@@ -212,10 +212,11 @@ export default function App() {
     viewRef.current = mergedNow?.view ?? view;
     const token = listGate.current.start();
     try {
+      let loaded: EngineMessage[];
       if (mergedNow) {
         const page = await api.listMessagesMerged(mergedNow.accountIds, mergedNow.view, PAGE_SIZE);
         if (!listGate.current.current(token)) return;
-        setRows(page.messages);
+        loaded = page.messages;
         setNextCursor(page.nextCursor ?? null);
       } else if (pairRef.current) {
         pairRef.current.cursors = [null, null];
@@ -223,16 +224,27 @@ export default function App() {
         pairRef.current.done = [false, false];
         const page = await nextPairPage(PAGE_SIZE);
         if (!listGate.current.current(token)) return;
+        loaded = page.items;
         pairMoreRef.current = page.more;
-        setRows(page.items);
         setNextCursor(null);
       } else {
         const page = await api.listMessages(fid, view, PAGE_SIZE);
         if (!listGate.current.current(token)) return;
-        setRows(page.messages);
+        loaded = page.messages;
         setNextCursor(page.nextCursor ?? null);
       }
-      if (folderChanged) setBody(null);
+      setRows(loaded);
+      // 换了文件夹、或选中的那封已经不在列表里：清掉选择。否则阅读窗格会
+      // 一直停在「正在载入邮件」（列表里已经没有它，没人会再去取正文）。
+      const stillListed =
+        selectedRef.current != null && loaded.some((m) => m.id === selectedRef.current);
+      if (folderChanged || !stillListed) {
+        selectedRef.current = null;
+        setSelectedId(null);
+        setBody(null);
+        // 让还在路上的正文请求作废，别在窗格里冒出来。
+        bodyGate.current.start();
+      }
     } catch (e) {
       setStatus(String(e));
     }

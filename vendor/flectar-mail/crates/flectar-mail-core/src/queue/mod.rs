@@ -543,11 +543,16 @@ async fn execute_on_imap(
                 .db
                 .read(move |conn| repo::folders::get(conn, folder_id))
                 .await?
-                .ok_or_else(|| CoreError::NotFound("Trash folder".into()))?;
-            if folder.account_id != config.id
-                || folder.role.as_deref() != Some(crate::models::roles::TRASH)
-            {
-                return Err(CoreError::NotFound("message is no longer in Trash".into()));
+                .ok_or_else(|| CoreError::NotFound("Trash or Junk folder".into()))?;
+            // 垃圾邮件和废纸篓里的邮件都是"确定不要的"：清空 Junk 也走永久删除。
+            let disposable = matches!(
+                folder.role.as_deref(),
+                Some(crate::models::roles::TRASH) | Some(crate::models::roles::SPAM)
+            );
+            if folder.account_id != config.id || !disposable {
+                return Err(CoreError::NotFound(
+                    "message is no longer in Trash or Junk".into(),
+                ));
             }
             let selected = imap::select(session, &folder.path).await?;
             match (folder.uidvalidity, selected.uid_validity) {
